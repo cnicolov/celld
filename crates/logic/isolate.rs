@@ -85,6 +85,10 @@ pub struct PoolLimits {
     /// worth starting. Below `grow_at`, and the gap is the hysteresis that
     /// stops growth and retirement chasing each other.
     pub shrink_under: usize,
+    /// Live isolates normal maintenance retains. Stateless pools configure a
+    /// warm floor; cell pools use zero so empty heaps can be reclaimed.
+    /// Memory-pressure shedding may retire below this floor.
+    pub min_isolates: usize,
     /// Ceiling on live isolates. Past it the pool queues rather than grows.
     pub max_stateless: usize,
     /// Affiliated stateless requests the node may hold at once, across every
@@ -331,9 +335,16 @@ pub fn may_free(load: &IsolateLoad) -> bool {
     load.retiring && load.turns == 0 && load.requests == 0 && load.cells == 0
 }
 
-pub fn retire(load: &PoolLoad) -> Option<IsolateId> {
+pub fn retire(load: &PoolLoad, shedding: bool) -> Option<IsolateId> {
     let live = load.live().count();
-    if live == 0 {
+    // The floor counts accepting isolates, never ones already draining.
+    // Pressure can override it; housed cells and busy turns remain protected.
+    let minimum = if shedding {
+        0
+    } else {
+        load.limits.min_isolates
+    };
+    if live == 0 || live <= minimum {
         return None;
     }
 
