@@ -1,0 +1,59 @@
+name: Warm pool checks
+
+on:
+  push:
+    branches:
+      - feat/configurable-warm-pool
+  pull_request:
+    paths:
+      - crates/celld/**
+      - crates/logic/**
+      - .github/workflows/warm-pool.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: warm-pool-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  RUST_VERSION: 1.97.1
+
+jobs:
+  linux-arm64:
+    name: Verify and build Linux ARM64
+    runs-on: ubuntu-22.04-arm
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal --component clippy --component rustfmt
+          rustup default "$RUST_VERSION"
+
+      - name: Verify
+        run: |
+          cargo fmt --all --check
+          cargo test --locked --workspace
+          cargo clippy --locked --workspace --all-targets -- -D warnings
+
+      - name: Build and identify the fork binary
+        run: |
+          cargo build --release --locked -p celld
+          target/release/celld --version
+          CELLD_MIN_STATELESS_ISOLATES=1 target/release/celld --help | grep -F CELLD_MIN_STATELESS_ISOLATES
+          mkdir -p out
+          gzip -9 -n -c target/release/celld > out/celld-aarch64-unknown-linux-gnu.gz
+          git rev-parse HEAD > out/source-commit.txt
+          target/release/celld --version > out/version.txt
+          cd out
+          sha256sum celld-aarch64-unknown-linux-gnu.gz > SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: celld-warm-pool-aarch64-unknown-linux-gnu-${{ github.sha }}
+          path: out/*
+          if-no-files-found: error
