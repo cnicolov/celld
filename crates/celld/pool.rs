@@ -589,16 +589,18 @@ impl Pool {
         }
     }
 
-    /// Build one isolate up front.
+    /// Prewarm the configured minimum, and always load at least one isolate.
     ///
-    /// The pool is otherwise lazy, and an idle node holding no isolates is the
-    /// point. But the first isolate is built at startup for two reasons that
-    /// laziness cannot serve: a node whose script does not load must fail
+    /// With a zero minimum, the pool may empty while idle. But the first
+    /// isolate is built at startup for two reasons that laziness cannot serve:
+    /// a node whose script does not load must fail
     /// *then*, not once per request forever after; and compiling the script
     /// inside the first request adds its whole cost to that request's latency,
     /// which a startup probe reads as a node that never came up.
     pub fn warm(&self) -> Result<()> {
-        self.grow(Some(self.limits.max_stateless))?;
+        for _ in self.live()..self.limits.min_isolates.max(1) {
+            self.grow(Some(self.limits.max_stateless))?;
+        }
         Ok(())
     }
 
@@ -742,7 +744,9 @@ impl Pool {
     }
 
     fn retire_one(&self) -> bool {
-        let Some(id) = celld_logic::isolate::retire(&self.load()) else {
+        let Some(id) =
+            celld_logic::isolate::retire(&self.load(), crate::ownership_store::node_is_shedding())
+        else {
             return false;
         };
         let slot = self.get(id);
@@ -785,9 +789,9 @@ impl Pool {
     /// The count an operator of a hibernation-heavy node needs and could
     /// not get: a dormant cell keeps about 160 KB more than its own records
     /// explain (GCE, 2026-09-03), and the one O(cells) structure
-    /// that fits is the isolate. `live_empty` is what `reap_empty` retires
-    /// on its next pass and `retiring` is what `may_free` still refuses, so
-    /// either staying positive across passes names the leak.
+    /// that fits is the isolate. `live_empty` is reclaimed after cell eviction;
+    /// stateless pools may retain their configured warm minimum. A retiring
+    /// heap that persists after its work ends names a leak.
     pub fn census(&self) -> PoolCensus {
         let mut census = PoolCensus::default();
         for slot in self.slots.read().expect("pool poisoned").iter() {

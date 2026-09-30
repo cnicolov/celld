@@ -441,6 +441,8 @@ pub fn pool_limits() -> celld_logic::isolate::PoolLimits {
         // rather than two independently configurable values.
         grow_at: GROW_AT,
         shrink_under: SHRINK_UNDER,
+        // Cell pools must reclaim every empty heap after eviction.
+        min_isolates: 0,
         max_stateless: env_usize("CELLD_MAX_STATELESS_ISOLATES").unwrap_or(cores),
         max_requests: env_usize("CELLD_MAX_REQUESTS"),
         // This is an engine blast-radius policy. The resident-cell and RSS
@@ -2559,18 +2561,20 @@ impl StatelessRuntime {
         node: Arc<str>,
         region: Arc<str>,
     ) -> anyhow::Result<Self> {
+        let mut limits = pool_limits();
+        limits.min_isolates = crate::env_vars::stateless_pool_minimum(limits.max_stateless)?;
         let build = {
             let config = config.clone();
             move || Worker::load_config(config.clone())
         };
         let isolates = Arc::new(crate::pool::Pool::new(
-            pool_limits(),
+            limits,
             admission_wait(),
             Box::new(build),
         ));
         // Eagerly, so a script that does not load fails here rather than on
         // every request, and so the first request does not pay for compiling
-        // it. Growth past this one stays lazy.
+        // it. A configured minimum is prewarmed; growth beyond it stays lazy.
         isolates.warm().context("stateless Worker failed to load")?;
         // Give isolates back when the burst that grew them is over. Without
         // this the pool only grows, and every heap a burst created is held
