@@ -1040,6 +1040,8 @@ For the full list, run `celld -h`. This table shows the primary settings:
 | `CELLD_OPERATION_DEADLINE_MS` | The deadline for a non-restore operation (default: 15000) |
 | `CELLD_MAX_CELL_REQUESTS` | The concurrent fetch limit for one Durable Object or Queue broker (default: 64) |
 | `CELLD_MAX_REQUEST_BODY_BYTES` | The body limit for a public Worker request or a direct Durable Object request (default: 1 GiB) |
+| `CELLD_MIN_STATELESS_ISOLATES` | Minimum warm isolates per current stateless Worker service (default: 0). Positive values are prewarmed and retained during normal maintenance; 0 allows idle pools to empty. Must not exceed `CELLD_MAX_STATELESS_ISOLATES`. Memory-pressure shedding and superseded-generation draining can go below the minimum. Durable-cell pools are unaffected |
+| `CELLD_MAX_STATELESS_ISOLATES` | Maximum live isolates per stateless Worker service (default: available CPU count). A positive integer; bounds pool growth, not warm retention |
 | `CELLD_MAX_RESIDENT_CELLS` | The hard limit for resident cells, enforced at admission |
 | `CELLD_IDLE_EVICT_S` | The age in seconds after which an idle resident cell leaves memory and hibernates (unset: only pressure or the residency cap removes an idle cell) |
 | `CELLD_PLACEMENT_WEIGHT` | The ownership share of this node, relative to the other nodes' weights (default: the CPU count) |

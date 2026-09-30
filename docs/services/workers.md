@@ -74,6 +74,37 @@ that it must keep into a binding. The Cloudflare
 [best practices](https://developers.cloudflare.com/workers/best-practices/workers-best-practices/)
 give the same rule.
 
+## Retaining warm request capacity
+
+Set `CELLD_MIN_STATELESS_ISOLATES=1` on every fleet node to prewarm and retain one
+stateless isolate per deployed Worker script. All routes and named entrypoints of
+one script share that pool. For example, one `atelier-v3` script on three nodes
+retains three isolates in total; the minimum is not per request or per cell.
+This removes the recurring Worker compilation cost caused by retiring the last
+warm isolate at a quiet maintenance tick. It does not remove durable-cell
+activation costs or deployment startup.
+
+The setting is a non-negative integer and defaults to `0`. Zero permits idle
+stateless pools to empty; startup still loads one isolate so broken Worker code
+fails before serving traffic. Positive values prewarm that many isolates and keep
+normal maintenance from shrinking below that count. A burst can still grow the
+pool, and maintenance reclaims excess isolates one at a time every 30 seconds.
+
+`CELLD_MAX_STATELESS_ISOLATES` caps each stateless pool and defaults to the available
+CPU count. The minimum must not exceed this maximum. Empty, negative, malformed,
+overflowing, or contradictory settings fail startup with the setting's name.
+
+The warm minimum is a normal-maintenance floor, not a promise to retain memory
+under pressure. Memory-pressure shedding may retire below it; capacity removed
+under pressure is rebuilt on demand rather than eagerly refilled. Superseded
+deployment generations retire every isolate and drain outstanding work. Durable
+cell pools have no warm minimum, so empty heaps after cell eviction are reclaimed
+as before. `CELLD_IDLE_EVICT_S` controls durable cells separately.
+
+Each retained isolate has its own V8 heap. Choose the minimum for the number of
+deployed services and the node's memory budget. Module-scope state remains
+ephemeral even when a positive warm minimum is configured.
+
 ## Differences from Cloudflare
 
 - celld does not manage a custom domain or terminate TLS. Terminate TLS in the

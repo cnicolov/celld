@@ -29,6 +29,32 @@ Web Platform Tests. Before a release, we replay storage, SQL, alarm,
 stream, WebSocket, and lifecycle scenarios through the full `celld` binary
 in each deployment mode.
 
+### Warm stateless pool regression checks
+
+The configurable stateless retention floor has focused checks in this fork:
+
+```sh
+cargo test --locked -p celld-logic --test isolate_retention
+cargo test --locked -p celld --test stateless_retention
+```
+
+The decision-core checks cover the retention floor, excess retirement, pressure
+overrides, and the conditions for safely freeing a heap. The native checks load
+real V8 Workers and verify reuse through repeated maintenance and HTTP dispatch,
+startup prewarming, excess-isolate reclamation and slot reuse, superseded-pool
+draining with an outstanding request, pressure overrides and demand-driven
+recovery, durable-cell heap reclamation, zero/unset compatibility, and invalid settings.
+Concurrent native admission and maintenance check that affiliations remain usable
+and the live pool respects its floor and ceiling. The tests drive maintenance
+explicitly without timing-dependent sleeps.
+
+The `Warm pool checks` GitHub Actions workflow runs these checks, workspace
+Clippy, and formatting on Linux ARM64 before building a release binary. Its
+artifact includes `source-commit.txt`, `version.txt`, and `SHA256SUMS` beside the
+compressed binary. This patch is based on upstream `v0.6.0` (`bad4649`) and keeps
+the package version `0.6.0`; pin the fork's source commit and artifact checksum to
+identify the patched binary, rather than relying on `celld --version` alone.
+
 ## Specification: exhaustive at small size
 
 The coordination protocol is also specified in TLA+. Heyang Zhou wrote
