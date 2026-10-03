@@ -1,0 +1,10 @@
+{
+  "name": "rpc-capabilities",
+  "main": "index.js",
+  "compatibility_date": "2026-09-04",
+  "worker_loaders": [{ "binding": "LOADER" }],
+  "durable_objects": {
+    "bindings": [{ "name": "SESSIONS", "class_name": "SessionStore" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["SessionStore"] }]
+}

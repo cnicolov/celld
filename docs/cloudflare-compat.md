@@ -94,10 +94,22 @@ The `tail` and `email` handlers are unavailable.
 
 ### [RPC](https://developers.cloudflare.com/workers/runtime-apis/rpc/)
 
-- An RPC stub cannot cross an isolate boundary.
+- Transient RPC capabilities, callbacks, and streams can cross isolate boundaries
+  on the same node. Their calls return to the original isolate; transferring a
+  handle moves its reference, and `dup()` retains another reference.
+- Transient RPC capabilities cannot cross a node boundary. They are not durable
+  identities and fail after their owning Durable Object leaves residency.
 - An `AbortSignal` in a Durable Object RPC call does not cross a node boundary.
 - A remote RPC retries only when the failed peer attempt did not start the
   method. Use a stable operation ID for an application retry.
+
+### Custom tracing spans
+
+The `cloudflare:workers` `tracing` helpers (`enterSpan`, `startActiveSpan`,
+`startSpan`, and `Span`) are available as unsampled compatibility spans.
+`span.isTraced` is `false`; application-defined Cloudflare spans are not exported
+to celld's runtime telemetry sink. Callback return values and exceptions propagate
+normally, including asynchronous callbacks.
 
 ### [Streams](https://developers.cloudflare.com/workers/runtime-apis/streams/)
 

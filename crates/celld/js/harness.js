@@ -2197,7 +2197,7 @@ class DurableObjectFacets {
             "Pipelined property paths on facets are not supported yet.");
         return __rpcDes(await __facet_rpc(
           loader, className, this._state._scope, record.owner, name, id,
-          propsSc, path[0], __rpcOut(args, false)));
+          propsSc, path[0], __rpcOut(args, true)));
       }),
     };
     // Arrow closures retain the manager because `target.fetch`'s method
@@ -3288,7 +3288,7 @@ __celld.__makeLoader = () => {
             "yet.");
         const { id } = await loadPromise;
         return __rpcDes(
-          await __loader_rpc(id, entrypoint, path[0], __rpcOut(args, false),
+          await __loader_rpc(id, entrypoint, path[0], __rpcOut(args, true),
             propsSc, limitsJson));
       })(),
     };
@@ -3704,8 +3704,8 @@ __celld.__installLoaderEnv = (bytes, routes) => {
 // The envelope's first byte tags the payload. 0xff (the clone version
 // header) = plain clone, decoded as-is. 0x01 = clone of a lifted tree in
 // which RpcTarget instances, functions, and Durable Object stubs were
-// replaced by stub markers; the lift runs only after a plain clone
-// already threw. A projection walk happens first because V8 silently erases
+// replaced by stub markers; the lift runs after a plain clone threw or when
+// a symbol disposer would be lost. A projection walk happens first because V8 silently erases
 // custom and null prototypes. 0x02 = a lifted tree carrying only by-value
 // host types (Blob/File, Headers,
 // Request/Response) and no capabilities -- decoded like 0x01, but a
@@ -3726,6 +3726,8 @@ const __rpcUnsupportedType = (value) => new DOMException(
 const __rpcProject = (value) => {
   const seen = new Map();
   const originals = new WeakMap();
+  const disposers = new WeakMap();
+  let hasDisposers = false;
   const set = (target, key, value) => Object.defineProperty(target, key, {
     value, enumerable: true, configurable: true, writable: true,
   });
@@ -3774,9 +3776,13 @@ const __rpcProject = (value) => {
     seen.set(v, out);
     originals.set(out, v);
     for (const key of Object.keys(v)) set(out, key, project(v[key]));
+    const dispose = v[Symbol.dispose];
+    disposers.set(out, { source: v, fn: dispose });
+    if (typeof dispose === "function") hasDisposers = true;
     return out;
   };
-  return { tree: project(value), originals };
+  const tree = project(value);
+  return { tree, originals, disposers, hasDisposers };
 };
 const __tagged = (tag, sc) => {
   const out = new Uint8Array(sc.length + 1);
@@ -3896,9 +3902,8 @@ const __ctxAbortCurrent =
 // A stub entry owns a local target; `refs` counts live handles
 // across dup()s. When the last handle is disposed the target's own
 // Symbol.dispose runs (async, matching Workerd's disposal callback).
-// Stubs cross same-isolate transports only (same-script entrypoint
-// RPC and same-process routed dispatch); a marker revived elsewhere fails
-// loudly on use instead of aliasing an unrelated local entry.
+// A process-local host route keeps exported entries' isolates alive and
+// dispatches foreign handles through the owning slot's async turn permit.
 // `ctx` records the owning request context: the entry's for
 // running its target, the handle's for the serialize-elsewhere
 // check.
@@ -3910,7 +3915,7 @@ const __stubMeta = new WeakMap();
 const __doStubMeta = new WeakMap();
 let __nextStubId = 1;
 const __stubIsolate = Math.random().toString(36).slice(2);
-const __newEntry = (target) => {
+const __newEntry = (target, service = false) => {
   // `scope` records the actor event that minted the entry (top of
   // the event stack at lift time), so an actor breakage can find
   // and abort the contexts hosting its exported stubs, and an op on
@@ -3921,6 +3926,8 @@ const __newEntry = (target) => {
   const entry = {
     id: __nextStubId++, target, refs: 1, ctx: __ctxNow(), scope,
     section: __cellBlocks.get(scope)?.holder ?? null,
+    owner: __stubIsolate, service,
+    routed: __rpc_cap_register(__stubIsolate, __nextStubId - 1, scope ?? null),
   };
   __stubEntries.set(entry.id, entry);
   return entry;
@@ -3966,6 +3973,7 @@ const __cellRelease = (scope) => {
   for (const entry of __stubEntries.values()) {
     if (entry.scope !== scope) continue;
     entry.released = true;
+    if (entry.routed) __rpc_cap_forget(entry.owner, entry.id);
     __stubEntries.delete(entry.id);
     // Break in-flight ops as an abort would, but not through
     // `__actorBreak`: that records the scope broken for the life of the
@@ -3976,17 +3984,30 @@ const __cellRelease = (scope) => {
 const __releasedStubError = () => new Error(
   "The Durable Object that returned this RPC stub no longer runs on " +
   "this node.");
-const __disposeStub = (meta) => {
-  if (meta.disposed) return;
-  meta.disposed = true;
-  __ctxUnregister(meta);
-  const entry = meta.entry;
-  if (--entry.refs > 0) return;
+const __destroyEntry = (entry) => {
   __stubEntries.delete(entry.id);
   const disposer = entry.target?.[Symbol.dispose];
   if (typeof disposer === "function")
     Promise.resolve().then(() => disposer.call(entry.target));
 };
+const __disposeStub = (meta) => {
+  if (meta.disposed) return;
+  meta.disposed = true;
+  __ctxUnregister(meta);
+  const entry = meta.entry;
+  if (entry.remote || entry.routed) {
+    if (!__rpc_cap_release(entry.owner, entry.id)) return;
+  } else if (--entry.refs > 0) return;
+  __destroyEntry(entry);
+};
+const __retainEntry = (entry) => {
+  if (entry.remote || entry.routed) {
+    if (!__rpc_cap_retain(entry.owner, entry.id)) throw __releasedStubError();
+  } else entry.refs++;
+};
+const __receivedEntry = (owner, id) => owner === __stubIsolate
+  ? __stubEntries.get(id)
+  : { owner, id, remote: true };
 const __stubDisposedError = () =>
   new Error("RPC stub used after being disposed.");
 // Shared brand value for RpcTarget instances; see the RpcTarget
@@ -4081,7 +4102,7 @@ const __writableBridge = (writer) => {
   };
   return bridge;
 };
-const __liftStream = (v) => {
+const __liftStream = (v, transaction) => {
   const readable = v instanceof ReadableStream;
   const key = readable ? "__celld$rs" : "__celld$ws";
   const meta = __rpcStreamMeta.get(v);
@@ -4089,18 +4110,17 @@ const __liftStream = (v) => {
     // Re-serializing a received, untouched stream forwards the
     // original handle: the reference moves (like a stub) and
     // the local wrapper is dead -- a round trip stays one hop.
-    meta.disposed = true;
-    __ctxUnregister(meta);
-    return { [key]: meta.entry.id, t: __stubIsolate };
+    transaction.transfers.push(meta);
+    return { [key]: meta.entry.id, t: meta.entry.owner };
   }
   if (v.locked)
     throw new TypeError(readable
       ? "The ReadableStream has been locked to a reader."
       : "The WritableStream has been locked to a writer.");
-  const bridge = readable
-    ? __readableBridge(v.getReader())
-    : __writableBridge(v.getWriter());
-  return { [key]: __newEntry(bridge).id, t: __stubIsolate };
+  const lock = readable ? v.getReader() : v.getWriter();
+  transaction.locks.push(lock);
+  const bridge = readable ? __readableBridge(lock) : __writableBridge(lock);
+  return { [key]: transaction.add(bridge).id, t: __stubIsolate };
 };
 // A signal is not a snapshot on the RPC wire. The marker carries a
 // process-wide identity, and the host forwards the source's single state
@@ -4183,12 +4203,11 @@ const __rpcSignalRefresh = () => {
       __rpcSignalReceivers.set(id, live);
   }
 };
-// Replace stub-able values with wire markers. Runs only after a
-// plain clone failed, so plain-data serialization never pays for
-// it. Passing an existing stub transfers its reference: the
+// Replace stub-able values with wire markers. Plain data without symbol
+// disposers skips this walk. Passing an existing stub transfers its reference: the
 // sender's handle is disposed (dup() first to keep one) and the
 // receiver adopts it. Returns null when nothing was liftable.
-const __stubLift = (value, allowCapabilities = true, originals) => {
+const __stubLift = (value, allowCapabilities, originals, disposers, transaction) => {
   let lifted = false;
   // Capabilities (stubs, disposers) root the callee context;
   // by-value host types do not -- they pick the 0x02 envelope.
@@ -4201,7 +4220,7 @@ const __stubLift = (value, allowCapabilities = true, originals) => {
   const liftBody = (v) => {
     if (v._bodyBytes !== null) return v._bodyBytes;
     caps = true;
-    return __liftStream(v.body);
+    return __liftStream(v.body, transaction);
   };
   const lift = (v) => {
     if (v === null ||
@@ -4217,25 +4236,24 @@ const __stubLift = (value, allowCapabilities = true, originals) => {
       // A stub belongs to the request that received it; another
       // request cannot serialize it (Workerd's IoContext rule).
       if (meta.ctx !== ctx) throw __ctxError("Client");
-      meta.disposed = true; // the ref moves to the receiver
-      __ctxUnregister(meta);
+      transaction.transfers.push(meta); // commit after encoding succeeds
       const marker = { "__celld$stub": meta.entry.id,
-                       t: __stubIsolate, c: meta.callable };
+                       t: meta.entry.owner, c: meta.callable };
       seen.set(v, marker);
       return marker;
     }
     const svc = __svcMeta.get(v);
     if (svc !== undefined) {
       if (!allowCapabilities) return v;
-      // A loopback service stub (ctx.exports): name + props cross
-      // as plain data and revive as a fresh loopback stub. Props
-      // are lifted too -- they may nest further stubs (Workerd's
-      // nested channel tokens).
+      // A loopback service stub (ctx.exports) retains its originating script
+      // and props, which may themselves contain capabilities.
       lifted = true;
       caps = true;
-      const marker = { "__celld$svc": svc.name, t: __stubIsolate };
+      // Route the loopback stub to its original script, including props and
+      // session identity, rather than resolving its name in the receiver.
+      const marker = { "__celld$stub": transaction.add(v, true).id,
+        t: __stubIsolate, c: false };
       seen.set(v, marker);
-      if (svc.props !== undefined) marker.p = lift(svc.props);
       return marker;
     }
     // Workerd refuses to serialize its promise/property handles.
@@ -4249,7 +4267,7 @@ const __stubLift = (value, allowCapabilities = true, originals) => {
       if (!allowCapabilities) return v;
       lifted = true;
       caps = true;
-      const marker = { "__celld$stub": __newEntry(v).id,
+      const marker = { "__celld$stub": transaction.add(v).id,
                        t: __stubIsolate,
                        c: typeof v === "function" };
       seen.set(v, marker);
@@ -4269,7 +4287,7 @@ const __stubLift = (value, allowCapabilities = true, originals) => {
     // serialization: entry lists for Headers, the buffered bytes
     // for bodies (the marker aliases the live buffer; the clone
     // is the one wire copy), and no signal -- the receiver mints
-    // a fresh one. A live stream body cannot cross yet.
+    // a fresh one. Live stream bodies use the same routed stream handles.
     let marker;
     if (v instanceof Headers) {
       if (!allowCapabilities) return v;
@@ -4298,7 +4316,7 @@ const __stubLift = (value, allowCapabilities = true, originals) => {
                v instanceof WritableStream) {
       if (!allowCapabilities) return v;
       caps = true;
-      marker = __liftStream(v);
+      marker = __liftStream(v, transaction);
     } else if (v instanceof AbortSignal) {
       marker = __liftSignal(v);
     }
@@ -4323,14 +4341,20 @@ const __stubLift = (value, allowCapabilities = true, originals) => {
     const out = Array.isArray(v) ? [] : {};
     seen.set(v, out);
     for (const key of Object.keys(v)) out[key] = lift(v[key]);
-    const disposerSource = originals?.get(v) ?? v;
-    const disposer = disposerSource[Symbol.dispose];
+    const snapshot = disposers?.get(v);
+    const disposerSource = snapshot?.source ?? originals?.get(v) ?? v;
+    const disposer = snapshot === undefined
+      ? disposerSource[Symbol.dispose] : snapshot.fn;
     if (allowCapabilities && !Array.isArray(v) &&
         typeof disposer === "function") {
       lifted = true;
       caps = true;
-      out["__celld$disp"] =
-        __newEntry(__rpcBindMethod(disposer, disposerSource)).id;
+      out["__celld$disp"] = {
+        id: transaction.add({
+          [Symbol.dispose]: __rpcBindMethod(disposer, disposerSource),
+        }).id,
+        t: __stubIsolate,
+      };
     }
     return out;
   };
@@ -4385,16 +4409,12 @@ const __reviveResponse = (marker, revive) => {
 // stream hot paths. Read errors surface as Workerd's generic
 // premature-disconnect; write errors propagate (Workerd sends
 // real errors back through the write loop).
-const __foreignStreamOp = () => Promise.reject(new Error(
-  "RPC streams cannot cross isolate boundaries yet."));
 const __reviveStream = (marker, id, readable, handles) => {
-  const entry = marker.t === __stubIsolate
-    ? __stubEntries.get(id) : undefined;
+  const entry = __receivedEntry(marker.t, id);
   if (entry === undefined)
     return readable
-      ? new ReadableStream({ pull: __foreignStreamOp })
-      : new WritableStream({ write: __foreignStreamOp,
-          close: __foreignStreamOp, abort: __foreignStreamOp });
+      ? new ReadableStream({ pull() { throw __releasedStubError(); } })
+      : new WritableStream({ write() { throw __releasedStubError(); } });
   const meta = { entry, disposed: false, ctx: __ctxNow() };
   __ctxRegister(meta);
   handles.push(meta);
@@ -4446,15 +4466,20 @@ const __reviveSignal = (marker, id) => {
 const __stubRevive = (value) => {
   const handles = [];
   const disposers = [];
-  const seen = new Set();
+  const seen = new Map();
   const revive = (v) => {
     if (v === null || typeof v !== "object") return v;
+    if (seen.has(v)) return seen.get(v);
+    const result = reviveOne(v);
+    seen.set(v, result);
+    return result;
+  };
+  const reviveOne = (v) => {
     const stubId = v["__celld$stub"];
     if (stubId !== undefined) {
-      const entry = v.t === __stubIsolate
-        ? __stubEntries.get(stubId) : undefined;
+      const entry = __receivedEntry(v.t, stubId);
       const stub = entry === undefined
-        ? __foreignStub()
+        ? __makeStub({ id: stubId, owner: v.t, remote: true }, v.c)
         : __makeStub(entry, v.c);
       const meta = __stubMeta.get(stub);
       if (meta) handles.push(meta);
@@ -4464,7 +4489,7 @@ const __stubRevive = (value) => {
     if (svcName !== undefined)
       return v.t === __stubIsolate
         ? __entrypointStub(svcName, revive(v.p))
-        : __foreignStub();
+        : __makeStub({ id: 0, owner: v.t, remote: true }, false);
     const doClass = v["__celld$do"];
     if (doClass !== undefined) {
       const namespace = __cell.makeNamespace(doClass);
@@ -4488,8 +4513,10 @@ const __stubRevive = (value) => {
       return __reviveStream(v, wsId, false, handles);
     const sigId = v["__celld$sig"];
     if (sigId !== undefined) return __reviveSignal(v, sigId);
-    if (seen.has(v)) return v;
-    seen.add(v);
+    // Register containers before walking children to preserve cycles. Marker
+    // aliases revive once too: multiple wrappers would release one wire ref
+    // repeatedly and could destroy a target while a dup() still holds it.
+    seen.set(v, v);
     if (Array.isArray(v)) {
       for (let i = 0; i < v.length; i++) v[i] = revive(v[i]);
       return v;
@@ -4498,8 +4525,9 @@ const __stubRevive = (value) => {
     if (proto !== Object.prototype && proto !== null) return v;
     for (const key of Object.keys(v)) {
       if (key === "__celld$disp") {
-        const entry = __stubEntries.get(v[key]);
-        if (entry) disposers.push(entry);
+        const marker = v[key];
+        const entry = __receivedEntry(marker.t, marker.id);
+        if (entry) disposers.push(__stubMeta.get(__makeStub(entry, false)));
         delete v[key];
         continue;
       }
@@ -4509,16 +4537,6 @@ const __stubRevive = (value) => {
   };
   return { value: revive(value), handles, disposers };
 };
-// A marker that crossed an isolate boundary: fail on use, loudly.
-const __foreignStub = () => new Proxy(function () {}, {
-  get: (_b, prop) => {
-    if (prop === "then" || typeof prop !== "string") return undefined;
-    return () => Promise.reject(new Error(
-      "RPC stubs cannot cross isolate boundaries yet."));
-  },
-  apply: () => Promise.reject(new Error(
-    "RPC stubs cannot cross isolate boundaries yet.")),
-});
 // Workerd's entrypoint method-visibility rules (worker-rpc.c++):
 // reserved lifecycle names are refused outright; only prototype
 // methods and accessors are visible -- never own instance state
@@ -4561,6 +4579,7 @@ const __rpcWalk = async (root, path, args, entrypointRoot) => {
     if (meta) {
       if (meta.disposed) throw __stubDisposedError();
       const rest = path.slice(i);
+      if (meta.entry.remote) return __stubOp(meta, rest, args);
       return await __ctxRun(meta.entry.ctx,
         () => __rpcWalk(meta.entry.target, rest, args, false));
     }
@@ -4599,6 +4618,11 @@ const __rpcWalk = async (root, path, args, entrypointRoot) => {
 const __stubOp = (meta, path, args) => {
   if (meta.disposed) return Promise.reject(__stubDisposedError());
   const entry = meta.entry;
+  if (entry.remote) {
+    const argsSc = args === null ? null : __rpcOut(args, true);
+    return __rpc_cap_call(entry.owner, entry.id, JSON.stringify(path), argsSc)
+      .then(__rpcDes);
+  }
   // The cell that minted this stub left residency, so `entry.target`
   // belongs to an instance this node released. The stub fails here
   // rather than calling into it.
@@ -4637,7 +4661,7 @@ const __stubOp = (meta, path, args) => {
         const decoded =
           argsSc === null ? null : __rpcDesArgs(argsSc);
         try {
-          return await __rpcWalk(entry.target, path,
+          return await (entry.service ? __walkLocal : __rpcWalk)(entry.target, path,
             decoded === null ? null : decoded.args, false);
         } finally {
           if (decoded !== null)
@@ -4715,7 +4739,7 @@ const __entrypointSession = (name, local, script, makeInst, propsSc) => ({
         await __svc_rpc(
           script, name, JSON.stringify(path), null, propsSc)))(),
   call: (path, args) => (async () => {
-    const argsSc = __rpcOut(args, local);
+    const argsSc = __rpcOut(args, true);
     if (local)
       return __rpcDes(await __entrypointOp(
         name, path, argsSc, true, makeInst));
@@ -4782,7 +4806,7 @@ const __makeStub = (entry, callable) => {
       if (prop === Symbol.dispose) return () => __disposeStub(meta);
       if (prop === "dup") return () => {
         if (meta.disposed) throw __stubDisposedError();
-        entry.refs++;
+        __retainEntry(entry);
         return __makeStub(entry, callable);
       };
       if (typeof prop !== "string") return undefined;
@@ -4983,24 +5007,53 @@ const __ctxExports = () => __ctxExportsCache ??= (() => {
   return out;
 })();
 // ---- RPC envelope ----------------------------------------------
-// Serialize one payload. `lift` marks a same-isolate transport,
-// where stub-able values may cross as markers; elsewhere they stay
-// a DataCloneError, exactly as before stubs existed.
+// Serialize one payload. Capability-enabled transports use routed markers.
+// Plain results retain the structured-clone fast path; symbol disposers need
+// an explicit lift because V8 would silently drop them from a successful clone.
 const __rpcOut = (value, lift) => {
   const projected = __rpcProject(value);
-  try {
-    return __sc_encode(projected.tree);
-  } catch (error) {
-    // A cross-isolate call lifts only a live signal. A same-isolate call can
-    // also transfer the existing host values and JS capability handles.
-    const lifted = __stubLift(projected.tree, lift, projected.originals);
-    if (lifted === null) throw __dataCloneError(error);
+  let cloneError;
+  if (!lift || !projected.hasDisposers) {
     try {
-      return __tagged(
-        lifted.caps ? 1 : 2, __sc_encode(lifted.tree));
-    } catch (error_) {
-      throw __dataCloneError(error_);
+      return __sc_encode(projected.tree);
+    } catch (error) {
+      cloneError = error;
     }
+  }
+  // Lifting is transactional: a later uncloneable value must not consume
+  // existing handles, pin new routes, or leave streams locked to a bridge
+  // that the receiver will never see.
+  const entries = [];
+  const transaction = {
+    transfers: [], locks: [],
+    add(target, service = false) {
+      const entry = __newEntry(target, service);
+      entries.push(entry);
+      return entry;
+    },
+  };
+  try {
+    const lifted = __stubLift(projected.tree, lift,
+      projected.originals, projected.disposers, transaction);
+    if (lifted === null) throw __dataCloneError(cloneError);
+    let bytes;
+    try {
+      bytes = __tagged(lifted.caps ? 1 : 2, __sc_encode(lifted.tree));
+    } catch (error) {
+      throw __dataCloneError(error);
+    }
+    for (const meta of transaction.transfers) {
+      meta.disposed = true;
+      __ctxUnregister(meta);
+    }
+    return bytes;
+  } catch (error) {
+    for (const entry of entries) {
+      if (entry.routed) __rpc_cap_forget(entry.owner, entry.id);
+      __stubEntries.delete(entry.id);
+    }
+    for (const lock of transaction.locks) lock.releaseLock();
+    throw error;
   }
 };
 // A callee exception as tagged bytes: the Error crosses by value
@@ -5031,7 +5084,7 @@ const __rpcDesArgs = (bytes) => {
   if (bytes[0] === 0xff)
     return { args: __sc_decode(bytes), received: [] };
   const revived = __stubRevive(__sc_decode(bytes.subarray(1)));
-  return { args: revived.value, received: revived.handles };
+  return { args: revived.value, received: [...revived.handles, ...revived.disposers] };
 };
 // The caller half: decode a reply, rebuilding stubs and rethrowing
 // callee exceptions as real Errors with the callee's own
@@ -5048,10 +5101,7 @@ const __rpcDes = (bytes) => {
         configurable: true,
         value: () => {
           for (const handle of handles) __disposeStub(handle);
-          for (const entry of disposers) {
-            __stubEntries.delete(entry.id);
-            Promise.resolve().then(() => entry.target());
-          }
+          for (const meta of disposers) __disposeStub(meta);
         },
       });
     }
@@ -5399,11 +5449,8 @@ const __rpcTargetMethod = async (scope, method) => {
     throw new TypeError(method + " is not a function");
   return [inst, fn];
 };
-// The byte path always lifts stub-able values into the reply: the
-// markers carry the isolate token, so they revive only back in this
-// isolate (same-process routed dispatch re-enters it) and fail loudly
-// on use anywhere else. Callee exceptions cross in
-// the error envelope on every flavor.
+// The byte path lifts capabilities into routed markers. Callee exceptions
+// cross in the error envelope on every flavor.
 __celld.__dispatchRpc = async (scope, method, args) => {
   const actorEvent = __beginActorEvent(scope);
   try {
@@ -5433,6 +5480,34 @@ __celld.__dispatchRpc = async (scope, method, args) => {
     })());
   } finally {
     __endActorEvent(actorEvent);
+  }
+};
+// Host-dispatched calls use the ordinary RPC envelope and target walk. For a
+// cell target the host installs its storage/output-gate frame before entering.
+__celld.__dispatchCapabilityRpc = async (id, path, argsSc, dispose) => {
+  const entry = __stubEntries.get(id);
+  if (entry === undefined) return __rpcErrOut(__releasedStubError());
+  const actorEvent = entry.scope === undefined ? null : __beginActorEvent(entry.scope);
+  try {
+    if (dispose) {
+      __destroyEntry(entry);
+      return __rpcOut(undefined, true);
+    }
+    const meta = { entry, disposed: false };
+    const args = argsSc === null ? null : __rpcDesArgs(argsSc);
+    try {
+      const reply = await __rpcRun(() => __stubOp(meta, path,
+        args === null ? null : args.args), true);
+      // Returned values, including read-only observations, trail the owning
+      // cell's output gate just like an ordinary Durable Object RPC reply.
+      if (entry.scope !== undefined) await __rpc_cap_gate();
+      return reply;
+    } finally {
+      if (args !== null)
+        for (const handle of args.received) __disposeStub(handle);
+    }
+  } finally {
+    if (actorEvent !== null) __endActorEvent(actorEvent);
   }
 };
 const __entrypointClass = (name) => {
@@ -5720,7 +5795,7 @@ const __entrypointOp = (name, path, argsSc, local, makeInst, props) => {
         drain = __endEvent();
       }
       return await result;
-    }, local);
+    }, true);
     // Registered work drains before a plain reply. A
     // capability-bearing reply (tag 1) must not wait: a returned
     // stream's chunks may be produced by that very work, which

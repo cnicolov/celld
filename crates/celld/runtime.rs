@@ -2089,7 +2089,7 @@ async fn drive_affiliated_inner(
 // while the worker-on-cell span includes it. Neither observer owns cleanup.
 async fn drive_worker(
     slot: &crate::pool::Slot,
-    job: crate::WorkerJob,
+    mut job: crate::WorkerJob,
     trace: Option<crate::telemetry::TraceContext>,
     budget: Duration,
     mut after_turn: impl FnMut(&js::InFlight),
@@ -2097,7 +2097,22 @@ async fn drive_worker(
 ) {
     let mut ops = Ops::new();
 
+    let mut order = match &mut job {
+        crate::WorkerJob::Rpc {
+            operation: crate::WorkerRpcOperation::Capability(operation),
+            ..
+        } => operation.order.take(),
+        _ => None,
+    };
+    if let Some(order) = order.as_mut() {
+        order.wait().await;
+    }
+
     let (begun, started) = slot.turn(|worker| worker.turn_begin(job, trace)).await;
+    if let Some(order) = order.as_mut() {
+        order.delivered();
+    }
+    drop(order);
     // Nothing is in flight; the reply already carries the error.
     let Some(mut entry) = begun else {
         drop(started);
@@ -3191,7 +3206,7 @@ async fn drive_cell_inner(
         let name = match &job {
             CellJob::Fetch { .. } => "celld.cell_fetch",
             CellJob::Alarm { .. } => "celld.alarm",
-            CellJob::Rpc { .. } => "celld.rpc",
+            CellJob::Rpc { .. } | CellJob::Capability { .. } => "celld.rpc",
             CellJob::WsOpen { .. } => "celld.ws_open",
             CellJob::WsMessage { .. } => "celld.ws_message",
             CellJob::WsClosed { .. } => "celld.ws_close",
@@ -3230,7 +3245,12 @@ async fn drive_cell_inner(
         let taken = slot
             .turn_cell(&scope, |worker| {
                 let job = pending.take().expect("one job per attempt");
-                if let Some(open) = js::cell_gate_wait(job.scope()) {
+                // Capability dispatch checks the gate in JS, where the target's
+                // critical-section identity is available for reentrant calls.
+                if let Some(open) = (!matches!(&job, CellJob::Capability { .. }))
+                    .then(|| js::cell_gate_wait(job.scope()))
+                    .flatten()
+                {
                     waiting = Some(open);
                     pending = Some(job);
                     return None;

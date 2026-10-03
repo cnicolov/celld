@@ -48,6 +48,7 @@ static_source!(CACHE_SOURCE, "cache.js");
 static_source!(SOCKETS_SOURCE, "sockets.js");
 static_source!(HTML_REWRITER_SOURCE, "html_rewriter.js");
 static_source!(CRYPTO_SOURCE, "crypto.js");
+static_source!(TRACING_SOURCE, "tracing.js");
 
 static PRELUDE: &[BootstrapSource] = &[
     BootstrapSource {
@@ -85,6 +86,10 @@ static PRELUDE: &[BootstrapSource] = &[
 ];
 
 static POST_HARNESS: &[BootstrapSource] = &[
+    BootstrapSource {
+        name: "tracing.js",
+        source: &TRACING_SOURCE,
+    },
     BootstrapSource {
         name: "message_channel.js",
         source: &MESSAGE_CHANNEL_SOURCE,

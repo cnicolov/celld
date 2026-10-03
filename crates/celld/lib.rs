@@ -513,6 +513,16 @@ pub struct WorkerInvocationLimits {
 pub enum WorkerRpcOperation {
     Get { path: Vec<String> },
     Call { path: Vec<String>, args: Vec<u8> },
+    Capability(RpcCapabilityOperation),
+}
+
+/// An invocation of a transient target in its original isolate.
+pub struct RpcCapabilityOperation {
+    pub id: u64,
+    pub path: Vec<String>,
+    pub args: Option<Vec<u8>>,
+    pub dispose: bool,
+    pub order: Option<js::CallOrder>,
 }
 
 pub enum WorkerJob {

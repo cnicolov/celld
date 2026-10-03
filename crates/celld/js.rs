@@ -25,6 +25,7 @@ use std::time::{Duration, Instant};
 use v8::{ValueDeserializerHelper, ValueSerializerHelper};
 
 pub(crate) mod input_gate_lifecycle;
+mod rpc_capabilities;
 use input_gate_lifecycle::{CrossEntryGateClaim, CrossEntryGateClaims};
 
 pub use crate::engine_api::answer_ticket;
@@ -604,6 +605,11 @@ pub enum CellJob {
         args: RpcData,
         reply: tokio::sync::oneshot::Sender<Result<RpcOutcome>>,
     },
+    Capability {
+        scope: String,
+        operation: crate::RpcCapabilityOperation,
+        reply: tokio::sync::oneshot::Sender<Result<RpcOutcome>>,
+    },
     WsOpen {
         scope: String,
         ws_id: u64,
@@ -658,6 +664,7 @@ impl CellJob {
         match self {
             CellJob::Fetch { scope, .. }
             | CellJob::Rpc { scope, .. }
+            | CellJob::Capability { scope, .. }
             | CellJob::WsOpen { scope, .. }
             | CellJob::WsMessage { scope, .. }
             | CellJob::WsClosed { scope, .. }
@@ -689,6 +696,7 @@ impl CellJob {
     pub fn take_order(&mut self) -> Option<CallOrder> {
         match self {
             CellJob::Fetch { order, .. } => order.take(),
+            CellJob::Capability { operation, .. } => operation.order.take(),
             _ => None,
         }
     }
@@ -698,6 +706,7 @@ impl CellJob {
         match self {
             CellJob::Fetch { reply, .. } => drop(reply.send(Err(error))),
             CellJob::Rpc { reply, .. } => drop(reply.send(Err(error))),
+            CellJob::Capability { reply, .. } => drop(reply.send(Err(error))),
             CellJob::WsOpen { reply, .. } => drop(reply.send(Err(error))),
             CellJob::WsMessage { reply, .. } => drop(reply.send(Err(error))),
             CellJob::WsClosed { reply, .. } => drop(reply.send(Err(error))),
@@ -4663,11 +4672,31 @@ fn begin_entrypoint_rpc(
     let guard = CurrentGuard::enter(context.clone());
     context.begin_cpu_turn();
     let started = (|| {
-        let f = internal_function(tc, "__dispatchEntrypointRpc")?;
+        let capability = matches!(&operation, crate::WorkerRpcOperation::Capability(_));
+        let f = internal_function(
+            tc,
+            if capability {
+                "__dispatchCapabilityRpc"
+            } else {
+                "__dispatchEntrypointRpc"
+            },
+        )?;
         let entrypoint = v8::String::new(tc, entrypoint).unwrap();
         let (path, args) = match operation {
             crate::WorkerRpcOperation::Get { path } => (path, v8::null(tc).into()),
             crate::WorkerRpcOperation::Call { path, args } => (path, bytes_value(tc, args)),
+            crate::WorkerRpcOperation::Capability(operation) => {
+                let arguments = capability_arguments(tc, operation);
+                let recv = v8::undefined(tc).into();
+                begin_event_context(tc)?;
+                let ret = f
+                    .call(tc, recv, &arguments)
+                    .ok_or_else(|| anyhow!("capability RPC threw"))?;
+                return match ret.try_cast::<v8::Promise>() {
+                    Ok(promise) => Ok(promise),
+                    Err(_) => resolved_promise(tc, ret),
+                };
+            }
         };
         let path = path
             .iter()
@@ -5202,6 +5231,30 @@ fn start_cell_event<'s>(
     }
 }
 
+/// The internal dispatcher takes the same arguments for a cell-owned target
+/// and a target exported by a stateless Worker.
+fn capability_arguments<'s>(
+    tc: &mut v8::PinScope<'s, '_>,
+    operation: crate::RpcCapabilityOperation,
+) -> [v8::Local<'s, v8::Value>; 4] {
+    let path = operation
+        .path
+        .iter()
+        .map(|part| v8::String::new(tc, part).unwrap().into())
+        .collect::<Vec<v8::Local<v8::Value>>>();
+    let path = v8::Array::new_with_elements(tc, &path);
+    let args = operation
+        .args
+        .map(|args| bytes_value(tc, args))
+        .unwrap_or_else(|| v8::null(tc).into());
+    [
+        v8::Number::new(tc, operation.id as f64).into(),
+        path.into(),
+        args,
+        v8::Boolean::new(tc, operation.dispose).into(),
+    ]
+}
+
 /// Start a cell event's first turn.
 ///
 /// The counterpart of `begin` for the events a cell receives. Where the
@@ -5211,6 +5264,25 @@ fn start_cell_event<'s>(
 /// than by nesting.
 fn begin_cell(tc: &mut v8::PinScope, job: CellJob, event_time: i64) -> Begun {
     match job {
+        CellJob::Capability {
+            scope,
+            operation,
+            reply,
+        } => start_cell_event(
+            tc,
+            &scope,
+            Answer::CellRpc(reply),
+            None,
+            None,
+            false,
+            |tc| {
+                let f = internal_function(tc, "__dispatchCapabilityRpc")?;
+                let arguments = capability_arguments(tc, operation);
+                let recv = v8::undefined(tc).into();
+                f.call(tc, recv, &arguments)
+                    .ok_or_else(|| anyhow!("capability RPC threw"))
+            },
+        ),
         CellJob::Fetch {
             request_id,
             scope,
@@ -6729,6 +6801,12 @@ ops! { OP_NAMES, install_op_functions,
         "__rpc_signal_unsubscribe" => op_rpc_signal_unsubscribe,
         "__do_id" => op_do_id,
         "__rpc_call" => op_rpc_call,
+        "__rpc_cap_register" => rpc_capabilities::register,
+        "__rpc_cap_retain" => rpc_capabilities::retain,
+        "__rpc_cap_release" => rpc_capabilities::release,
+        "__rpc_cap_forget" => rpc_capabilities::forget,
+        "__rpc_cap_call" => rpc_capabilities::call,
+        "__rpc_cap_gate" => rpc_capabilities::output_gate,
         "__sc_encode" => storage_ops::op_sc_encode,
         "__sc_decode" => storage_ops::op_sc_decode,
         "__structured_clone" => storage_ops::op_structured_clone,
