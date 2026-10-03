@@ -990,12 +990,14 @@ fn finish_cell_adoption(tc: &mut v8::PinScope, cell: &str, owned: bool) -> Resul
     // The release loses nothing the cell needs back: `register_actor_name`
     // persists the id name before writing it here, so the take-in below reads
     // it back.
+    release_cell_contexts(tc, cell);
     let source = format!("__celld.__cell.release({cell:?});");
     run_internal_snippet(tc, &source).ok_or_else(|| anyhow!("adopt failed"))?;
     if !owned {
         // A facet of the root's own class lives in this isolate, and nothing
         // else releases it: its realm and connection would outlive the root.
         for facet in storage::embedded_facets(cell) {
+            release_cell_contexts(tc, &facet);
             let source = format!("__celld.__cell.release({facet:?});");
             run_internal_snippet(tc, &source).ok_or_else(|| anyhow!("release failed"))?;
             storage::close(&facet);
@@ -1006,6 +1008,34 @@ fn finish_cell_adoption(tc: &mut v8::PinScope, cell: &str, owned: bool) -> Resul
     let name = storage::get_actor_name(cell).context("read actor name")?;
     register_actor_name(tc, cell, name.as_deref())?;
     Ok(storage::get_alarm(cell))
+}
+
+/// The JS instance map is only one owner of a cell generation. Detached native
+/// I/O also roots its promises and callbacks, so it must retire at this edge.
+/// Snapshot the weak registry before waking drivers: dropping a context removes
+/// it from the same registry, and must never happen with its mutex held.
+fn release_cell_contexts(scope: &mut v8::PinScope, cell: &str) {
+    let state = actor_runtime_state(scope);
+    let contexts = state
+        .io_contexts
+        .lock()
+        .unwrap()
+        .values()
+        .filter_map(Weak::upgrade)
+        .collect::<Vec<_>>();
+    for context in contexts {
+        let owns_cell = context
+            .egress
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|frame| frame.storage == cell);
+        if owns_cell {
+            context.cell_released.store(true, Ordering::Release);
+            finish_retired_input_gate_context(scope, &context);
+            context.handed_wake.notify_one();
+        }
+    }
 }
 
 pub(super) fn inject_storage_compatibility(scope: &mut v8::PinScope, compat: Compat) -> Result<()> {

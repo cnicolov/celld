@@ -2121,6 +2121,10 @@ async fn drive_worker(
                 entry.finish_cross_entry_gates();
                 Vec::new()
             }
+            Wake::CellReleased => {
+                entry.retire_released_cell();
+                Vec::new()
+            }
             Wake::Cancelled { shutdown } => {
                 let started = slot
                     .turn(|worker| {
@@ -2166,6 +2170,7 @@ async fn drive_worker(
 
 /// What next moves a suspended request.
 enum Wake {
+    CellReleased,
     /// One of its own ops finished.
     Op(u64, Result<asyncrt::OpOut, String>),
     /// The detached output-gate waiter sent, or abandoned, the final reply.
@@ -2176,7 +2181,9 @@ enum Wake {
     /// A cross-entry claim changed, or subscribing closed a retirement gap.
     CrossEntryGateChanged,
     /// Its client hung up, or shutdown forced the complete event to retire.
-    Cancelled { shutdown: bool },
+    Cancelled {
+        shutdown: bool,
+    },
     /// It ran past the handler budget without answering.
     Expired,
     /// Nothing outstanding could ever move it.
@@ -2217,6 +2224,9 @@ async fn wake_with_cross_entry_gate(
 
 async fn wake(ops: &mut Ops, entry: &mut js::InFlight, budget: Duration) -> Wake {
     loop {
+        if entry.has_unobserved_cell_release() {
+            return Wake::CellReleased;
+        }
         // An op this event enqueued from inside another event's turn reaches
         // this driver here rather than through `adopt`, because the turn that
         // took it belongs to another entry. See `js::adopt`.
@@ -3281,6 +3291,10 @@ async fn drive_cell_inner(
             }
             Wake::CrossEntryGateChanged => {
                 entry.finish_cross_entry_gates();
+                (Vec::new(), Vec::new())
+            }
+            Wake::CellReleased => {
+                entry.retire_released_cell();
                 (Vec::new(), Vec::new())
             }
             Wake::Cancelled { shutdown } => {
