@@ -741,6 +741,18 @@ pub(crate) async fn receive_service_fetch_response_for_test(
 }
 
 impl RuntimeManager {
+    /// A no-progress signal for health, without interrupting admitted work,
+    /// changing ownership, or waiting for an isolate that's already stalled.
+    pub fn application_progressing(&self) -> bool {
+        const MAXIMUM_TURN_MS: u64 = 30_000;
+        let generations = self.generations.read().expect("generation lock poisoned");
+        generations.current.application_progressing(MAXIMUM_TURN_MS)
+            && generations
+                .draining
+                .iter()
+                .all(|generation| generation.application_progressing(MAXIMUM_TURN_MS))
+    }
+
     /// A deployment with no Durable Object classes can never land a Worker fetch
     /// on a cell, so the core's round-robin routing always returns `None`. Lets
     /// the request path skip the core round-trip entirely for stateless workers.

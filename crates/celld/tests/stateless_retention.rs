@@ -102,6 +102,46 @@ fn configured_minimum_reuses_the_warm_isolate_after_repeated_maintenance() {
 }
 
 #[test]
+// Observe the V8 shell's real wall-clock progress from outside its execution boundary.
+#[allow(clippy::disallowed_methods)]
+fn application_progress_is_readable_during_a_stalled_turn_and_recovers_on_return() {
+    let _environment = PoolEnvironment::new(Some("1"), Some("2"));
+    let runtime = start();
+    let request = runtime.isolates.admit(false).unwrap();
+    // Long-lived request affiliations (native I/O) spend no execution budget.
+    assert!(runtime.isolates.application_progressing(1));
+    let slot = request.slot().clone();
+    let executor = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    executor.block_on(async {
+        let (entered, receive_entered) = tokio::sync::oneshot::channel();
+        let (release, receive_release) = std::sync::mpsc::channel();
+        let running = tokio::spawn(async move {
+            slot.turn(move |_| {
+                entered.send(()).unwrap();
+                // Stand in for a non-returning V8/GC turn. The observer must
+                // not acquire the Worker lock this callback already holds.
+                receive_release.recv().unwrap();
+            })
+            .await;
+        });
+        receive_entered.await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let observed = std::time::Instant::now();
+        assert!(!runtime.isolates.application_progressing(1));
+        assert!(runtime.isolates.census().max_active_turn_ms >= 1);
+        assert!(observed.elapsed() < std::time::Duration::from_millis(100));
+        release.send(()).unwrap();
+        running.await.unwrap();
+        assert!(runtime.isolates.application_progressing(1));
+        assert_eq!(runtime.isolates.census().max_active_turn_ms, 0);
+    });
+}
+
+#[test]
 fn configured_minimum_is_prewarmed_and_superseded_pools_still_drain() {
     let _environment = PoolEnvironment::new(Some("3"), Some("3"));
     let runtime = start();

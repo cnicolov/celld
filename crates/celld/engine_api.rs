@@ -664,6 +664,9 @@ pub struct PoolCensus {
     pub requests: usize,
     /// Turns in flight across the pool.
     pub turns: usize,
+    /// Oldest continuously executing turn, sampled without entering V8.
+    /// Zero also covers idle isolates and requests suspended on native I/O.
+    pub max_active_turn_ms: u64,
     /// Physical memory V8 has committed to the heaps of the isolates a turn
     /// did not hold at the sample.
     pub heap_bytes: u64,
