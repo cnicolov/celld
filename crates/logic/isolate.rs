@@ -335,6 +335,12 @@ pub fn may_free(load: &IsolateLoad) -> bool {
     load.retiring && load.turns == 0 && load.requests == 0 && load.cells == 0
 }
 
+/// A parked timer, socket, or subrequest does not mean stalled JavaScript.
+/// Only a continuously executing isolate turn spends the progress budget.
+pub fn application_progressing(active_turn_ms: Option<u64>, maximum_turn_ms: u64) -> bool {
+    active_turn_ms.is_none_or(|age| age < maximum_turn_ms)
+}
+
 pub fn retire(load: &PoolLoad, shedding: bool) -> Option<IsolateId> {
     let live = load.live().count();
     // The floor counts accepting isolates, never ones already draining.

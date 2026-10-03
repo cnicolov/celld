@@ -1796,6 +1796,13 @@ impl AppHandle {
     }
 
     pub async fn healthy(&self) -> bool {
+        if self
+            .runtime
+            .as_ref()
+            .is_some_and(|runtime| !runtime.application_progressing())
+        {
+            return false;
+        }
         let (reply, receive) = oneshot::channel();
         if self.tx.send(Message::Health { reply }).is_err() {
             return false;

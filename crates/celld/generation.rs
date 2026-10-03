@@ -411,6 +411,20 @@ impl Generation {
         }
     }
 
+    pub(crate) fn application_progressing(&self, maximum_turn_ms: u64) -> bool {
+        self.stateless
+            .isolates
+            .application_progressing(maximum_turn_ms)
+            && self
+                .services
+                .values()
+                .all(|service| service.isolates.application_progressing(maximum_turn_ms))
+            && self
+                .cell_isolates
+                .values()
+                .all(|pool| pool.application_progressing(maximum_turn_ms))
+    }
+
     /// The isolates this generation holds right now, for `/state`.
     pub(crate) fn isolate_census(&self) -> IsolateCensus {
         IsolateCensus {

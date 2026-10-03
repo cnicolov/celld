@@ -182,6 +182,9 @@ pub struct Slot {
     turn_scheduler: TurnScheduler,
     queue_producers: Mutex<std::collections::HashMap<String, usize>>,
     turns: AtomicUsize,
+    /// Held only to publish/read a monotonic timestamp, never across V8 work.
+    /// Health must be readable even when an application turn cannot return.
+    active_turn: Mutex<Option<std::time::Instant>>,
     requests: AtomicUsize,
     /// The pool's admission bell, cloned into every slot so an
     /// `Affiliation` drop can ring it without holding the pool.
@@ -256,6 +259,14 @@ impl Slot {
             TurnLane::Cell(scope) => scope,
         });
         let previous = CURRENT_SLOT.replace(Some(self.me.clone()));
+        struct Running<'a>(&'a Mutex<Option<std::time::Instant>>);
+        impl Drop for Running<'_> {
+            fn drop(&mut self) {
+                *self.0.lock().expect("turn progress poisoned") = None;
+            }
+        }
+        *self.active_turn.lock().expect("turn progress poisoned") = Some(std::time::Instant::now());
+        let _running = Running(&self.active_turn);
         let result = f(worker);
         CURRENT_SLOT.set(previous);
         result
@@ -315,6 +326,7 @@ impl Slot {
             turn_scheduler: TurnScheduler::default(),
             queue_producers: Mutex::new(std::collections::HashMap::new()),
             turns: AtomicUsize::new(0),
+            active_turn: Mutex::new(None),
             requests: AtomicUsize::new(0),
             freed: Arc::new(tokio::sync::Notify::new()),
             cells: AtomicUsize::new(0),
@@ -340,6 +352,7 @@ impl Slot {
             turn_scheduler: TurnScheduler::default(),
             queue_producers: Mutex::new(std::collections::HashMap::new()),
             turns: AtomicUsize::new(0),
+            active_turn: Mutex::new(None),
             requests: AtomicUsize::new(0),
             freed: Arc::new(tokio::sync::Notify::new()),
             cells: AtomicUsize::new(0),
@@ -392,6 +405,13 @@ impl Slot {
     /// The node-wide identity of this slot's currently installed V8 heap.
     pub fn heap_id(&self) -> HeapId {
         self.heap_id
+    }
+
+    fn active_turn_age_ms(&self) -> Option<u64> {
+        self.active_turn
+            .lock()
+            .expect("turn progress poisoned")
+            .map(|started| u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX))
     }
 
     fn is_reusable(&self) -> bool {
@@ -565,6 +585,7 @@ impl Pool {
             turn_scheduler: TurnScheduler::default(),
             queue_producers: Mutex::new(std::collections::HashMap::new()),
             turns: AtomicUsize::new(0),
+            active_turn: Mutex::new(None),
             requests: AtomicUsize::new(0),
             freed: self.freed.clone(),
             cells: AtomicUsize::new(0),
@@ -799,6 +820,9 @@ impl Pool {
             census.cells += load.cells;
             census.requests += load.requests;
             census.turns += load.turns;
+            if let Some(age) = slot.active_turn_age_ms() {
+                census.max_active_turn_ms = census.max_active_turn_ms.max(age);
+            }
             // A heap is gone once its worker was taken. A worker a turn
             // holds right now is installed, so a failed `try_lock` counts
             // as a heap and never as freed; its size is unknown this pass.
@@ -827,6 +851,21 @@ impl Pool {
             }
         }
         census
+    }
+
+    /// No Worker/isolate lock: stalled application execution cannot hide its
+    /// health behind the same lock that it holds. Suspended I/O has no turn.
+    pub fn application_progressing(&self, maximum_turn_ms: u64) -> bool {
+        self.slots
+            .read()
+            .expect("pool poisoned")
+            .iter()
+            .all(|slot| {
+                celld_logic::isolate::application_progressing(
+                    slot.active_turn_age_ms(),
+                    maximum_turn_ms,
+                )
+            })
     }
 }
 
