@@ -189,6 +189,7 @@ pub struct RpcCallReq {
     pub method: String,
     pub args: RpcData,
     pub reply: tokio::sync::oneshot::Sender<Result<RpcData>>,
+    pub parent: Option<crate::telemetry::TraceContext>,
 }
 pub(crate) static RPC_CALL_TX: OnceLock<tokio::sync::mpsc::UnboundedSender<RpcCallReq>> =
     OnceLock::new();

@@ -556,6 +556,16 @@ async fn serve_rpc(upgraded: hyper::upgrade::Upgraded, app: AppHandle) {
                 .get(NAME_HEADER)
                 .and_then(|value| value.to_str().ok())
                 .map(str::to_string);
+            let parent = inner
+                .headers()
+                .get("traceparent")
+                .and_then(|value| value.to_str().ok())
+                .and_then(celld::telemetry::parse_traceparent)
+                .map(|parent| celld::telemetry::TraceContext {
+                    trace_id: parent.trace_id,
+                    span_id: parent.span_id,
+                    sampled: parent.sampled,
+                });
             let structured = inner
                 .headers()
                 .get(hyper::header::CONTENT_TYPE)
@@ -591,7 +601,7 @@ async fn serve_rpc(upgraded: hyper::upgrade::Upgraded, app: AppHandle) {
                     }
                 }
             };
-            let reply = dispatch_forwarded_rpc(app, scope, name, method, args).await;
+            let reply = dispatch_forwarded_rpc(app, scope, name, method, args, parent).await;
             Ok(reply)
         }
     });
@@ -607,6 +617,7 @@ pub(crate) async fn rpc(
     name: Option<&str>,
     method: &str,
     args: &celld::js::RpcData,
+    parent: Option<&celld::telemetry::TraceContext>,
 ) -> anyhow::Result<Response<PooledResponseBody>> {
     let (content_type, payload) = match args {
         celld::js::RpcData::Json(json) => ("application/json", Bytes::from(json.clone())),
@@ -624,6 +635,9 @@ pub(crate) async fn rpc(
                 .header(hyper::header::CONTENT_TYPE, content_type);
             if let Some(name) = name {
                 inner = inner.header(NAME_HEADER, name);
+            }
+            if let Some(parent) = parent {
+                inner = inner.header("traceparent", celld::telemetry::traceparent(parent));
             }
             Ok(inner.body(body)?)
         },

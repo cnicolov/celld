@@ -6785,6 +6785,9 @@ ops! { OP_NAMES, install_op_functions,
         "__event_depth" => op_event_depth,
         "__als_get" => op_als_get,
         "__als_set" => op_als_set,
+        "__workflow_trace_new" => op_workflow_trace_new,
+        "__workflow_trace_enter" => op_workflow_trace_enter,
+        "__workflow_span" => op_workflow_span,
         "__util_type_flags" => op_util_type_flags,
         "__util_constructor_name" => op_util_constructor_name,
         "__util_proxy_details" => op_util_proxy_details,
@@ -8683,6 +8686,7 @@ fn op_rpc_call(
         method,
         args,
         reply: tx,
+        parent: current_trace_context(scope),
     };
     let id = asyncrt::enqueue(async move {
         gated_channel_send(gate, &RPC_CALL_TX, request, "no RPC channel").await?;
@@ -9781,6 +9785,74 @@ fn op_log(
     };
     tracing::info!(target: "cell_console", "{}", displayed);
 }
+/// Allocate a serializable, sampling-preserving Workflow context.
+fn op_workflow_trace_new(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    if !crate::telemetry::active() {
+        return;
+    }
+    let parent = if args.get(0).is_string() {
+        serde_json::from_str::<crate::telemetry::WorkflowTrace>(
+            &args.get(0).to_rust_string_lossy(scope),
+        )
+        .ok()
+        .map(crate::telemetry::WorkflowTrace::context)
+    } else {
+        current_trace_context(scope)
+    };
+    if let Some(trace) = crate::telemetry::WorkflowTrace::new(parent) {
+        if let Ok(json) = serde_json::to_string(&trace) {
+            if let Some(value) = v8::String::new(scope, &json) {
+                rv.set(value.into());
+            }
+        }
+    }
+}
+
+/// Bind only the trace CPED rider; preserve ALS and the native IoContext token.
+/// Promise continuations registered by the callback inherit this exact context.
+fn op_workflow_trace_enter(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let Ok(callback) = v8::Local::<v8::Function>::try_from(args.get(1)) else {
+        return;
+    };
+    let trace = serde_json::from_str::<crate::telemetry::WorkflowTrace>(
+        &args.get(0).to_rust_string_lossy(scope),
+    )
+    .ok()
+    .map(crate::telemetry::WorkflowTrace::context);
+    let previous = install_trace(scope, trace.as_ref());
+    let receiver = v8::undefined(scope).into();
+    let result = callback.call(scope, receiver, &[]);
+    restore_trace(scope, previous);
+    if let Some(value) = result {
+        rv.set(value);
+    }
+}
+
+fn op_workflow_span(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
+    if !crate::telemetry::active() {
+        return;
+    }
+    let json = args.get(0).to_rust_string_lossy(scope);
+    if json.len() > 64 * 1024 {
+        return;
+    }
+    if let Ok(span) = serde_json::from_str::<crate::telemetry::WorkflowSpan>(&json) {
+        crate::telemetry::record_workflow_span(span);
+    }
+}
+
 /// `__isolate_condemn(reason)` -> whether this isolate will be replaced.
 ///
 /// The guest's own verdict that it cannot run here again: the Python bundle

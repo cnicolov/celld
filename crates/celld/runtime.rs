@@ -1786,6 +1786,19 @@ impl RuntimeManager {
         args: js::RpcData,
         request_id: Option<js::RequestId>,
     ) -> anyhow::Result<js::RpcOutcome> {
+        self.rpc_with_parent(cell, name, method, args, request_id, None)
+            .await
+    }
+
+    pub async fn rpc_with_parent(
+        &self,
+        cell: String,
+        name: Option<String>,
+        method: String,
+        args: js::RpcData,
+        request_id: Option<js::RequestId>,
+        parent: Option<crate::telemetry::TraceContext>,
+    ) -> anyhow::Result<js::RpcOutcome> {
         let (reply, receive) = tokio::sync::oneshot::channel();
         let job = CellJob::Rpc {
             request_id,
@@ -1795,8 +1808,14 @@ impl RuntimeManager {
             args,
             reply,
         };
-        self.cell_event(&cell, job, receive, "cell isolate dropped RPC result")
-            .await
+        let isolate = self.cell_isolate(&cell)?;
+        tokio::spawn(drive_cell(
+            isolate,
+            job,
+            Some(self.alarm_reporter.clone()),
+            parent,
+        ));
+        receive.await.context("cell isolate dropped RPC result")?
     }
 
     pub async fn ws_message(

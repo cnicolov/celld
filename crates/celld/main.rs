@@ -1357,6 +1357,7 @@ async fn dispatch_rpc_call(app: AppHandle, call: RpcCallReq) {
         method,
         args,
         reply,
+        parent,
     } = call;
     let result = async {
         anyhow::ensure!(
@@ -1378,7 +1379,14 @@ async fn dispatch_rpc_call(app: AppHandle, call: RpcCallReq) {
                             app.runtime
                                 .as_ref()
                                 .context("no cell runtime")?
-                                .rpc(scope, name, method, args, local_request_id)
+                                .rpc_with_parent(
+                                    scope,
+                                    name,
+                                    method,
+                                    args,
+                                    local_request_id,
+                                    parent,
+                                )
                                 .await
                         })
                         .await;
@@ -1420,6 +1428,7 @@ async fn dispatch_rpc_call(app: AppHandle, call: RpcCallReq) {
                     name.as_deref(),
                     &method,
                     &args,
+                    parent.as_ref(),
                 )
                 .await;
                 // Classify failures before response decoding. An explicit stale
@@ -2172,6 +2181,7 @@ pub(crate) async fn dispatch_forwarded_rpc(
     name: Option<String>,
     rpc_method: String,
     args: celld::js::RpcData,
+    parent: Option<celld::telemetry::TraceContext>,
 ) -> HttpReply {
     let result = match app.request(scope.clone()).await {
         Ok(Routed {
@@ -2184,7 +2194,14 @@ pub(crate) async fn dispatch_forwarded_rpc(
                 return peer_response(response(StatusCode::SERVICE_UNAVAILABLE, "no cell runtime"));
             };
             let completed = local
-                .run(runtime.rpc(scope, name, rpc_method, args, local_request_id))
+                .run(runtime.rpc_with_parent(
+                    scope,
+                    name,
+                    rpc_method,
+                    args,
+                    local_request_id,
+                    parent,
+                ))
                 .await;
             match completed.result {
                 Ok(outcome) => Ok(outcome.data),

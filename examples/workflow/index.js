@@ -13,7 +13,7 @@ export class ReportBuilder extends WorkflowEntrypoint {
 }
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     const url = new URL(request.url);
     const id = url.searchParams.get("id");
 
@@ -29,7 +29,38 @@ export default {
       return Response.json(await instance.status());
     }
 
-    return new Response("Use /create?url=URL or /status?id=ID.", {
+    if (url.pathname === "/events" && id) {
+      if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
+        return new Response("WebSocket upgrade required", { status: 426 });
+      }
+      const instance = await env.REPORTS.get(id);
+      const subscription = await instance.subscribe({
+        ...(url.searchParams.has("cursor")
+          ? { cursor: Number(url.searchParams.get("cursor")) } : {}),
+      });
+      const [client, server] = Object.values(new WebSocketPair());
+      server.accept();
+      const dispose = () => subscription[Symbol.dispose]();
+      server.addEventListener("close", dispose);
+      server.addEventListener("error", dispose);
+      ctx.waitUntil((async () => {
+        try {
+          while (true) {
+            const result = await subscription.next();
+            if (result.done) break;
+            server.send(JSON.stringify(result.value));
+          }
+          server.close(1000, "Workflow ended");
+        } catch {
+          server.close(1011, "Reconnect with the last processed eventId");
+        } finally {
+          dispose();
+        }
+      })());
+      return new Response(null, { status: 101, webSocket: client });
+    }
+
+    return new Response("Use /create?url=URL, /status?id=ID or WebSocket /events?id=ID.", {
       status: 404,
     });
   },
