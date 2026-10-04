@@ -10,6 +10,7 @@
 //! Field numbers follow opentelemetry-proto v1: trace/v1/trace.proto,
 //! logs/v1/logs.proto, common/v1/common.proto, resource/v1/resource.proto.
 
+use crate::telemetry::AttributeValue;
 use crate::telemetry::Log;
 use crate::telemetry::Span;
 
@@ -53,7 +54,7 @@ fn field_fixed64(out: &mut Vec<u8>, field: u64, value: u64) {
     out.extend_from_slice(&value.to_le_bytes());
 }
 
-/// common.v1.AnyValue: string_value=1, bool_value=2, int_value=3.
+/// common.v1.AnyValue: string_value=1, bool_value=2, int_value=3, double_value=4.
 fn any_string(value: &str) -> Vec<u8> {
     let mut out = Vec::with_capacity(value.len() + 4);
     field_str(&mut out, 1, value);
@@ -69,6 +70,12 @@ fn any_bool(value: bool) -> Vec<u8> {
 fn any_int(value: i64) -> Vec<u8> {
     let mut out = Vec::new();
     field_varint(&mut out, 3, value as u64);
+    out
+}
+
+fn any_double(value: f64) -> Vec<u8> {
+    let mut out = Vec::new();
+    field_fixed64(&mut out, 4, value.to_bits());
     out
 }
 
@@ -147,6 +154,15 @@ fn span_message(span: &Span) -> Vec<u8> {
     }
     if let Some(remote) = span.parent_remote {
         key_value(&mut out, 9, "celld.parent_remote", any_bool(remote));
+    }
+    for (name, value) in &span.attributes {
+        let value = match value {
+            AttributeValue::String(value) => any_string(value),
+            AttributeValue::Int(value) => any_int(*value),
+            AttributeValue::Bool(value) => any_bool(*value),
+            AttributeValue::Float(value) => any_double(*value),
+        };
+        key_value(&mut out, 9, name, value);
     }
     // Status (15): unset when ok, per the spec; ERROR (code=3 value 2)
     // with the message when not.

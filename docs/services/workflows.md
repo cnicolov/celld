@@ -103,6 +103,80 @@ of the fleet and the resident-cell cap bound that number instead. A waiting
 instance costs no memory, so a fleet holds far more waiting instances than
 running ones.
 
+## Subscribe to execution events
+
+`WorkflowInstance.subscribe({ cursor?, filter? })` reads retained execution history
+and then waits for live events. It observes engine transitions, including native
+timeouts, result-validation failures, retry backoff, sleeps, waits, and lifecycle
+controls. Every event includes `instanceId`, an increasing numeric `eventId`, and
+an observed UNIX `timestamp` in milliseconds. Event-specific fields follow the
+[Cloudflare event definitions](https://developers.cloudflare.com/workflows/build/subscribe-to-instance-events/#event-fields).
+
+```js
+const instance = await env.REPORTS.get(instanceId);
+using subscription = await instance.subscribe({
+  cursor: lastProcessedEventId,
+  filter: ["attempt_errored", "step_completed", "workflow_completed", "workflow_errored"],
+});
+
+while (true) {
+  const result = await subscription.next();
+  if (result.done) break;
+  await archiveEvent(result.value);
+  lastProcessedEventId = result.value.eventId;
+}
+```
+
+- An omitted cursor starts at the beginning of the current execution generation.
+  A supplied cursor starts strictly after that ID. Cursors must be non-negative
+  safe integers and cannot be ahead of retained history.
+- An omitted filter selects all events. An empty filter selects none, but still
+  waits for the instance to end. Unknown event types are rejected.
+- A subscription ends at the first `workflow_completed`, `workflow_errored`, or
+  `workflow_terminated` event, even if the filter excludes that event. Subsequent
+  `next()` calls return `{ done: true, value: undefined }`.
+- Use `using` or `subscription[Symbol.dispose]()` to release the handle. Disposal
+  completes a pending `next()` with `done: true`. One handle supports one pending
+  `next()` at a time; concurrent readers should create separate subscriptions.
+- A failed RPC does not advance the handle's cursor. Reconnect after a process or
+  ownership change with the last event ID your application successfully processed.
+
+History and the corresponding ledger transition share one SQLite transaction.
+Delivery waits for the cell's replicated durability proof. Subscribers pull bounded
+history pages; there is no per-subscriber backlog of live events in memory. Live
+reads long-poll the owner for up to 25 seconds. Disposal sends routed cancellation;
+the long-poll deadline bounds cleanup if the caller disconnects without disposing.
+An actively observed waiting instance has resident RPC work; unobserved waiting
+instances still hibernate normally. The public handle is a caller-local RPC target,
+subject to celld's existing RPC-target transport restrictions.
+
+An automatic crash replay can emit `attempt_started` again with the same Step name
+and attempt number. Each observation has its own event ID: the interrupted callback
+did not become a newly numbered retry. celld does not invent an attempt settlement
+or exact crash time for work whose result never committed.
+
+Explicit `restart()` preserves the instance's history and keeps event IDs increasing.
+A new subscription without a cursor observes the new generation. To read an older
+generation, supply its cursor (or `0` for the first generation); that subscription
+still stops at the first terminal event it encounters. A selected restart does not
+emit new completion events for copied checkpoints. History expires with the instance
+under its configured retention and is removed by `delete()`. Existing handles reject
+if that instance is deleted, expired, or replaced. Instances created before this
+feature continue to execute but `subscribe()` rejects because their complete history
+was never recorded.
+
+The [Workflow example](../../examples/workflow/index.js) exposes `/events?id=ID` as
+a WebSocket, with optional `cursor=EVENT_ID`. See
+[the subscription test instructions](../../tests/workflow-subscribe/README.md) for
+the real-runtime restart, timeout, cursor and disposal checks.
+
+With telemetry enabled, these native transitions also produce a correlated
+Workflow/Step/attempt span tree, including retry delays, sleeps, event waits and
+pause intervals. See [Workflow timelines](../telemetry.md#workflow-timelines) for
+OTLP/Parquet attributes, recovery semantics and a runnable motel demo. The retained
+subscription history is authoritative; the telemetry exporter is sampled and
+best effort.
+
 ## Differences from Cloudflare
 
 - celld retains a successful or failed instance for 30 days by default. Each
