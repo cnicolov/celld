@@ -202,13 +202,31 @@ pub struct Options {
     pub dry_run: bool,
     pub json: bool,
     /// Worker variables that override the `vars` of the config. `celld dev`
-    /// reads them from `.dev.vars`; `celld deploy` supplies none, so a local
-    /// credential cannot reach a fleet.
-    pub vars: BTreeMap<String, String>,
+    /// reads them from `.dev.vars` or the dotenv files; `celld deploy`
+    /// supplies none, so a local credential cannot reach a fleet.
+    pub vars: VarOverrides,
     /// Keep container images in the local engine instead of saving them to
     /// the bucket. `celld dev` runs its node on the same engine that built
     /// them; a fleet needs the tar.
     pub local_images: bool,
+}
+
+/// Local Worker variables, tagged with the kind of file that supplied them.
+/// The kind decides what an entry that cannot become a var binding does, so
+/// it travels with the entries instead of beside them.
+#[derive(Default)]
+pub enum VarOverrides {
+    #[default]
+    None,
+    /// `.dev.vars` exists only for the Worker, so an entry that cannot become
+    /// a binding is a mistake, and it fails the build.
+    DevVars(BTreeMap<String, String>),
+    /// `.env` and `.env.local` also serve other tools, such as a bundler or an
+    /// ORM. An entry with a name that is not a valid binding, or a name that
+    /// another binding of the config uses, is skipped with a warning. Failing
+    /// instead stops a `celld dev` that `wrangler dev` runs, and the only
+    /// workaround is an empty `.dev.vars`.
+    DotEnv(BTreeMap<String, String>),
 }
 
 pub fn print_help() {
@@ -244,7 +262,7 @@ pub fn options_from_arguments(
         dry_run: false,
         local_images: false,
         json: false,
-        vars: BTreeMap::new(),
+        vars: VarOverrides::None,
     };
     let mut arguments = arguments.into_iter();
     while let Some(argument) = arguments.next() {
@@ -1266,11 +1284,7 @@ pub(crate) fn resolve_config(given: Option<PathBuf>) -> anyhow::Result<PathBuf> 
     )
 }
 
-fn read_project(
-    path: &Path,
-    root: &Path,
-    overrides: &BTreeMap<String, String>,
-) -> anyhow::Result<Project> {
+fn read_project(path: &Path, root: &Path, overrides: &VarOverrides) -> anyhow::Result<Project> {
     let source =
         std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     let config: Value = serde_json::from_str(&strip_jsonc(&source))
@@ -1875,15 +1889,40 @@ fn read_project(
         Some(_) => bail!("config `vars` must be an object"),
     }
     // An asset-only project has no Worker to hand a variable to, so a
-    // `.dev.vars` beside it is residue, not a binding the guard below
+    // `.dev.vars` or `.env` beside it is residue, not a binding the guard below
     // should refuse in the config's name.
     let declared_vars = !vars.is_empty();
     if main.is_some() {
-        vars.extend(
-            overrides
-                .iter()
-                .map(|(name, value)| (name.as_str(), value.as_str())),
-        );
+        match overrides {
+            VarOverrides::None => {}
+            VarOverrides::DevVars(entries) => vars.extend(
+                entries
+                    .iter()
+                    .map(|(name, value)| (name.as_str(), value.as_str())),
+            ),
+            VarOverrides::DotEnv(entries) => {
+                // A config var of the same name is the override the entry
+                // exists for; every other binding owns its name.
+                let taken = bindings
+                    .iter()
+                    .filter_map(|binding| binding.get("name").and_then(Value::as_str))
+                    .chain(
+                        assets
+                            .as_ref()
+                            .and_then(|assets| assets.config.binding.as_deref()),
+                    )
+                    .collect::<BTreeSet<_>>();
+                for (name, value) in entries {
+                    if !valid_binding(name) {
+                        note!("warning: skipped the dotenv entry {name:?}, which is not a valid binding name");
+                    } else if taken.contains(name.as_str()) {
+                        note!("warning: skipped the dotenv entry {name:?}, whose name another binding uses");
+                    } else {
+                        vars.insert(name, value);
+                    }
+                }
+            }
+        }
     }
     for (name, value) in &vars {
         if !valid_binding(name) {

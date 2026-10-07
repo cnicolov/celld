@@ -607,12 +607,17 @@ pub enum CellJob {
     WsOpen {
         scope: String,
         ws_id: u64,
+        /// As on `WsMessage`, for a socket that a facet dialed.
+        facet_opening: Option<u64>,
         protocol: String,
         reply: tokio::sync::oneshot::Sender<Result<Option<u64>>>,
     },
     WsMessage {
         scope: String,
         ws_id: u64,
+        /// The opening of the facet that accepted the socket, for an event of
+        /// a facet's socket. See `facet_socket_refusal`.
+        facet_opening: Option<u64>,
         data: WsIn,
         /// Released after the first turn, so the socket can deliver the next
         /// message in order without waiting for this handler's async work.
@@ -622,6 +627,8 @@ pub enum CellJob {
     WsClosed {
         scope: String,
         ws_id: u64,
+        /// As on `WsMessage`.
+        facet_opening: Option<u64>,
         code: u16,
         reason: String,
         was_clean: bool,
@@ -5244,6 +5251,24 @@ fn start_cell_event<'s>(
     }
 }
 
+/// Why an event of a facet's socket must not run, if it must not.
+///
+/// The check runs in the turn that would start the handler, so no abort or
+/// give-back can close the facet between the check and the dispatch. An
+/// event for a facet that is not open would otherwise reach `_instance`,
+/// which constructs a missing instance: the class would run under the
+/// facet's scope with no storage and outside its root's lifetime.
+///
+/// The check compares the opening, not the root epoch. A facet that its root
+/// reopened is a new actor that never accepted the socket, and a generation
+/// swap reopens a facet at the same epoch. The new isolate's owner counter
+/// starts again, so the facet's scope can repeat too.
+fn facet_socket_refusal(scope: &str, facet_opening: Option<u64>) -> Option<anyhow::Error> {
+    let opening = facet_opening?;
+    (storage::facet_opening(scope) != Some(opening))
+        .then(|| anyhow!("the Durable Object facet that holds this WebSocket is no longer running"))
+}
+
 /// Start a cell event's first turn.
 ///
 /// The counterpart of `begin` for the events a cell receives. Where the
@@ -5345,68 +5370,96 @@ fn begin_cell(tc: &mut v8::PinScope, job: CellJob, event_time: i64) -> Begun {
         CellJob::WsOpen {
             scope,
             ws_id,
+            facet_opening,
             protocol,
             reply,
-        } => start_cell_event(tc, &scope, Answer::Ack(reply), None, None, false, |tc| {
-            let f = internal_function(tc, "__wsOpen")?;
-            let arguments = [
-                v8::String::new(tc, &scope).unwrap().into(),
-                v8::Number::new(tc, ws_id as f64).into(),
-                v8::String::new(tc, &protocol).unwrap().into(),
-            ];
-            let recv = v8::undefined(tc).into();
-            f.call(tc, recv, &arguments)
-                .ok_or_else(|| anyhow!("wsOpen threw"))
-        }),
-        CellJob::WsMessage {
-            scope,
-            ws_id,
-            data,
-            reply,
-            ..
-        } => start_cell_event(
-            tc,
-            &scope,
-            Answer::WsMessage(reply),
-            None,
-            None,
-            true,
-            |tc| {
-                let (name, data) = match data {
-                    WsIn::Text(text) => ("__wsMessage", v8::String::new(tc, &text).unwrap().into()),
-                    WsIn::Binary(bytes) => ("__wsBinary", bytes_value(tc, bytes)),
-                };
-                let f = internal_function(tc, name)?;
+        } => {
+            // The dial fails rather than open a socket that no handler of
+            // the facet can receive.
+            if let Some(refusal) = facet_socket_refusal(&scope, facet_opening) {
+                let _ = reply.send(Err(refusal));
+                return Begun::Nothing;
+            }
+            start_cell_event(tc, &scope, Answer::Ack(reply), None, None, false, |tc| {
+                let f = internal_function(tc, "__wsOpen")?;
                 let arguments = [
                     v8::String::new(tc, &scope).unwrap().into(),
                     v8::Number::new(tc, ws_id as f64).into(),
-                    data,
+                    v8::String::new(tc, &protocol).unwrap().into(),
                 ];
                 let recv = v8::undefined(tc).into();
                 f.call(tc, recv, &arguments)
-                    .ok_or_else(|| anyhow!("WebSocket message dispatch threw"))
-            },
-        ),
+                    .ok_or_else(|| anyhow!("wsOpen threw"))
+            })
+        }
+        CellJob::WsMessage {
+            scope,
+            ws_id,
+            facet_opening,
+            data,
+            reply,
+            ..
+        } => {
+            if let Some(refusal) = facet_socket_refusal(&scope, facet_opening) {
+                let _ = reply.send(Err(refusal));
+                return Begun::Nothing;
+            }
+            start_cell_event(
+                tc,
+                &scope,
+                Answer::WsMessage(reply),
+                None,
+                None,
+                true,
+                |tc| {
+                    let (name, data) = match data {
+                        WsIn::Text(text) => {
+                            ("__wsMessage", v8::String::new(tc, &text).unwrap().into())
+                        }
+                        WsIn::Binary(bytes) => ("__wsBinary", bytes_value(tc, bytes)),
+                    };
+                    let f = internal_function(tc, name)?;
+                    let arguments = [
+                        v8::String::new(tc, &scope).unwrap().into(),
+                        v8::Number::new(tc, ws_id as f64).into(),
+                        data,
+                    ];
+                    let recv = v8::undefined(tc).into();
+                    f.call(tc, recv, &arguments)
+                        .ok_or_else(|| anyhow!("WebSocket message dispatch threw"))
+                },
+            )
+        }
         CellJob::WsClosed {
             scope,
             ws_id,
+            facet_opening,
             code,
             reason,
             was_clean,
             reply,
-        } => start_cell_event(tc, &scope, Answer::Ack(reply), None, None, false, |tc| {
-            let f = internal_function(tc, "__wsClosed")?;
-            let arguments = [
-                v8::String::new(tc, &scope).unwrap().into(),
-                v8::Number::new(tc, ws_id as f64).into(),
-                v8::Number::new(tc, f64::from(code)).into(),
-                v8::String::new(tc, &reason).unwrap().into(),
-                v8::Boolean::new(tc, was_clean).into(),
-            ];
-            let recv = v8::undefined(tc).into();
-            f.call(tc, recv, &arguments)
-                .ok_or_else(|| anyhow!("wsClosed threw"))
-        }),
+        } => {
+            // A facet that stopped is not told that its socket closed, as an
+            // aborted actor in workerd is not: the socket closed because the
+            // facet stopped, and no handler is left to run.
+            if facet_socket_refusal(&scope, facet_opening).is_some() {
+                let _ = reply.send(Ok(None));
+                return Begun::Nothing;
+            }
+            start_cell_event(tc, &scope, Answer::Ack(reply), None, None, false, |tc| {
+                let f = internal_function(tc, "__wsClosed")?;
+                let arguments = [
+                    v8::String::new(tc, &scope).unwrap().into(),
+                    v8::Number::new(tc, ws_id as f64).into(),
+                    v8::Number::new(tc, f64::from(code)).into(),
+                    v8::String::new(tc, &reason).unwrap().into(),
+                    v8::Boolean::new(tc, was_clean).into(),
+                ];
+                let recv = v8::undefined(tc).into();
+                f.call(tc, recv, &arguments)
+                    .ok_or_else(|| anyhow!("wsClosed threw"))
+            })
+        }
         CellJob::Alarm {
             request_id,
             scope,
@@ -6153,15 +6206,15 @@ impl Worker {
         id_sc: Vec<u8>,
         props_sc: Vec<u8>,
         file: (std::path::PathBuf, bool),
-    ) -> Result<Option<i64>> {
+    ) -> Result<u64> {
         let compat = self.inner.as_ref().expect("live worker isolate").compat;
         let (mut locker, _cells) = self.lock();
-        if storage::activation_epoch(cell).is_some() {
+        if let Some(opening) = storage::facet_opening(cell) {
             // The facet is already open, but this call carries a newer sample
             // of the root cell. Take it: the egress of this call must wait for
             // what the root cell had committed when the call left it.
             storage::refresh_embedded_root(cell, parent);
-            return Ok(None);
+            return Ok(opening);
         }
         v8::scope!(let hs, &mut *locker);
         let realm = self.realm(hs);
@@ -6182,7 +6235,48 @@ impl Worker {
                 restored,
             },
             compat,
-        )
+        )?;
+        storage::facet_opening(cell).context("the facet opened without an embedded backing")
+    }
+
+    /// The opening of the facet `scope` in this isolate, for a test that
+    /// addresses a facet's socket event to it.
+    #[cfg(all(test, celld_internal_tests))]
+    pub(crate) fn facet_opening_for_test(&mut self, scope: &str) -> Option<u64> {
+        let (_locker, _cells) = self.lock();
+        storage::facet_opening(scope)
+    }
+
+    /// Close the facet `cell` at `facet_path` of `root`, and every facet
+    /// below it that this isolate runs, deepest first. Answers each scope it
+    /// closed, including those whose close failed.
+    ///
+    /// workerd aborts a facet's children with it. A child left open keeps
+    /// its stream and its sockets, and the root can reopen the parent and
+    /// start a second instance of the same child stream.
+    fn close_facet_tree(
+        &mut self,
+        cell: &str,
+        root: &str,
+        facet_path: &[String],
+    ) -> (Vec<String>, Result<()>) {
+        let compat = self.inner.as_ref().expect("live worker isolate").compat;
+        let (mut locker, _cells) = self.lock();
+        v8::scope!(let hs, &mut *locker);
+        let realm = self.realm(hs);
+        let context = realm.context;
+        let cs = &mut v8::ContextScope::new(hs, context);
+        let tc = std::pin::pin!(v8::TryCatch::new(cs));
+        let tc = &mut tc.init();
+        let mut closed = storage::embedded_facets_below(root, facet_path);
+        closed.push(cell.to_string());
+        let mut outcome = Ok(());
+        for scope in &closed {
+            if let Err(error) = adopt_cell(tc, scope, None, compat) {
+                outcome = outcome.and(Err(error));
+            }
+        }
+        (closed, outcome)
     }
 
     /// Drain the alarm moves the last turn committed in this isolate.
@@ -7646,7 +7740,7 @@ fn op_loader_load(
     );
     handle.spawn(async move {
         let state = match tokio::task::spawn_blocking(move || Worker::load_config(config)).await {
-            Ok(Ok(worker)) => LoaderState::Ready(crate::pool::Slot::standalone(worker)),
+            Ok(Ok(worker)) => LoaderState::Ready(crate::pool::Slot::loaded_worker(worker)),
             Ok(Err(error)) => LoaderState::Failed(Arc::from(format!("{error}"))),
             Err(error) => LoaderState::Failed(Arc::from(format!(
                 "worker loader: load task failed: {error}"
@@ -7658,7 +7752,7 @@ fn op_loader_load(
 }
 
 /// `__loader_fetch(id, url, method, body, headersJson, streamId, entrypoint,
-/// propsSc, limitsJson, tailReporting)` -> Promise<json> or
+/// propsSc, limitsJson, tailReporting, cancellable)` -> Promise<json> or
 /// [Promise<json>, Promise<json>].
 /// The loaded-worker analog of `__svc_call`: it encodes the response the same
 /// way and can return a separate report after the invocation finishes.
@@ -7718,6 +7812,25 @@ fn op_loader_fetch(
             }
         };
     let want_tail_report = args.get(9).boolean_value(scope);
+    // The caller's AbortSignal cancels through the registry that
+    // `__do_call_cancel` already reads, as a service-binding call does. Only a
+    // call with a signal registers, because nothing else can name the id.
+    let cancellable = args.get(10).boolean_value(scope);
+    let (cancel_id, cancel, cancel_guard) = if cancellable {
+        let request_id = next_do_request_id();
+        let (cancel_sender, cancel_receiver) = tokio::sync::oneshot::channel();
+        do_call_cancels()
+            .lock()
+            .unwrap()
+            .insert(request_id, cancel_sender);
+        (
+            Some(request_id),
+            Some(cancel_receiver),
+            Some(DoCallCancelGuard::new(request_id)),
+        )
+    } else {
+        (None, None, None)
+    };
     let (tail_report, tail_receive) = if want_tail_report {
         let (send, receive) = tokio::sync::oneshot::channel();
         (Some(send), Some(receive))
@@ -7739,6 +7852,7 @@ fn op_loader_fetch(
     let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::Service);
     let stream_service = http_stream_service();
     let async_id = asyncrt::enqueue(async move {
+        let mut cancel_guard = cancel_guard;
         // The child's own `IoContext` has an empty egress stack, so nothing
         // inside it gates what it sends onward. Holding the call until the
         // caller's writes are proven makes every effect of the loaded worker
@@ -7756,29 +7870,43 @@ fn op_loader_fetch(
             body,
             headers,
             // A loaded Worker receives an incoming request like a service
-            // target does. The id selects the stream-aware construction path
-            // and gives an abandoned request a lifecycle owner.
-            request_id: Some(next_request_id()),
+            // target does. The lifetime below supplies the id, which selects
+            // the stream-aware construction path and gives an abandoned
+            // request a lifecycle owner.
+            request_id: None,
             tail_report,
             reply,
         };
-        let driving = tokio::spawn(crate::runtime::drive(slot, job, None));
-        match receive.await {
-            Ok(Ok(response)) => {
-                // The response proves that the loaded Worker installed its
-                // request context. That context owns an unread body tail
-                // through its waitUntil work.
-                body_guard.disarm();
-                encode_http_response(response, false, &stream_service)
+        // Without this shared lifetime, a caller's abort rejected only the
+        // caller's promise and the child ran to completion with a live
+        // `request.signal` (denoland/celld#257).
+        let cancellation = crate::runtime::RequestCancellationLifetime::stateless();
+        let driving = tokio::spawn(cancellation.clone().drive_fetch_job(slot, job));
+        let response = async {
+            match receive.await {
+                Ok(response) => response,
+                Err(_) => Err(match driving.await {
+                    Err(error) => anyhow::anyhow!("loaded worker task died: {error}"),
+                    Ok(()) => anyhow::anyhow!("loaded worker dropped response"),
+                }),
             }
-            Ok(Err(error)) => Err(format!("{error}")),
-            Err(_) => match driving.await {
-                Err(error) => Err(format!("loaded worker task died: {error}")),
-                Ok(()) => Err("loaded worker dropped response".to_string()),
-            },
+        };
+        let response =
+            crate::runtime::receive_service_fetch_response(response, cancellation, cancel).await;
+        if let Some(cancel_guard) = cancel_guard.as_mut() {
+            cancel_guard.disarm();
         }
+        let response = response.map_err(|error| format!("{error}"))?;
+        // The response proves that the loaded Worker installed its request
+        // context. That context owns an unread body tail through its
+        // waitUntil work.
+        body_guard.disarm();
+        encode_http_response(response, false, &stream_service)
     });
     let response = promise_for(scope, async_id);
+    if let Some(request_id) = cancel_id {
+        attach_cancel_id(scope, response, request_id);
+    }
     let Some(tail_receive) = tail_receive else {
         rv.set(response);
         return;
@@ -7916,11 +8044,55 @@ struct FacetStart {
 struct LoadedFacet {
     slot: Arc<crate::pool::Slot>,
     scope: String,
+    /// The cell whose database holds the facet's, which owns the facet.
+    root: String,
     stream: String,
     epoch: u64,
+    /// See `storage::facet_opening`.
+    opening: u64,
 }
 
 impl LoadedFacet {
+    /// Route the socket of a facet's upgrade through the facet's root.
+    ///
+    /// Recorded here, where the host knows which facet answered, because the
+    /// response's target names only the facet's scope. A target that the
+    /// facet did not accept keeps its own route.
+    fn attach_websocket(&self, response: &HttpResponse) {
+        if let Some(HttpResponseWebSocket::Cell(target)) = &response.websocket {
+            ws_attach_facet(
+                target.id,
+                &self.scope,
+                FacetSocket {
+                    root: self.root.clone(),
+                    stream: self.stream.clone(),
+                    epoch: self.epoch,
+                    opening: self.opening,
+                },
+            );
+        }
+    }
+
+    /// Prove the facet's stream before its response leaves, and release a
+    /// socket that the facet accepted for a response that fails this proof.
+    ///
+    /// The response carries the only reference the host has to that socket.
+    /// A dropped response would keep the registration and its regular-socket
+    /// count for the life of the process. Only the proof is covered: the
+    /// later encode fails only when the stream service has closed, and the
+    /// facet's own response read fails first on that service.
+    ///
+    /// Takes the socket's id rather than the response: a response with a
+    /// body stream is not `Sync`, so a borrow of it across the proof would
+    /// make the op's future not `Send`.
+    async fn gate_response(&self, socket: Option<u64>) -> Result<(), String> {
+        let gated = self.gate_reply().await;
+        if let (Err(_), Some(id)) = (&gated, socket) {
+            ws_release_unanswered(id, &self.scope);
+        }
+        gated
+    }
+
     /// A facet's reply leaves as workerd's facet output gate lets it: after
     /// every write the facet committed is durable on its own stream. That
     /// covers an earlier call's write this reply can reveal as well as the
@@ -7965,10 +8137,21 @@ impl FacetHost {
             Self::Own(slot) => Ok(slot),
         }
     }
+
+    /// Whether the facet runs in a loaded Worker's isolate, which the root's
+    /// give-back must close and which `ROOT_FACETS` records. A facet of a
+    /// loaded Worker's own class runs in that Worker's isolate too.
+    fn is_loaded_worker(&self) -> bool {
+        match self {
+            Self::Loaded(_) => true,
+            Self::Own(slot) => slot.is_loaded_worker(),
+        }
+    }
 }
 
 /// The facets that each root runs in loaded Workers' isolates, by the root's
-/// cell and epoch.
+/// cell and epoch. A facet of a loaded Worker's own class counts, because it
+/// runs in that Worker's isolate.
 ///
 /// A loaded Worker can outlive a root through another stub or until garbage
 /// collection. Neither lifetime tells the loaded isolate when a root stops,
@@ -7979,9 +8162,10 @@ impl FacetHost {
 /// state. The adoption turn records each facet here, and the root's
 /// give-back closes them.
 ///
-/// A facet of the root's own class is not recorded: `finish_cell_adoption`
-/// closes it in the root's give-back turn, and its slot can be freed while a
-/// reference is held, so a later turn on it would panic.
+/// A facet that runs in the root's own isolate is not recorded:
+/// `finish_cell_adoption` closes it in the root's give-back turn, and its
+/// slot can be freed while a reference is held, so a later turn on it would
+/// panic.
 static ROOT_FACETS: OnceLock<Mutex<HashMap<(String, u64), RootFacets>>> = OnceLock::new();
 
 fn root_facets() -> std::sync::MutexGuard<'static, HashMap<(String, u64), RootFacets>> {
@@ -8002,7 +8186,16 @@ struct RootFacets {
     stopped: bool,
     /// Each slot keeps its loaded isolate alive until the release closes
     /// the facet in it.
-    open: Vec<(Arc<crate::pool::Slot>, String)>,
+    open: Vec<RecordedFacet>,
+}
+
+/// A facet that a root runs in a loaded Worker's isolate.
+struct RecordedFacet {
+    slot: Arc<crate::pool::Slot>,
+    scope: String,
+    /// The facet names from the root down to this facet, which find the
+    /// facets below an aborted one.
+    path: Vec<String>,
 }
 
 /// One facet call of a root, from its start until its adoption turn.
@@ -8025,7 +8218,12 @@ impl PendingFacet {
     /// Record the facet before its adoption. Call inside the adoption turn:
     /// a release that takes the record queues its close behind this turn on
     /// the same slot, and a release that came first makes this refuse.
-    fn record(&self, slot: &Arc<crate::pool::Slot>, scope: &str) -> Result<(), String> {
+    fn record(
+        &self,
+        slot: &Arc<crate::pool::Slot>,
+        scope: &str,
+        path: &[String],
+    ) -> Result<(), String> {
         let mut roots = root_facets();
         let entry = roots
             .get_mut(&self.key)
@@ -8036,9 +8234,13 @@ impl PendingFacet {
         if !entry
             .open
             .iter()
-            .any(|(open, name)| Arc::ptr_eq(open, slot) && name == scope)
+            .any(|open| Arc::ptr_eq(&open.slot, slot) && open.scope == scope)
         {
-            entry.open.push((slot.clone(), scope.to_string()));
+            entry.open.push(RecordedFacet {
+                slot: slot.clone(),
+                scope: scope.to_string(),
+                path: path.to_vec(),
+            });
         }
         Ok(())
     }
@@ -8094,11 +8296,55 @@ pub(crate) async fn release_root_facets(root: &str, epoch: u64, release: RootRel
         open
     };
     // A nested facet records after its parent, so it closes first.
-    for (slot, scope) in open.into_iter().rev() {
+    for RecordedFacet { slot, scope, .. } in open.into_iter().rev() {
         if let Err(error) = slot.turn(|worker| worker.own_cell(&scope, None)).await {
             tracing::warn!(root, epoch, facet = %scope, %error, "a facet did not close with its root");
         }
+        ws_close_facet(&scope, "the parent Durable Object was released");
     }
+}
+
+/// Take the records of the facets below the facet at `path`, deepest first.
+/// Their isolates can differ from the aborted facet's: a child of a loaded
+/// class runs in its own loaded Worker.
+fn take_recorded_facets_below(root: &str, epoch: u64, path: &[String]) -> Vec<RecordedFacet> {
+    let key = (root.to_string(), epoch);
+    let mut roots = root_facets();
+    let Some(entry) = roots.get_mut(&key) else {
+        return Vec::new();
+    };
+    let (mut below, kept) = std::mem::take(&mut entry.open)
+        .into_iter()
+        .partition::<Vec<_>, _>(|open| open.path.len() > path.len() && open.path.starts_with(path));
+    entry.open = kept;
+    if entry.pending == 0 && entry.open.is_empty() {
+        roots.remove(&key);
+    }
+    below.sort_by_key(|open| std::cmp::Reverse(open.path.len()));
+    below
+}
+
+/// The loaded isolate that runs the facet `scope` of `root` at `epoch`, while
+/// the root's give-back has not closed it. `None` also answers for a facet in
+/// the root's own isolate, which the root's residency pins instead.
+pub(crate) fn recorded_facet_slot(
+    root: &str,
+    epoch: u64,
+    scope: &str,
+) -> Option<Arc<crate::pool::Slot>> {
+    root_facets()
+        .get(&(root.to_string(), epoch))?
+        .open
+        .iter()
+        .find(|open| open.scope == scope)
+        .map(|open| open.slot.clone())
+}
+
+/// Prove every write that a facet committed on its own stream.
+pub(crate) async fn prove_facet_stream(stream: String, epoch: u64) -> anyhow::Result<()> {
+    prove_facet(stream, epoch)
+        .await
+        .map_err(|refusal| anyhow!("facet output: {refusal}"))
 }
 
 /// Drop an aborted facet's record, which its abort closed already.
@@ -8108,7 +8354,7 @@ fn forget_root_facet(root: &str, epoch: u64, slot: &Arc<crate::pool::Slot>, scop
     if let Some(entry) = roots.get_mut(&key) {
         entry
             .open
-            .retain(|(open, name)| !(Arc::ptr_eq(open, slot) && name == scope));
+            .retain(|open| !(Arc::ptr_eq(&open.slot, slot) && open.scope == scope));
         if entry.pending == 0 && entry.open.is_empty() {
             roots.remove(&key);
         }
@@ -8116,12 +8362,13 @@ fn forget_root_facet(root: &str, epoch: u64, slot: &Arc<crate::pool::Slot>, scop
 }
 
 async fn prepare_facet(host: FacetHost, start: FacetStart) -> Result<LoadedFacet, String> {
-    let pending = match host {
-        FacetHost::Loaded(_) => Some(PendingFacet::begin(
+    let pending = if host.is_loaded_worker() {
+        Some(PendingFacet::begin(
             &start.parent.root_scope,
             start.parent.epoch,
-        )?),
-        FacetHost::Own(_) => None,
+        )?)
+    } else {
+        None
     };
     let slot = host.slot().await?;
     let file = open_facet_file(&start.parent, &start.name).await?;
@@ -8135,28 +8382,31 @@ async fn prepare_facet(host: FacetHost, start: FacetStart) -> Result<LoadedFacet
         &start.owner,
         &start.name,
     );
-    slot.turn(|worker| {
-        if let Some(pending) = &pending {
-            pending.record(&slot, &scope)?;
-        }
-        worker
-            .own_embedded_cell(
-                &scope,
-                &start.parent,
-                &start.name,
-                start.id_sc,
-                start.props_sc,
-                file,
-            )
-            .map_err(|error| format!("{error}"))
-    })
-    .await
-    .map_err(|error| format!("worker loader facet: {error}"))?;
+    let opening = slot
+        .turn(|worker| {
+            if let Some(pending) = &pending {
+                pending.record(&slot, &scope, &names)?;
+            }
+            worker
+                .own_embedded_cell(
+                    &scope,
+                    &start.parent,
+                    &start.name,
+                    start.id_sc,
+                    start.props_sc,
+                    file,
+                )
+                .map_err(|error| format!("{error}"))
+        })
+        .await
+        .map_err(|error| format!("worker loader facet: {error}"))?;
     Ok(LoadedFacet {
         slot,
         scope,
+        root: start.parent.root_scope,
         stream,
         epoch,
+        opening,
     })
 }
 
@@ -8328,14 +8578,19 @@ fn op_facet_fetch(
             trace,
         ));
         let replied = receive.await;
-        if replied.is_ok() {
+        if let Ok(Err(_)) = &replied {
             facet.gate_reply().await?;
         }
         match replied {
             Ok(Ok(response)) => {
                 body_guard.disarm();
-                facet.gate_reply().await?;
-                encode_http_response(response, false, &stream_service)
+                let socket = match &response.websocket {
+                    Some(HttpResponseWebSocket::Cell(target)) => Some(target.id),
+                    _ => None,
+                };
+                facet.gate_response(socket).await?;
+                facet.attach_websocket(&response);
+                encode_http_response(response, true, &stream_service)
             }
             Ok(Err(error)) => Err(format!("{error}")),
             Err(_) => match driving.await {
@@ -8359,22 +8614,55 @@ fn op_facet_abort(
     let name = args.get(4).to_rust_string_lossy(scope);
     let host = FacetHost::of(loader);
     let facet_scope = facet_scope(&class_name, &parent_scope, &owner, &name);
-    // The root that recorded the facet. A parent without storage has no
-    // record to drop.
+    // The root that recorded the facet, and the facet's place below it. A
+    // parent without storage has no record to drop and no facet below.
     let root = storage::storage_identity(&parent_scope)
         .ok()
         .flatten()
-        .map(|parent| (parent.root_scope, parent.epoch));
+        .map(|parent| {
+            let mut path = parent.facet_path;
+            path.push(name.clone());
+            (parent.root_scope, parent.epoch, path)
+        });
     let async_id = asyncrt::enqueue(async move {
         let host = host?;
-        let loaded = matches!(host, FacetHost::Loaded(_));
+        let recorded = host.is_loaded_worker();
         let slot = host.slot().await?;
-        slot.turn(|worker| worker.own_cell(&facet_scope, None))
-            .await
-            .map_err(|error| format!("abort facet: {error}"))?;
-        if let (true, Some((root, epoch))) = (loaded, root) {
-            forget_root_facet(&root, epoch, &slot, &facet_scope);
+        const ABORTED: &str = "the Durable Object facet was aborted";
+        // A facet below this one can run in another loaded Worker, which
+        // only its root's record names.
+        let below = match &root {
+            Some((root, epoch, path)) => take_recorded_facets_below(root, *epoch, path),
+            None => Vec::new(),
+        };
+        for RecordedFacet { slot, scope, .. } in below {
+            if let Err(error) = slot.turn(|worker| worker.own_cell(&scope, None)).await {
+                tracing::warn!(facet = %scope, %error, "a facet did not close with its parent");
+            }
+            ws_close_facet(&scope, ABORTED);
         }
+        let (closed, outcome) = match &root {
+            Some((root, _, path)) => {
+                slot.turn(|worker| worker.close_facet_tree(&facet_scope, root, path))
+                    .await
+            }
+            None => {
+                let outcome = slot
+                    .turn(|worker| worker.own_cell(&facet_scope, None))
+                    .await
+                    .map(|_| ());
+                (vec![facet_scope.clone()], outcome)
+            }
+        };
+        // Close the sockets whether or not the close turn succeeded: no
+        // later event can reach a facet that its parent aborted.
+        for scope in &closed {
+            ws_close_facet(scope, ABORTED);
+        }
+        if let (true, Some((root, epoch, _))) = (recorded, &root) {
+            forget_root_facet(root, *epoch, &slot, &facet_scope);
+        }
+        outcome.map_err(|error| format!("abort facet: {error}"))?;
         Ok(Vec::new())
     });
     rv.set(promise_for(scope, async_id));

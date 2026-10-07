@@ -193,6 +193,9 @@ pub struct Slot {
     /// drained. `None` for a standalone slot: nothing frees or replaces it,
     /// so [`Slot::condemn`] cannot apply to it.
     reclaim: Option<Arc<tokio::sync::Notify>>,
+    /// The slot holds a Worker Loader's Worker, so the facets it runs belong
+    /// to the root that started them rather than to this isolate.
+    loaded_worker: bool,
     /// Cells whose realm lives in this isolate. Not a count of live work: a
     /// cell stays until it is evicted or handed to another node, which is
     /// why `retire` refuses an isolate holding any.
@@ -317,11 +320,16 @@ impl Slot {
         Affiliation(self.clone())
     }
 
+    /// A slot holding a Worker Loader's Worker.
+    pub(crate) fn loaded_worker(worker: js::Worker) -> Arc<Self> {
+        Self::outside_pool(worker, true)
+    }
+
     /// A slot holding a Worker outside a placement pool.
     ///
     /// A dynamic Worker owns exactly one isolate, so it needs no
     /// admission, growth, or retirement policy.
-    pub(crate) fn standalone(worker: js::Worker) -> Arc<Self> {
+    fn outside_pool(worker: js::Worker, loaded_worker: bool) -> Arc<Self> {
         Arc::new_cyclic(|me| Slot {
             me: me.clone(),
             id: 0,
@@ -334,6 +342,7 @@ impl Slot {
             requests: AtomicUsize::new(0),
             freed: Arc::new(tokio::sync::Notify::new()),
             reclaim: None,
+            loaded_worker,
             cells: AtomicUsize::new(0),
             adopted_cells: AtomicUsize::new(0),
             retiring: AtomicBool::new(false),
@@ -342,9 +351,14 @@ impl Slot {
         })
     }
 
+    /// Whether this slot holds a Worker Loader's Worker.
+    pub(crate) fn is_loaded_worker(&self) -> bool {
+        self.loaded_worker
+    }
+
     #[cfg(celld_internal_tests)]
     pub fn for_test(worker: js::Worker) -> Arc<Self> {
-        Self::standalone(worker)
+        Self::outside_pool(worker, false)
     }
 
     #[cfg(all(test, celld_internal_tests))]
@@ -361,6 +375,7 @@ impl Slot {
             requests: AtomicUsize::new(0),
             freed: Arc::new(tokio::sync::Notify::new()),
             reclaim: None,
+            loaded_worker: false,
             cells: AtomicUsize::new(0),
             adopted_cells: AtomicUsize::new(0),
             retiring: AtomicBool::new(false),
@@ -638,6 +653,7 @@ impl Pool {
             requests: AtomicUsize::new(0),
             freed: self.freed.clone(),
             reclaim: Some(self.reclaim.clone()),
+            loaded_worker: false,
             cells: AtomicUsize::new(0),
             adopted_cells: AtomicUsize::new(0),
             retiring: AtomicBool::new(self.retired.load(Ordering::Relaxed)),

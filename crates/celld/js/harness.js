@@ -2215,9 +2215,13 @@ class DurableObjectFacets {
           ? new CelldHttpBodyStream(response.streamId)
           : response.body !== undefined ? response.body
           : Uint8Array.from(response.bodyBytes || []);
+        // The facet's socket lives in the facet's isolate. The target lets
+        // the root return the upgrade, or accept the client end that the
+        // wrapper binds to the facet's socket.
         return __wrapServiceResponse(new Response(responseBody, {
           status: response.status,
           headers: response.headers,
+          __wsTarget: response.wsTarget,
         }), req.url);
       });
     };
@@ -3237,6 +3241,10 @@ __celld.__makeLoader = () => {
       async fetch(input, init) {
         const { id, tails } = await loadPromise;
         const req = new Request(input, init);
+        // The caller's signal, never the incoming request's own, as for a
+        // service binding.
+        const signal = req._signalForSubrequests;
+        if (signal?.aborted) throw signal.reason;
         // The verbatim header list; see the note on the outbound `fetch`.
         // The loaded worker rebuilds a `Headers` from these pairs, so a
         // repeat and its casing survive the isolate boundary.
@@ -3245,8 +3253,11 @@ __celld.__makeLoader = () => {
         const loaded = __loader_fetch(
           id, req.url, req.method, body, headers, streamId, entrypoint,
           propsSc === undefined ? new Uint8Array() : propsSc,
-          limitsJson, tails.length !== 0);
-        const response = tails.length === 0 ? loaded : loaded[0];
+          limitsJson, tails.length !== 0, signal != null);
+        const dispatch = tails.length === 0 ? loaded : loaded[0];
+        const response = signal
+          ? __awaitCancellableDoCall(dispatch, signal)
+          : dispatch;
         if (tails.length !== 0) {
           const delivery = loaded[1]
             .then((report) => JSON.parse(report))
@@ -11320,6 +11331,10 @@ globalThis.performance = {
 __celld.__advanceIoTime = (timestamp) => {
   __ioTimestamp = timestamp;
 };
+// Workerd ServiceWorkerGlobalScope: `self` is the global scope, as a writable,
+// enumerable data property. Libraries probe it to find the global, and
+// @cloudflare/worker-bundler throws when it is absent.
+globalThis.self = globalThis;
 if (!globalThis.navigator) globalThis.navigator = {
   userAgent: "Cloudflare-Workers", hardwareConcurrency: 1,
   language: "en", languages: ["en"],

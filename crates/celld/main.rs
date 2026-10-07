@@ -16,7 +16,8 @@ use celld::actor::*;
 use celld::bucket::Bucket;
 use celld::cell_dispatch::{
     dispatch_call_attempt, dispatch_gate, local_dispatch_request_id, local_request_error,
-    local_response_stream, split_do_call, CallAttempt, CallPayload, RoutedRequestError,
+    local_response_stream, requests_websocket_upgrade, split_do_call, CallAttempt, CallPayload,
+    RoutedRequestError, WEBSOCKET_WITHOUT_UPGRADE,
 };
 use celld::fleet;
 use celld::generation::{
@@ -247,6 +248,24 @@ type HttpReply = Response<UnsyncBoxBody<Bytes, std::io::Error>>;
 
 const STALE_ROUTE_HEADER: &str = "x-cells-route-error";
 const STALE_ROUTE_VALUE: &str = "stale-owner";
+/// Marks a forwarded fetch whose handler failed on the owner, so the caller's
+/// `stub.fetch()` rejects as it does for a local owner. Without the marker a
+/// remote handler failure looks like an application 500 response.
+const HANDLER_FAILURE_HEADER: &str = "x-cells-handler-failure";
+const HANDLER_FAILURE_PREFIX: &str = "cell Worker failed: ";
+
+/// A handler failure that the owner reported for a forwarded fetch. The owner
+/// ran the handler, so a retry would run it a second time.
+#[derive(Debug)]
+struct RemoteHandlerFailure(String);
+
+impl std::fmt::Display for RemoteHandlerFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for RemoteHandlerFailure {}
 const DURABLE_OBJECT_ROUTING_ERROR_MARKER: &str = "__CELLD_DO_ROUTING_ERROR__:";
 
 fn owner_unreachable(scope: &str, owner: &str, source: anyhow::Error) -> anyhow::Error {
@@ -1037,13 +1056,8 @@ async fn internal_reload(app: AppHandle) -> HttpReply {
 
 async fn dispatch_do_call(app: AppHandle, call: DoCallReq) {
     let (mut call, mut payload, reply) = split_do_call(call);
-    let mut websocket_timing = payload
-        .headers
-        .iter()
-        .any(|(name, value)| {
-            name.eq_ignore_ascii_case("upgrade") && value.eq_ignore_ascii_case("websocket")
-        })
-        .then(|| WebSocketRouteTiming {
+    let mut websocket_timing =
+        requests_websocket_upgrade(&payload.headers).then(|| WebSocketRouteTiming {
             started: Instant::now(),
             route_resolution_us: 0,
             dispatch_us: 0,
@@ -1096,6 +1110,24 @@ async fn dispatch_do_call(app: AppHandle, call: DoCallReq) {
                         );
                     }
                     break result;
+                }
+                CallAttempt::RefusedWebSocket { error, websocket } => {
+                    websocket::reject_accepted_websocket(&app, &websocket, &error.to_string())
+                        .await;
+                    if let Some(timing) = websocket_timing.as_mut() {
+                        timing.dispatch_us = timing
+                            .dispatch_us
+                            .saturating_add(dispatch_started.elapsed().as_micros() as u64);
+                        timing.emit(
+                            &app,
+                            &call.scope,
+                            call.request_id,
+                            "error",
+                            "local",
+                            app.runtime.as_ref().map_or("", |runtime| runtime.node()),
+                        );
+                    }
+                    break Err(error);
                 }
                 CallAttempt::Remote {
                     node,
@@ -1249,6 +1281,22 @@ async fn dispatch_do_call(app: AppHandle, call: DoCallReq) {
                             observed_position: None,
                         });
                     }
+                    if response.headers().contains_key(HANDLER_FAILURE_HEADER) {
+                        // The owner ran the handler, so the attempt is
+                        // complete: the owner needs no abort, and the error
+                        // must not reach the redispatch policy below.
+                        abort.disarm();
+                        let body = Limited::new(response.into_body(), MAX_PEER_CONTROL_BODY_BYTES)
+                            .collect()
+                            .await
+                            .map(|body| body.to_bytes())
+                            .unwrap_or_default();
+                        let body = String::from_utf8_lossy(&body);
+                        let message = body.strip_prefix(HANDLER_FAILURE_PREFIX).unwrap_or(&body);
+                        return Err(anyhow::Error::new(RemoteHandlerFailure(
+                            message.to_string(),
+                        )));
+                    }
                     let response_headers = response
                         .headers()
                         .iter()
@@ -1295,6 +1343,12 @@ async fn dispatch_do_call(app: AppHandle, call: DoCallReq) {
                         timing.emit(&app, scope, request_id, "ok", "remote", &node);
                     }
                     break Ok(response);
+                }
+                Err(error) if error.downcast_ref::<RemoteHandlerFailure>().is_some() => {
+                    if let Some(timing) = websocket_timing.as_ref() {
+                        timing.emit(&app, scope, request_id, "error", "remote", &node);
+                    }
+                    break Err(error);
                 }
                 Err(error) => {
                     // A streamed upload is not replayable after the HTTP
@@ -1626,10 +1680,15 @@ fn internal_do_worker_error(error: anyhow::Error) -> HttpReply {
     if cell_overload_error(&error) {
         return cell_overload_response();
     }
-    response(
+    let mut failed = response(
         StatusCode::INTERNAL_SERVER_ERROR,
-        format!("cell Worker failed: {error:#}"),
-    )
+        format!("{HANDLER_FAILURE_PREFIX}{error:#}"),
+    );
+    failed.headers_mut().insert(
+        hyper::header::HeaderName::from_static(HANDLER_FAILURE_HEADER),
+        hyper::header::HeaderValue::from_static("1"),
+    );
+    failed
 }
 
 /// Divide an ingress request into its metadata and a body that the Worker
@@ -1868,6 +1927,7 @@ fn request_url(parts: &hyper::http::request::Parts, trust_forwarded_headers: boo
 /// rather than only the node it connected to. `/do/` and `/runtime/` share this:
 /// they differ in what they authenticate, not in how they reach a cell.
 async fn dispatch_cell_fetch(
+    app: &AppHandle,
     cell: String,
     name: Option<String>,
     url: String,
@@ -1908,7 +1968,7 @@ async fn dispatch_cell_fetch(
     let _hangup = HangUp(Some(cancel_tx));
     match receive.await {
         Ok(Ok(worker_response)) => {
-            runtime_response(worker_response, preserve_representation_length)
+            reply_without_upgrade(app, worker_response, preserve_representation_length).await
         }
         Ok(Err(error)) if request_body_limit_error(&error) => {
             response(StatusCode::PAYLOAD_TOO_LARGE, "request body too large")
@@ -1999,6 +2059,8 @@ pub(crate) async fn dispatch_forwarded_fetch(
                 drain_pins: app.drain_pins.clone(),
                 handler_active: true,
             };
+            let upgrade = requests_websocket_upgrade(&headers);
+            let mut accepted = None;
             let completed = local
                 .run(async {
                     let result = runtime
@@ -2023,10 +2085,28 @@ pub(crate) async fn dispatch_forwarded_fetch(
                     // gate wait below cancels the request's remaining work, not a
                     // handler that is still running.
                     abort.handler_answered();
-                    result
+                    let response = result?;
+                    if let Some(HttpResponseWebSocket::Cell(target)) = &response.websocket {
+                        accepted = Some(target.clone());
+                        // The same object-level check as a local call, so a
+                        // caller sees one answer whichever node owns the cell.
+                        anyhow::ensure!(upgrade, "TypeError: {WEBSOCKET_WITHOUT_UPGRADE}");
+                    }
+                    Ok(response)
                 })
                 .await;
             let activity = completed.activity;
+            // A failure after the cell returned a socket discards the response,
+            // which is the socket's only owner.
+            if let (Err(failure), Some(target)) = (&completed.result, accepted.as_ref()) {
+                let reason = match failure {
+                    LocalRequestFailure::Handler(error) => error.to_string(),
+                    LocalRequestFailure::OutputGate { verdict, .. } => {
+                        RoutedRequestError(*verdict).to_string()
+                    }
+                };
+                websocket::reject_accepted_websocket(&app, target, &reason).await;
+            }
             let result = match completed.result {
                 Ok(answer) => Ok(answer),
                 Err(LocalRequestFailure::Handler(error)) => Err(error),
@@ -2040,18 +2120,18 @@ pub(crate) async fn dispatch_forwarded_fetch(
             match result {
                 Ok(mut worker_response) => {
                     if let Some(HttpResponseWebSocket::Cell(target)) = &worker_response.websocket {
-                        let kind = if celld::js::ws_hibernatable(target.id).unwrap_or(false) {
+                        let (cell, hibernatable) = celld::js::ws_core_registration(target);
+                        let kind = if hibernatable {
                             WebSocketKind::Hibernatable
                         } else {
                             WebSocketKind::Regular
                         };
-                        if let Err(error) = app
-                            .websocket_opened(target.scope.clone(), target.id, kind)
-                            .await
-                        {
+                        if let Err(error) = app.websocket_opened(cell, target.id, kind).await {
+                            let reason = format!("WebSocket core registration failed: {error:#}");
+                            websocket::reject_accepted_websocket(&app, target, &reason).await;
                             return ForwardedFetchOutcome::Reply(peer_response(response(
                                 StatusCode::SERVICE_UNAVAILABLE,
-                                format!("WebSocket core registration failed: {error:#}"),
+                                reason,
                             )));
                         }
                     }
@@ -2076,7 +2156,8 @@ pub(crate) async fn dispatch_forwarded_fetch(
                         abort.disarm();
                         drop(activity);
                     }
-                    runtime_response(worker_response, preserve_representation_length)
+                    reply_without_upgrade(&app, worker_response, preserve_representation_length)
+                        .await
                 }
                 Err(error) => internal_do_worker_error(error),
             }
@@ -2259,7 +2340,7 @@ pub(crate) async fn dispatch_forwarded_rpc(
 mod peer_tunnel;
 #[path = "main/websocket.rs"]
 mod websocket;
-use websocket::{handle_websocket, outbound_websocket_task};
+use websocket::{handle_websocket, outbound_websocket_task, reply_without_upgrade};
 
 async fn handle_ingress(
     request: Request<Incoming>,
@@ -2311,7 +2392,9 @@ async fn handle_ingress(
         .fetch_worker(url, method, body, headers, connection)
         .await
     {
-        Ok(worker_response) => runtime_response(worker_response, preserve_representation_length),
+        Ok(worker_response) => {
+            reply_without_upgrade(&app, worker_response, preserve_representation_length).await
+        }
         Err(error) if request_body_limit_error(&error) => {
             response(StatusCode::PAYLOAD_TOO_LARGE, "request body too large")
         }
@@ -2926,6 +3009,7 @@ async fn handle_internal(
             // consumer. The runtime also proves that this name hashes to the
             // requested scope before it exposes the identity to JavaScript.
             dispatch_cell_fetch(
+                &app,
                 scope,
                 name,
                 "http://cell/".to_string(),
@@ -2975,7 +3059,7 @@ async fn handle_internal(
                 Ok(payload) => payload,
                 Err(response) => return Ok(*response),
             };
-            dispatch_cell_fetch(cell, None, url, method, body, headers).await
+            dispatch_cell_fetch(&app, cell, None, url, method, body, headers).await
         }
         _ if cell_scope.is_some() => {
             let cell = cell_scope.expect("checked prefix");

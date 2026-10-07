@@ -132,6 +132,24 @@ impl RequestCancellationLifetime {
         let job = stateless_fetch_job_factory(None, url, method, body, headers, Some(self))(reply);
         drive_affiliated(slot.affiliate(), job, None)
     }
+
+    /// Drive a fully built fetch job, such as a loaded Worker's, with this
+    /// lifetime. The job's request id is overwritten from the lifetime, so the
+    /// caller cannot pair an abort publisher with a different request.
+    pub(crate) fn drive_fetch_job(
+        self: Arc<Self>,
+        slot: Arc<crate::pool::Slot>,
+        mut job: crate::WorkerJob,
+    ) -> impl std::future::Future<Output = ()> + Send + 'static {
+        if let crate::WorkerJob::Fetch { request_id, .. } = &mut job {
+            *request_id = Some(self.request_id);
+        }
+        let job = StatelessWorkerJob {
+            job,
+            cancellation: RequestCancellationGuard::shared(self),
+        };
+        drive_affiliated(slot.affiliate(), job, None)
+    }
 }
 
 /// A stateless job and the only cancellation lifetime that can name it.
@@ -665,7 +683,7 @@ async fn receive_cell_fetch_reply(
     received.context("cell isolate dropped response")?
 }
 
-async fn receive_service_fetch_response(
+pub(crate) async fn receive_service_fetch_response(
     response: impl std::future::Future<Output = anyhow::Result<HttpResponse>>,
     cancellation: Arc<RequestCancellationLifetime>,
     cancel: Option<tokio::sync::oneshot::Receiver<()>>,
@@ -1785,11 +1803,41 @@ impl RuntimeManager {
         let job = CellJob::WsOpen {
             scope: cell.clone(),
             ws_id,
+            facet_opening: None,
             protocol,
             reply,
         };
         self.cell_event(&cell, job, receive, "cell isolate dropped WebSocket open")
             .await
+    }
+
+    /// Run `webSocketOpen` in the facet `scope` that dialed `ws_id`. A write
+    /// of the handler is proved by the facet's next output, as for
+    /// `facet_ws_closed`.
+    pub async fn facet_ws_open(
+        &self,
+        scope: String,
+        facet: &js::FacetSocket,
+        ws_id: u64,
+        protocol: String,
+    ) -> anyhow::Result<()> {
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        let job = CellJob::WsOpen {
+            scope: scope.clone(),
+            ws_id,
+            facet_opening: Some(facet.opening),
+            protocol,
+            reply,
+        };
+        self.facet_event(
+            &scope,
+            facet,
+            job,
+            receive,
+            "facet isolate dropped WebSocket open",
+        )
+        .await
+        .map(|_| ())
     }
 
     pub async fn rpc(
@@ -1843,6 +1891,7 @@ impl RuntimeManager {
         let job = CellJob::WsMessage {
             scope: cell.clone(),
             ws_id,
+            facet_opening: None,
             data,
             started: Some(started),
             reply,
@@ -1870,6 +1919,7 @@ impl RuntimeManager {
         let job = CellJob::WsClosed {
             scope: cell.clone(),
             ws_id,
+            facet_opening: None,
             code,
             reason,
             was_clean,
@@ -1877,6 +1927,101 @@ impl RuntimeManager {
         };
         self.cell_event(&cell, job, receive, "cell isolate dropped WebSocket close")
             .await
+    }
+
+    /// Run `webSocketMessage` in the facet `scope` that accepted `ws_id`.
+    ///
+    /// The frames leave only after the facet's stream proves every write the
+    /// facet committed, as a facet's reply waits in `op_facet_fetch`. The
+    /// answer carries no position: a facet's write positions count in the
+    /// facet's stream, and the root cell's gate would read them as its own.
+    pub async fn facet_ws_message(
+        &self,
+        scope: String,
+        facet: &js::FacetSocket,
+        ws_id: u64,
+        data: js::WsIn,
+        started: tokio::sync::oneshot::Sender<()>,
+    ) -> anyhow::Result<js::WsDispatch> {
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        let job = CellJob::WsMessage {
+            scope: scope.clone(),
+            ws_id,
+            facet_opening: Some(facet.opening),
+            data,
+            started: Some(started),
+            reply,
+        };
+        let dispatch = self
+            .facet_event(
+                &scope,
+                facet,
+                job,
+                receive,
+                "facet isolate dropped WebSocket message",
+            )
+            .await?;
+        js::prove_facet_stream(facet.stream.clone(), facet.epoch).await?;
+        Ok(js::WsDispatch {
+            frames: dispatch.frames,
+            write_position: None,
+            observed_position: None,
+        })
+    }
+
+    /// Run `webSocketClose` in the facet `scope` that accepted `ws_id`. A
+    /// write of the handler is proved by the facet's next output, which
+    /// waits for the facet's whole stream.
+    pub async fn facet_ws_closed(
+        &self,
+        scope: String,
+        facet: &js::FacetSocket,
+        ws_id: u64,
+        code: u16,
+        reason: String,
+        was_clean: bool,
+    ) -> anyhow::Result<()> {
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        let job = CellJob::WsClosed {
+            scope: scope.clone(),
+            ws_id,
+            facet_opening: Some(facet.opening),
+            code,
+            reason,
+            was_clean,
+            reply,
+        };
+        self.facet_event(
+            &scope,
+            facet,
+            job,
+            receive,
+            "facet isolate dropped WebSocket close",
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// Start one event of a facet's socket and wait for its answer.
+    ///
+    /// A loaded Worker's isolate stays alive while its root's record holds
+    /// it. Any other facet runs in the root's own isolate, which the root's
+    /// residency pins. A facet that closed in either place is refused by the
+    /// event's own first turn (`facet_socket_refusal`).
+    async fn facet_event<T>(
+        &self,
+        scope: &str,
+        facet: &js::FacetSocket,
+        job: CellJob,
+        receive: tokio::sync::oneshot::Receiver<anyhow::Result<T>>,
+        dropped: &'static str,
+    ) -> anyhow::Result<T> {
+        let isolate = match js::recorded_facet_slot(&facet.root, facet.epoch, scope) {
+            Some(slot) => slot.affiliate(),
+            None => self.cell_isolate(&facet.root)?,
+        };
+        // No alarm reporter: a facet cannot set an alarm.
+        run_cell_event(isolate, job, None, receive, dropped).await
     }
 
     /// The isolate a published cell's events run in.
@@ -1942,14 +2087,28 @@ impl RuntimeManager {
         dropped: &'static str,
     ) -> anyhow::Result<T> {
         let isolate = self.cell_isolate(cell)?;
-        tokio::spawn(drive_cell(
+        run_cell_event(
             isolate,
             job,
             Some(self.alarm_reporter.clone()),
-            None,
-        ));
-        receive.await.context(dropped)?
+            receive,
+            dropped,
+        )
+        .await
     }
+}
+
+/// Drive one cell event in `isolate` on a task of its own, and wait for its
+/// answer.
+async fn run_cell_event<T>(
+    isolate: crate::pool::Affiliation,
+    job: CellJob,
+    report: Option<AlarmReporter>,
+    receive: tokio::sync::oneshot::Receiver<anyhow::Result<T>>,
+    dropped: &'static str,
+) -> anyhow::Result<T> {
+    tokio::spawn(drive_cell(isolate, job, report, None));
+    receive.await.context(dropped)?
 }
 
 fn restored_alarm_from_persisted(

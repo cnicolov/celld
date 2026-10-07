@@ -22,7 +22,7 @@ pub(super) struct WsCapture {
 fn prepare_worker_websocket_handoff(id: u64) {
     let (inbound, receiver) = ws_pull_channel();
     ws_pull_register(id, receiver);
-    ws_register_outbound(id, "");
+    ws_register_outbound(id, "", None);
     ws_track_request_socket(id);
     let registry = ws_registry();
     let replaced = registry.lock().unwrap().worker_handoffs.insert(id, inbound);
@@ -301,6 +301,43 @@ pub(super) fn op_ws_prepare_worker_handoff(
         .unwrap_or(0);
     prepare_worker_websocket_handoff(id);
 }
+/// The facet record of an outbound socket that `cell` opens, when the running
+/// event belongs to a Durable Object facet.
+///
+/// A facet is not a cell. A socket that names the facet's scope as its cell
+/// starts an activation of a class that no Worker exports, so the upgrade
+/// fails with `RuntimeFailed`. The socket must route, register, and gate
+/// through the facet's root instead. The record comes from the frame that
+/// the host installed when the event started, not from `cell`, because the
+/// scope crosses application JavaScript.
+fn dialing_facet(scope: &mut v8::PinScope, cell: &str) -> Result<Option<FacetSocket>, String> {
+    if cell.is_empty() {
+        return Ok(None);
+    }
+    let Some(EgressFrame {
+        storage,
+        root: Some(root),
+        ..
+    }) = current_cell_event(&event_context(scope))
+    else {
+        return Ok(None);
+    };
+    if storage != cell {
+        return Err(format!(
+            "websocket: the socket names {cell}, but the running Durable Object facet is {storage}"
+        ));
+    }
+    let opening = storage::facet_opening(&storage).ok_or(
+        "websocket: the Durable Object facet that opened this socket is no longer running",
+    )?;
+    Ok(Some(FacetSocket {
+        root: root.cell,
+        stream: root.stream,
+        epoch: root.epoch,
+        opening,
+    }))
+}
+
 /// `fetch(url, { headers: { Upgrade: "websocket" } })`. Returns a JSON
 /// envelope: either an upgraded socket, or the ordinary response a server sent
 /// instead, which the caller returns unchanged.
@@ -330,6 +367,10 @@ pub(super) fn op_ws_upgrade(
         .map(|n| n.value() as u64)
         .unwrap_or(0);
     let cell = args.get(1).to_rust_string_lossy(scope);
+    let facet = match dialing_facet(scope, &cell) {
+        Ok(facet) => facet,
+        Err(error) => return loader_throw(scope, &error),
+    };
     let url = args.get(2).to_rust_string_lossy(scope);
     // The subprotocol list is read back out of these headers, so a silent
     // default opened the socket with no headers and no subprotocol at all.
@@ -366,6 +407,7 @@ pub(super) fn op_ws_upgrade(
                 headers,
                 want_response: true,
                 target: None,
+                facet,
                 reply: tx,
             })
             .is_ok()
@@ -451,6 +493,10 @@ pub(super) fn op_ws_connect(
         .map(|n| n.value() as u64)
         .unwrap_or(0);
     let cell = args.get(1).to_rust_string_lossy(scope);
+    let facet = match dialing_facet(scope, &cell) {
+        Ok(facet) => facet,
+        Err(error) => return loader_throw(scope, &error),
+    };
     let url = args.get(2).to_rust_string_lossy(scope);
     let protocols: Vec<String> =
         match serde_json::from_str(&args.get(3).to_rust_string_lossy(scope)) {
@@ -482,6 +528,7 @@ pub(super) fn op_ws_connect(
                 headers: Vec::new(),
                 want_response: false,
                 target: None,
+                facet,
                 reply: tx,
             })
             .is_ok()
@@ -526,6 +573,14 @@ pub(super) fn op_ws_bind_target(
     // accounted against the isolate holding it, exactly as `op_ws_connect`
     // accounts an outbound one.
     let cell = args.get(2).to_rust_string_lossy(scope);
+    // The caller end's frames reach this isolate through its pull queue, so
+    // they never route by `cell`. The record still matters: a facet that
+    // stops closes its sockets by it, and this end would otherwise keep the
+    // other Durable Object's socket open after the facet is gone.
+    let facet = match dialing_facet(scope, &cell) {
+        Ok(facet) => facet,
+        Err(error) => return loader_throw(scope, &error),
+    };
     let (pull_tx, pull_rx) = ws_pull_channel();
     ws_pull_register(id, pull_rx);
     if cell.is_empty() {
@@ -535,7 +590,7 @@ pub(super) fn op_ws_bind_target(
     // the pipe task buffers as a pending frame instead of being dropped for
     // a socket the registry has never heard of. `accept()` opens the socket
     // synchronously, so that window is reachable by an ordinary `send()`.
-    ws_register_outbound(id, &cell);
+    ws_register_outbound(id, &cell, facet);
     let (tx, rx) = tokio::sync::oneshot::channel();
     let sent = outbound_ws_tx().is_some_and(|sender| {
         sender
@@ -548,6 +603,8 @@ pub(super) fn op_ws_bind_target(
                 headers: Vec::new(),
                 want_response: false,
                 target: Some(target),
+                // `scope` names the target, which keeps its own route.
+                facet: None,
                 reply: tx,
             })
             .is_ok()
@@ -613,6 +670,7 @@ pub(super) fn op_ws_accept(
                 attachment: None,
                 pending: Vec::new(),
                 auto_response_at: None,
+                facet: None,
             });
         replaced_regular_scope
     };
@@ -644,6 +702,7 @@ pub(super) fn op_ws_accept_regular(
                 attachment: None,
                 pending: Vec::new(),
                 auto_response_at: None,
+                facet: None,
             });
             true
         } else {
