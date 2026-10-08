@@ -81,6 +81,9 @@ fn configured_minimum_reuses_the_warm_isolate_after_repeated_maintenance() {
         .enable_all()
         .build()
         .unwrap();
+    // v0.6.1 requires the host execution domain before fetch timing or I/O.
+    // This is the only test here that drives the async StatelessRuntime facade.
+    celld::asyncrt::set_host_handle(executor.handle().clone());
     for expected in 1..=4 {
         runtime.isolates.reap();
         assert_eq!(runtime.isolates.census().live, 1);
