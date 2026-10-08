@@ -650,9 +650,8 @@ pub(crate) enum StopMode {
 pub struct PoolCensus {
     /// Isolates that accept placement and work.
     pub live: usize,
-    /// Live isolates that house no cell. The next maintenance pass retires
-    /// them, so a count that persists across passes means the pass is not
-    /// running.
+    /// Live isolates that house no cell. Cell-pool maintenance retires them;
+    /// stateless pools may retain their configured warm minimum.
     pub live_empty: usize,
     /// Retiring isolates whose heap is still installed, because a turn, a
     /// request, or a cell holds it.
@@ -665,6 +664,9 @@ pub struct PoolCensus {
     pub requests: usize,
     /// Turns in flight across the pool.
     pub turns: usize,
+    /// Oldest continuously executing turn, sampled without entering V8.
+    /// Zero also covers idle isolates and requests suspended on native I/O.
+    pub max_active_turn_ms: u64,
     /// Physical memory V8 has committed to the heaps of the isolates a turn
     /// did not hold at the sample.
     pub heap_bytes: u64,

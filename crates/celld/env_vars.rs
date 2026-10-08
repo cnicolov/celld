@@ -287,6 +287,11 @@ pub fn validate() -> anyhow::Result<()> {
         optional::<u64>(name)?;
     }
 
+    let cores = std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(4);
+    let maximum = positive_or::<usize>("CELLD_MAX_STATELESS_ISOLATES", cores)?;
+    stateless_pool_minimum(maximum)?;
     shutdown_timing()?;
 
     positive::<usize>("CELLD_MAX_DYNAMIC_WORKER_CODE_BYTES")?;
@@ -327,6 +332,19 @@ pub fn validate() -> anyhow::Result<()> {
 pub fn shutdown_timing() -> anyhow::Result<ShutdownTiming> {
     let total_ms = positive("CELLD_SHUTDOWN_TOTAL_MS")?.unwrap_or(DEFAULT_SHUTDOWN_TOTAL_MS);
     Ok(ShutdownTiming::from_total_ms(total_ms))
+}
+
+/// Normal-maintenance floor for one current stateless Worker service.
+/// Validate against the same effective ceiling the runtime passes to its pool.
+pub fn stateless_pool_minimum(maximum: usize) -> anyhow::Result<usize> {
+    let minimum = with_default("CELLD_MIN_STATELESS_ISOLATES", 0_usize)?;
+    if minimum > maximum {
+        bail!(
+            "CELLD_MIN_STATELESS_ISOLATES ({minimum}) must not exceed \
+             CELLD_MAX_STATELESS_ISOLATES ({maximum})"
+        );
+    }
+    Ok(minimum)
 }
 
 pub fn value(name: &str) -> anyhow::Result<Option<String>> {
