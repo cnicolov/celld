@@ -2823,6 +2823,15 @@ async fn internal_log(request: Request<Incoming>, app: AppHandle, path: String) 
             },
             Err(error) => Err(error.into()),
         },
+        "/peer/log/tail-page" => {
+            match serde_json::from_slice::<celld::node_log::TailPageReq>(&body) {
+                Ok(req) => follower
+                    .tail_page(&req)
+                    .await
+                    .map(|tail| celld::node_log::encode_tail_page(&tail)),
+                Err(error) => Err(error.into()),
+            }
+        }
         _ => Err(anyhow::anyhow!("unknown log endpoint")),
     };
     match result {
@@ -2898,6 +2907,25 @@ async fn handle_internal(
         "/peer/handoff" => internal_handoff(request, app).await,
         _ if path.starts_with("/peer/log/") => internal_log(request, app, path.clone()).await,
         "/state" => response(StatusCode::OK, app.snapshot().await),
+        "/hot-recovery" => response(
+            StatusCode::OK,
+            app.follower
+                .as_ref()
+                .map_or_else(
+                    || serde_json::json!({"enabled": false, "candidates": []}),
+                    |follower| follower.hot_recovery_status(),
+                )
+                .to_string(),
+        ),
+        "/gc/follower-log" if request.method() != hyper::Method::POST => {
+            response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed")
+        }
+        "/gc/follower-log" => {
+            if let Some(follower) = &app.follower {
+                follower.gc_fragments().await;
+            }
+            response(StatusCode::OK, "{\"ok\":true}")
+        }
         "/reload" if request.method() != hyper::Method::POST => {
             response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed")
         }
@@ -3294,7 +3322,7 @@ fn serve_http_connection(
                         HttpSurface::Recovery => {
                             let path = request.uri().path().to_string();
                             Ok(match path.as_str() {
-                                "/peer/log/seal" | "/peer/log/tail" => {
+                                "/peer/log/seal" | "/peer/log/tail" | "/peer/log/tail-page" => {
                                     internal_log(request, app, path).await
                                 }
                                 _ => response(
@@ -3540,6 +3568,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
         Action::Dev(arguments) => return celld::dev::run(arguments).await,
         Action::Cell(arguments) => return celld::cell_cli::run(arguments).await,
         Action::D1(arguments) => return celld::d1_cli::run(arguments).await,
+        Action::Disk(arguments) => return celld::disk_cli::run(arguments).await,
         Action::Kv(arguments) => return celld::kv_cli::run(arguments).await,
         Action::Queue(arguments) => return celld::queue_cli::run(arguments).await,
         Action::R2(arguments) => return celld::r2_cli::run(arguments).await,
@@ -3758,7 +3787,12 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
         });
     });
     let (fence_tx, mut fence_rx) = mpsc::unbounded_channel();
-    let node = std::env::var("CELLD_NODE").unwrap_or_else(|_| random_node_session_id());
+    let data_dir = std::env::var_os("CELLD_TEST_DATA_DIR")
+        .or_else(|| std::env::var_os("CELLD_WATCH"))
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join(format!("celld-{}", std::process::id())));
+    let explicit_node = std::env::var("CELLD_NODE").ok();
+    let node = celld::node_identity::load_or_create(&data_dir, explicit_node.as_deref())?;
     let clean_reload_node = node.clone();
     celld::control_plane::install_reexec_node_session_id(&node)?;
     let probe_public_key = celld::peer_probe::install_signer()?;
@@ -3791,10 +3825,6 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
     };
     let max_releases = celld::env_vars::positive::<usize>("CELLD_RELEASES")?
         .unwrap_or(DEFAULT_MAX_CONCURRENT_RELEASES);
-    let data_dir = std::env::var_os("CELLD_TEST_DATA_DIR")
-        .or_else(|| std::env::var_os("CELLD_WATCH"))
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::env::temp_dir().join(format!("celld-{}", std::process::id())));
     let mut deploy_agent = None;
     // The channel `POST /reload` and a managed notification nudge the pointer
     // watcher through. Without a deployment bucket the receiver is dropped
@@ -4290,26 +4320,47 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                 celld::node_log::eviction_policy_from_env()?,
             ));
             *actor.node_log.lock().unwrap() = Some(manager.clone());
-            // Recovery-before-install is fatal for every posture: the
+            let hot_recovery = std::env::var("CELLD_HOT_RECOVERY").unwrap_or_else(|_| "0".into());
+            anyhow::ensure!(
+                matches!(hot_recovery.as_str(), "0" | "1"),
+                "CELLD_HOT_RECOVERY must be 0 or 1"
+            );
+            if hot_recovery == "1" {
+                if let Some(follower) = &follower {
+                    manager.enable_hot_recovery(
+                        follower.clone(),
+                        &data_dir,
+                        celld::env_vars::positive_or("CELLD_HOT_STANDBY_MB", 2048_u64)?
+                            .checked_mul(1024 * 1024)
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("CELLD_HOT_STANDBY_MB overflows bytes")
+                            })?,
+                        celld::env_vars::positive_or("CELLD_HOT_STANDBY_CELLS", 128_usize)?,
+                    )?;
+                }
+            }
+            // Recovery-before-install is mandatory for every posture: the
             // predecessor's folded state lives in the lease record this
             // session is about to replace, and the install writes a fresh
-            // log — so an unrecovered predecessor must stop the boot, or
+            // log — so an unrecovered predecessor must hold startup closed, or
             // the install erases the only evidence recovery was needed.
             // The ladder waits out the predecessor's own lease because the
             // fence recheck refuses a live lease, retries with backoff,
-            // and exits on exhaustion. Serve the retained follower disks
-            // throughout the ladder, including retry backoffs, so a fleet
-            // restart can recover without waiting for another node's lease.
+            // and keeps retrying while witnesses or bucket reads are pending.
+            // Serve the retained follower disks throughout the wait,
+            // including retry backoffs, so a fleet restart can recover without
+            // waiting for another node's lease.
             recover_with_follower_listener(&internal_listener, app.clone(), async {
                 let ttl_backoff =
                     std::time::Duration::from_millis(actor.lease_spec.ttl_ms.max(1_000));
-                let mut recovered = Ok(());
+                let mut attempt = 0_u64;
                 // A boot waits behind a peer's live recovery claim and takes
                 // it over only once its heartbeat is stale, so one attempt
                 // can legitimately last as long as the peer's gather. The
                 // bound is a backstop against a wedge, not a pace.
-                for attempt in 1..=4u32 {
-                    recovered = match tokio::time::timeout(
+                loop {
+                    attempt = attempt.saturating_add(1);
+                    let recovered = match tokio::time::timeout(
                         std::time::Duration::from_secs(15 * 60),
                         manager.recover_self(),
                     )
@@ -4318,23 +4369,22 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                         Ok(result) => result,
                         Err(_) => Err(anyhow::anyhow!("predecessor recovery timed out")),
                     };
-                    if recovered.is_ok() || attempt == 4 {
-                        break;
+                    if recovered.is_ok() {
+                        return Ok(());
                     }
                     if let Err(error) = recovered.as_ref() {
                         eprintln!("celld predecessor recovery attempt {attempt} failed: {error:#}");
                     }
-                    // At least one full TTL between attempts, so a
-                    // refused-because-live predecessor lease has expired
-                    // by the retry.
-                    tokio::time::sleep(ttl_backoff.saturating_mul(attempt)).await;
-                }
-                recovered.map_err(|error| {
-                    anyhow::anyhow!(
-                        "refusing to install a lease over an unrecovered \
-                         predecessor log: {error:#}"
+                    // Pace failed reads without bounding witness return time.
+                    // The usual first wait spans a full predecessor TTL; large
+                    // configured TTLs and later failures use the 30s cap.
+                    tokio::time::sleep(
+                        ttl_backoff
+                            .saturating_mul(attempt.min(30) as u32)
+                            .min(std::time::Duration::from_secs(30)),
                     )
-                })
+                    .await;
+                }
             })
             .await?;
             let mut owner = celld::node_log::DurabilityOwner::new(manager, durability == "fleet");
@@ -5607,8 +5657,8 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
 }
 
 use celld::machine::{
-    lease_ttl_ms_from_environment, local_cache_max_bytes_from_environment, random_node_session_id,
-    random_peer_key, DEFAULT_MAX_OUTBOUND_WEBSOCKETS, PEER_CONNECT_TIMEOUT,
+    lease_ttl_ms_from_environment, local_cache_max_bytes_from_environment, random_peer_key,
+    DEFAULT_MAX_OUTBOUND_WEBSOCKETS, PEER_CONNECT_TIMEOUT,
 };
 
 /// Signals cancellation when the connection handling this request goes away.

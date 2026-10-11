@@ -154,6 +154,16 @@ record forces recovery before the restore: compare-and-swap the record to fence
 it, seal the reachable followers, upload their retained segments and bundles
 into the per-cell prefixes, and mark the record sealed.
 
+With opt-in `CELLD_HOT_RECOVERY=1`, an eligible follower can instead certify
+the exact cell's sealed, continuously materialized SQLite image and complete
+canonical checkpoint. It rejects newer bucket-only/bundled commits, checks the
+local image checksum, and promotes only after the cell ownership CAS wins and
+the successor marker is durable. This cell-scoped proof does **not** seal the
+predecessor session, release its follower obligations, or authorize disk
+retirement. Missing/stale images use ordinary session recovery, and process
+restart discards standby certificates. See [hot recovery](designs/hot-recovery.md)
+for the opt-in settings, bounds, additional checkpoint writes, and lifecycle.
+
 A cell can stop while its node session stays open; its next activation gathers
 any acknowledged tail outside its per-cell prefix. Once the log epoch is
 active (before its first fleet proof), at least one current follower must
@@ -162,30 +172,84 @@ recovery requirement.
 
 Recovery has these limits:
 
+- An expired or unreachable follower is not evidence that its disk was lost.
+  An epoch that may have fleet acknowledgements requires a complete matching
+  witness; otherwise recovery stays pending and does not declare loss or seal.
 - A follower's HTTP error does not prove its data is absent, even when its
   lease has expired, so persistent errors can block recovery and startup.
+- An unreadable retained bundle keeps the fold pending. Neither a damaged
+  envelope nor a row outside its payload establishes that every alternative
+  copy is lost; these paths do not create an automatic-loss certificate.
 - A restarted follower cannot certify a range with a damaged batch or a gap
   until valid data covers it.
-- An older node's entries-only tail (`CLT1`) proves neither completeness nor
-  loss, so recovery or startup can stall during a mixed-version update.
+- Recovery reads `/peer/log/tail-page` (`CLP1`). Upgrade follower nodes before
+  relying on paged recovery: an older follower without this endpoint cannot
+  certify this recovery path. An entries-only tail (`CLT1`) proves neither
+  completeness nor loss.
 - A deleted final batch is undetectable if no later batch or persisted end
   records its range.
 - A torn batch with an unacknowledged write looks like damage after an
-  acknowledgement, so the loss record can report an uncertified range when no
-  acknowledged write is missing.
+  acknowledgement, so it can block recovery even when no acknowledged write
+  is missing.
 
 A restarting node serves authenticated follower seal and tail requests before
 its own predecessor recovery completes, so nodes that restart together can
 recover acknowledged writes from surviving follower disks. It accepts
 application requests and new follower appends only after startup completes.
+The startup listener also serves paged tails. A failed predecessor-recovery
+attempt keeps startup pending and retries with a backoff capped at 30 seconds,
+rather than exiting after a fixed number of missing-witness attempts. Each
+attempt has a 15-minute I/O backstop; expiration retries without replacing the
+predecessor lease or discarding its recovery obligation.
 
 Recovery of a large dead node can take minutes. It reads retained bundles in
-windows of at most 512 MiB and uploads and releases each window before the next,
-so memory does not grow with the session; a cell with rows in several windows
-receives one object per window. A failed or timed-out attempt does not fail
-waiting requests: the cell retries with a backoff (`CELLD_RECOVERY_RETRY_MS`,
-default 1000), and the requests fail with a resolve error only after
-`CELLD_RECOVERY_RETRIES` (default 240) attempts.
+windows targeting 512 MiB and uploads and releases each window before the next,
+and transfers a follower tail in pages targeting 4 MiB. A single indivisible
+bundle or entry can exceed its target; the memory bound includes the largest
+admitted batch or bundle. Range indexes retain metadata rather than all payloads. Tail
+pages are validated against the persisted seal and spooled to local scratch;
+bundles fold first, then tail pages fold in sequence order. Failed page requests
+retry the current cursor up to twice, keeping earlier pages for that attempt.
+A process crash starts a fresh transfer; scratch is not a persistent promotion
+certificate. Response headers and body inactivity have a 10-second timeout,
+while an ongoing body transfer has no whole-request deadline. Recovery beats
+its claim while waiting and at page-progress boundaries, so fast individual
+pages cannot starve the heartbeat of a long transfer. A cell with rows in
+several windows or pages receives multiple objects. A failed or timed-out
+attempt does not fail waiting requests: the cell retries with a backoff
+(`CELLD_RECOVERY_RETRY_MS`, default 1000), and the requests fail with a resolve
+error only after `CELLD_RECOVERY_RETRIES` (default 240) attempts.
+
+### Node identity and disk retirement
+
+The logical node identity is persisted as `node-id` in the data directory.
+Reusing a persistent `CELLD_WATCH` directory without `CELLD_NODE` reuses this
+identity, while process generations remain fresh. An explicit `CELLD_NODE`
+must match an existing disk identity. The default process-temporary data
+directory does not provide persistent storage across process restarts. When
+upgrading a legacy disk without `node-id`, supply its original `CELLD_NODE` on
+the first start so old follower obligations remain addressable.
+
+Follower GC reclaims a fragment when its log epoch is closed, or when the
+leader's lease shows a successor process generation. Recovery-before-install
+is the proof for the latter. A missing lease is not a GC proof. The persisted
+fragment fence remains after payload deletion, rejecting delayed old appends.
+The periodic sweep runs every ten minutes; `POST /gc/follower-log` on the
+internal operator listener runs the same proof-guarded sweep immediately.
+
+A completed cell handoff does not prove a follower disk disposable. Stop the
+node, keep it stopped, and run:
+
+```sh
+celld disk check /path/to/node-data --bucket s3://fleet
+```
+
+The command emits a JSON verdict and exits zero only when the node's lease is
+no longer live, its own log is sealed or absent, and every local follower
+fragment is closed or superseded. A missing own lease is not a completion
+proof. Outstanding obligations or unreadable proof return a nonzero exit.
+This conservative check requires bucket completion;
+another follower copy alone is not a retirement certificate.
 
 ### Epoch-chain restore
 
@@ -222,7 +286,8 @@ A fenced node can append an unacknowledged tail to an older prefix. After a
 snapshot successor, a later restore can expose that tail; this does not violate
 the contract, because a missing acknowledgement does not prove a write absent.
 After a paged successor, the chain clips the older prefix at the cut, and the
-takeover recovery gate seals the prior node-log session before the successor
+takeover recovery gate seals the prior node-log session, or certifies the exact
+cell's canonical checkpoint and local standby, before the successor
 restores, so no write past the cut can be acknowledged.
 
 ### Self-fencing
@@ -230,6 +295,11 @@ restores, so no write past the cut can be acknowledged.
 Each node holds a lease in the bucket with an expiry, renewed after one third of
 the lifetime (`CELLD_TTL_MS`, default 10000 ms). A failed renewal is retried
 while the published expiry has not passed.
+
+An S3 conditional PUT that returns HTTP 409 (`ConditionalRequestConflict`)
+is a retryable rejection with no committed write, not proof that the lease's
+ETag changed. HTTP 412 remains a definitive failed precondition. Retryable
+conflicts do not extend authority: the existing expiry still bounds retries.
 
 When the expiry passes, the node fences itself: it stops each active cell and
 fails every incomplete request. It also fences at once when its lease record is

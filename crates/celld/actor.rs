@@ -3287,7 +3287,7 @@ impl Actor {
                         // recover, and the claim proceeds as before.
                         None => Ok(()),
                         Some(interlock) => interlock
-                            .ensure_recovered(Some(&owner))
+                            .ensure_cell_recovered(&cell, &owner)
                             .await
                             .map_err(|error| {
                                 eprintln!(

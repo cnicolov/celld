@@ -247,6 +247,14 @@ pub fn certify(tiered: Offset, sealed_end: Offset) -> Offset {
     tiered.max(sealed_end)
 }
 
+/// A failed or expired follower is not evidence that its disk has no data.
+/// If this fragment could acknowledge beyond the bucket, recovery must retain
+/// its obligation until a complete sealed witness is read, however long that
+/// witness takes to return.
+pub fn recovery_has_witness(may_have_fleet_acks: bool, complete_witnesses: usize) -> bool {
+    !may_have_fleet_acks || complete_witnesses > 0
+}
+
 /// Recovery final step: the certified tail is durable in the bucket, so the
 /// record seals at the cut and every per-cell takeover may treat the bucket
 /// as complete.

@@ -18,7 +18,7 @@
 //! read answers and a conditional write consumes.
 //!
 //! Error contract, relied on by the self-fence: `put_cas` answers
-//! `Ok(None)` only for a clean 412/409 rejection; every other failure
+//! `Ok(None)` only for a definitive precondition rejection; every other failure
 //! surfaces as `Err`. An `Err` is ambiguous — the write may have
 //! committed — unless `cas_write_did_not_commit` recognizes an answer
 //! that proves the store wrote no object. In the same spirit a response
@@ -226,6 +226,28 @@ pub fn is_clean_cas_rejection(error: &Error) -> bool {
     )
 }
 
+/// object_store maps every HTTP 409 to AlreadyExists. For S3 conditional
+/// PUTs, 409 is ConditionalRequestConflict, not evidence of an ETag mismatch:
+/// the request did not commit, and the caller may retry within its authority.
+#[derive(Debug)]
+struct S3CasConflict(Error);
+
+impl std::fmt::Display for S3CasConflict {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "S3 conditional request conflict (409), safe to retry: {}",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for S3CasConflict {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
 /// Whether a failed conditional write proves that the store holds no new
 /// object. A caller that renews a lease uses this to skip the readback
 /// that resolves an ambiguous write, because the readback costs a round
@@ -247,6 +269,9 @@ pub fn is_clean_cas_rejection(error: &Error) -> bool {
 /// until the upstream type is reachable.
 #[doc(hidden)]
 pub fn cas_write_did_not_commit(error: &anyhow::Error) -> bool {
+    if error.downcast_ref::<S3CasConflict>().is_some() {
+        return true;
+    }
     // `put_cas` wraps the store error in context, so read the chain rather
     // than the outermost error. A chain that carries no `object_store`
     // error at all -- an applied write whose response had no CAS token --
@@ -1066,6 +1091,16 @@ impl Bucket {
                         )
                     })?;
                 Ok(Some(token))
+            }
+            Err(error)
+                if self.backend == StorageBackend::S3
+                    && matches!(error, Error::AlreadyExists { .. }) =>
+            {
+                Err(anyhow!(S3CasConflict(error)).context(format!(
+                    "conditional write {}://{}/{key} was rejected by a retryable conflict",
+                    self.scheme(),
+                    self.name
+                )))
             }
             Err(error) if is_clean_cas_rejection(&error) => Ok(None),
             Err(error) => Err(anyhow!(error).context(format!(

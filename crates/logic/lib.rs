@@ -4512,9 +4512,10 @@ impl State {
         }
     }
 
-    /// The interlock's completion: recovery sealed (or proved absent)
-    /// every session of the dead owner, so the claim the gate deferred
-    /// proceeds against the SAME owner record the decision was made on —
+    /// The interlock's completion: recovery sealed (or proved absent) the
+    /// dead session, or certified this cell's checkpoint and local standby.
+    /// The deferred claim proceeds against the SAME owner record the decision
+    /// was made on —
     /// the CAS guard still carries its etag, so a record that moved in
     /// the meantime rejects the claim and resolution restarts.
     fn node_log_recovered(

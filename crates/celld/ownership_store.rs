@@ -978,7 +978,8 @@ impl BucketOwnership {
                 Err(error) => LeaseRequestOutcome::Error(error),
             },
         );
-        // `put_cas` folds a clean 412/409 into `Ok(None)`, so every failure
+        // `put_cas` folds a definitive precondition rejection into `Ok(None)`;
+        // an S3 409 stays retryable. Every failure
         // left here either carries a store answer that proves no object was
         // written, or describes a write that can have committed.
         let applied = written.map_err(|error| {

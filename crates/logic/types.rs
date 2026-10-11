@@ -1063,9 +1063,10 @@ pub enum Effect {
     },
     /// The takeover interlock, as a core decision (lease-fold): the dead
     /// owner's folded log state was not sealed, so its acked tail may
-    /// exist only on its followers. The executor recovers every
-    /// non-sealed session of `owner` into the bucket and reports
-    /// `NodeLogRecovered`; only then does the claim proceed.
+    /// exist only on its followers. The executor either recovers the session
+    /// into the bucket or certifies this exact cell's complete canonical
+    /// checkpoint and sealed local standby. It reports `NodeLogRecovered`
+    /// only with a usable restore proof; the ownership CAS still must win.
     RecoverNodeLog {
         op: OpId,
         cell: CellId,

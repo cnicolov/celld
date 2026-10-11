@@ -1302,6 +1302,7 @@ pub struct LtxRepl {
     /// process death hands the same duty to boot recovery, which drains
     /// whole predecessor sessions.
     dirty_tails: Mutex<BTreeMap<String, BTreeMap<u64, RetainedTail>>>,
+    hot_promotions: Mutex<BTreeMap<String, crate::hot_recovery::Promotion>>,
     registration: Arc<Mutex<RegistrationState>>,
     stop: StopToken,
     task_owner: Mutex<Option<LtxTaskOwner>>,
@@ -1355,6 +1356,13 @@ pub struct LtxRepl {
 }
 
 impl LtxRepl {
+    pub(crate) fn recovery_scratch(&self) -> std::io::Result<celld_ltx::HostFile> {
+        let directory = self.watch.join("recovery-scratch");
+        let filesystem = crate::asyncrt::fs();
+        filesystem.create_dir_all(&directory)?;
+        filesystem.temporary_file(Some(&directory))
+    }
+
     /// Cfg-gated constructor over an injected store.
     #[cfg(celld_internal_tests)]
     pub fn start_with_store_for_test(watch: &Path, store: Arc<dyn ObjectStore>) -> Self {
@@ -1613,6 +1621,7 @@ impl LtxRepl {
             preserved,
             dirty_ship,
             dirty_tails: Mutex::new(BTreeMap::new()),
+            hot_promotions: Mutex::new(BTreeMap::new()),
             registration,
             stop: stop.clone(),
             task_owner: Mutex::new(Some(LtxTaskOwner {
@@ -2277,6 +2286,176 @@ impl LtxRepl {
         Ok(Some(EpochChain::build(clients).await?))
     }
 
+    pub(crate) fn install_hot_promotion(
+        &self,
+        cell: &str,
+        promotion: crate::hot_recovery::Promotion,
+    ) {
+        self.hot_promotions
+            .lock()
+            .unwrap()
+            .insert(cell.to_string(), promotion);
+    }
+
+    pub(crate) fn prune_hot_promotions(&self) {
+        let now = asyncrt::mono_ms();
+        self.hot_promotions
+            .lock()
+            .unwrap()
+            .retain(|_, promotion| promotion.expires_mono_ms > now);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hot_promotions_for_test(&self, cell: &str) -> crate::hot_recovery::Promotion {
+        self.hot_promotions.lock().unwrap().remove(cell).unwrap()
+    }
+
+    pub(crate) async fn hot_checkpoint_position(
+        &self,
+        cell: &str,
+        epoch: u64,
+    ) -> anyhow::Result<u64> {
+        let Some(chain) = self
+            .epoch_chain(
+                cell,
+                epoch
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow!("cell epoch exhausted"))?,
+            )
+            .await?
+        else {
+            return Ok(0);
+        };
+        anyhow::ensure!(
+            chain
+                .spans()
+                .last()
+                .is_some_and(|(source, _)| *source == epoch),
+            "standby source epoch changed"
+        );
+        // A maximum past a hole is not a checkpoint. Plan validation demands
+        // the same complete chain that a cold successor would restore.
+        let plan = replica::calc_restore_plan(&chain, TXID(0)).await?;
+        Ok(plan.iter().map(|file| file.max_txid.0).max().unwrap_or(0))
+    }
+
+    pub(crate) async fn hot_seed(
+        &self,
+        cell: &str,
+        epoch: u64,
+        budget: u64,
+    ) -> anyhow::Result<Option<(RestoredSnapshot, u64, u32)>> {
+        let Some(chain) = self
+            .epoch_chain(
+                cell,
+                epoch
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow!("cell epoch exhausted"))?,
+            )
+            .await?
+        else {
+            return Ok(None);
+        };
+        if chain
+            .spans()
+            .last()
+            .is_none_or(|(source, _)| *source != epoch)
+        {
+            return Ok(None);
+        }
+        // Existing whale cells can join a standby after their snapshot was
+        // already tiered. Stream their canonical baseline in bounded page
+        // runs; never materialize the full restore in a heap-sized Vec.
+        let plan = replica::calc_restore_plan(&chain, TXID(0)).await?;
+        let map = celld_ltx::paged::build_page_map(&chain, &plan).await?;
+        anyhow::ensure!(
+            u64::from(map.commit) * u64::from(map.page_size) <= budget,
+            "standby seed exceeds its reserved disk budget"
+        );
+        let newest = plan
+            .last()
+            .ok_or_else(|| anyhow!("empty standby seed plan"))?;
+        let header = celld_ltx::ltx::Header::parse(
+            &chain
+                .read_range(
+                    newest.level,
+                    newest.min_txid,
+                    newest.max_txid,
+                    0,
+                    celld_ltx::ltx::HEADER_SIZE as u64,
+                )
+                .await?,
+        )?;
+        let trailer = celld_ltx::ltx::Trailer::parse(
+            &chain
+                .read_range(
+                    newest.level,
+                    newest.min_txid,
+                    newest.max_txid,
+                    u64::try_from(newest.size)?
+                        .checked_sub(celld_ltx::ltx::TRAILER_SIZE as u64)
+                        .ok_or_else(|| anyhow!("short standby seed object"))?,
+                    celld_ltx::ltx::TRAILER_SIZE as u64,
+                )
+                .await?,
+        )?;
+        let mut readers = Vec::new();
+        for (source, lo) in chain.spans() {
+            readers.push((
+                lo,
+                self.client_for(cell, source)
+                    .blocking_range_reader()
+                    .await?,
+            ));
+        }
+        let reader = celld_ltx::paged::EpochChainReader::new(readers);
+        let directory = self.watch.join("hot-standby").join(format!(
+            ".seed-{}",
+            crate::machine::random_node_session_id()
+        ));
+        self.ltx_host.create_dir_all(&directory)?;
+        let path = directory.join("db.sqlite");
+        let snapshot =
+            RestoredSnapshot::new(epoch, path.clone(), directory, self.ltx_host.filesystem());
+        let host = self.ltx_host.clone();
+        let stop = self.stop.clone();
+        let page_size = map.page_size;
+        asyncrt::blocking(move || {
+            let mut output = host.create(&path)?;
+            let lock = celld_ltx::ltx::lock_pgno(map.page_size);
+            let mut checksum = celld_ltx::CHECKSUM_FLAG;
+            let mut pgno = 1;
+            while pgno <= map.commit {
+                anyhow::ensure!(!stop.is_stopped(), "standby seed stopped");
+                if pgno == lock {
+                    output.write_all(&vec![0; map.page_size as usize])?;
+                    pgno += 1;
+                    continue;
+                }
+                let pages = map.read_run_sync(&reader, pgno, celld_ltx::paged::READAHEAD_BYTES)?;
+                anyhow::ensure!(!pages.is_empty(), "standby seed is missing page {pgno}");
+                for (number, page) in pages {
+                    anyhow::ensure!(
+                        number == pgno && number <= map.commit,
+                        "standby seed page gap"
+                    );
+                    checksum = celld_ltx::CHECKSUM_FLAG
+                        | (checksum ^ celld_ltx::ltx::checksum_page(number, &page));
+                    output.write_all(&page)?;
+                    pgno += 1;
+                }
+            }
+            anyhow::ensure!(
+                header.no_checksum() || checksum == trailer.post_apply_checksum,
+                "standby seed checksum mismatch"
+            );
+            output.sync_all()?;
+            anyhow::Ok(())
+        })
+        .await??;
+        Ok(Some((snapshot, chain.max_txid().0, page_size)))
+    }
+
     /// Does the bucket hold any LTX for this cell at this epoch? The fail-closed
     /// eviction gate: never delete the last local copy of state the bucket
     /// cannot restore.
@@ -2311,7 +2490,7 @@ impl LtxRepl {
             resume_local,
             // Consumed by the interlock before the fold; the field stays
             // on the options because the core's claim still names it.
-            prior: _,
+            prior,
         } = options;
         {
             let _close_gate = self.replica_close_gate.lock().unwrap();
@@ -2330,9 +2509,11 @@ impl LtxRepl {
         // The takeover interlock moved OUT of this path (lease-fold): the
         // decision core gates foreign takeovers on the folded lease state
         // it already reads (Effect::RecoverNodeLog), and the boot order
-        // recovers this node's own predecessor before the lease installs,
-        // so by the time any activation reaches here the bucket is
-        // provably complete for both the takeover and the named-me path.
+        // recovers this node's own predecessor before the lease installs.
+        // The interlock either sealed the whole session or prepared an exact
+        // canonical cell checkpoint plus a local standby. If that standby is
+        // absent or no longer usable, the cold path re-establishes the full
+        // session gate below before reading its restore chain.
 
         // Reuse a preserved local eviction snapshot only as the previous
         // epoch's baseline. Eviction removes the LTX metadata, so reopening
@@ -2375,7 +2556,46 @@ impl LtxRepl {
         // A paged activation continues its chain from the cut: (last txid of
         // the chain, page count at the cut).
         let mut continuation: Option<(TXID, u32)> = None;
-        if resume_local {
+        let hot = self
+            .hot_promotions
+            .lock()
+            .unwrap()
+            .remove(cell)
+            .filter(|promotion| {
+                took_over
+                    && !fresh
+                    && !resume_local
+                    && !dst_existed
+                    && promotion.expires_mono_ms > asyncrt::mono_ms()
+                    && prior.as_deref() == Some(&promotion.owner)
+                    && promotion.source_epoch.checked_add(1) == Some(epoch)
+                    && !is_file(&dst.with_extension("sqlite-wal"))
+                    && !is_file(&dst.with_extension("sqlite-shm"))
+            });
+        if let Some(promotion) = hot {
+            // All predecessor commits represented by this image already have
+            // canonical bucket checkpoints. The ownership CAS has now won;
+            // only now can the private standby become the writable database.
+            self.ltx_host.rename(&promotion.path, &dst)?;
+            continuation = Some((
+                TXID(
+                    promotion
+                        .txid
+                        .checked_add(1)
+                        .ok_or_else(|| anyhow!("standby TXID exhausted"))?,
+                ),
+                promotion.commit,
+            ));
+            restored = true;
+            info!(
+                event = "hot_recovery_promoted",
+                cell,
+                from = promotion.source_epoch,
+                to = epoch,
+                txid = promotion.txid,
+                "promoted materialized standby after ownership CAS"
+            );
+        } else if resume_local {
             anyhow::ensure!(
                 is_file(&dst),
                 "clean reload database is missing: {}",
@@ -2391,6 +2611,14 @@ impl LtxRepl {
             info!(cell, epoch, "reused local eviction snapshot");
             restored = true;
         } else if !fresh {
+            // A hot preparation can lose its CAS, be superseded, or disappear
+            // before a dormant activation runs. Without its exact local image,
+            // re-establish the ordinary session recovery gate before restoring.
+            if took_over {
+                if let Some(targets) = registered_durability(&self.registration) {
+                    targets.manager.ensure_recovered(prior.as_deref()).await?;
+                }
+            }
             // Restore the newest durable epoch's full contiguous chain. The
             // epoch seal that once capped this read is deleted: the
             // cut it fixed defended only never-acked resurrection — not a
