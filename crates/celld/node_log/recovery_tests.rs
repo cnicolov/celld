@@ -4,21 +4,7 @@
 //! They do not require the external upstream simulation harness.
 
 use super::*;
-use std::sync::OnceLock;
-
-fn run(future: impl std::future::Future<Output = anyhow::Result<()>>) {
-    static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
-    let runtime = RUNTIME.get_or_init(|| {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .unwrap();
-        crate::asyncrt::set_host_handle(runtime.handle().clone());
-        runtime
-    });
-    runtime.block_on(future).unwrap();
-}
+use crate::test_runtime::run;
 
 async fn lease(bucket: &Bucket, node: &str, generation: &str, log: serde_json::Value) {
     bucket
@@ -1073,6 +1059,7 @@ fn s3_conflict_is_retryable_but_a_failed_precondition_is_a_lost_cas() {
             .cas_node_lease(
                 celld_logic::CasGuard::Match("prior-etag".into()),
                 &celld_logic::NodeLeaseRecord {
+                    placement_pool: celld_logic::placement::Pool::DEFAULT,
                     node: "conflict".into(),
                     addr: "unused".into(),
                     expires_ms: crate::ownership_store::now_ms() + 10000,

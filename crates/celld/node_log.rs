@@ -5665,15 +5665,17 @@ impl NodeLogManager {
         match shortfall {
             log_tier::Shortfall::NoPeer => info!(
                 live_peers,
+                placement_pool = %self.ownership.placement_pool(),
                 "fleet durability requested and no peer is available; writes \
                  wait for the bucket. A second node acknowledges a write when \
                  its follower holds it on disk, which is much faster"
             ),
             log_tier::Shortfall::NoEligiblePeer => warn!(
                 live_peers,
+                placement_pool = %self.ownership.placement_pool(),
                 "fleet durability requested and no peer is eligible; writes \
-                 wait for the bucket. Every live peer is quarantined for \
-                 incapability or has not been recruited yet"
+                 wait for the bucket. Peers must match the placement pool, \
+                 advertise hot recovery for named pools, and pass protocol/health checks"
             ),
         }
     }
@@ -5747,6 +5749,11 @@ impl NodeLogManager {
         let members: Vec<Member> = peers
             .into_iter()
             .filter(|peer| peer.node != self.node && peer.expires_ms > now)
+            .filter(|peer| {
+                self.ownership
+                    .placement_pool()
+                    .accepts_follower(peer.placement_pool, peer.hot_recovery)
+            })
             // Only a follower that cannot serve appends at all sits out a
             // term. A gray one is recruitable again at once, because the
             // latency rule can judge it again and the swap rate cap is what

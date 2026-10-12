@@ -74,7 +74,14 @@ impl<'a> Fleet<'a> {
         since_ms: u64,
     ) -> Option<Self> {
         let mut members = Vec::new();
-        for peer in peers.iter().filter(|peer| peer.expires_ms > now_ms) {
+        let pool = peers
+            .iter()
+            .find(|peer| peer.node == self_node)?
+            .placement_pool;
+        for peer in peers
+            .iter()
+            .filter(|peer| peer.expires_ms > now_ms && peer.placement_pool == pool)
+        {
             let fresh =
                 peer.sampled_ms > since_ms && now_ms.saturating_sub(peer.sampled_ms) <= max_age_ms;
             if !fresh || !peer.paced_handoff || peer.rebalance_paused {

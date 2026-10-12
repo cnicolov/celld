@@ -58,8 +58,10 @@ fleet bucket. Each row links to a project that deploys as-is:
 | Containers (experimental): a Durable Object that supervises a container, `@cloudflare/containers` | [`container`](examples/container)                       |
 | Sandboxes: the Cloudflare Sandbox SDK, `@cloudflare/sandbox`, on a container per sandbox          | [`sandbox`](examples/sandbox)                           |
 
-A product that needs the Cloudflare network, a GPU, or a browser farm is out
-of scope. The [Cloudflare compatibility](docs/cloudflare-compat.md) page
+celld does not provide the Cloudflare network, GPU compute APIs, or a browser
+farm. [Placement pools](docs/placement.md) can constrain cells and their hot
+followers to your own specialized nodes, with bucket durability when no eligible
+follower is available. The [Cloudflare compatibility](docs/cloudflare-compat.md) page
 lists each gap in the services above.
 
 ## Install

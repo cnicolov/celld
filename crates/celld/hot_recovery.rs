@@ -78,6 +78,7 @@ mod tests {
 
     #[test]
     fn hot_recovery_requires_checkpoint_coverage_and_a_complete_observed_range() {
+        crate::test_runtime::init();
         let root = tempfile::tempdir().unwrap();
         let cache = Arc::new(HotStandbys::new(root.path(), 16384, 4).unwrap());
         cache.observe(
@@ -96,6 +97,7 @@ mod tests {
 
     #[test]
     fn hot_recovery_applies_growth_and_truncation_and_detects_cache_damage() {
+        crate::test_runtime::init();
         let root = tempfile::tempdir().unwrap();
         let cache = Arc::new(HotStandbys::new(root.path(), 16384, 4).unwrap());
         let first = entry("cell", 1, 1, 1, 2, 0);
@@ -120,6 +122,7 @@ mod tests {
 
     #[test]
     fn hot_recovery_rejects_ltx_gaps_and_drops_cache_certificates_on_restart() {
+        crate::test_runtime::init();
         let root = tempfile::tempdir().unwrap();
         let cache = Arc::new(HotStandbys::new(root.path(), 16384, 4).unwrap());
         let first = entry("cell", 1, 1, 1, 1, 0);
@@ -156,6 +159,7 @@ mod tests {
 
     #[test]
     fn hot_recovery_budget_includes_prepared_promotions() {
+        crate::test_runtime::init();
         let root = tempfile::tempdir().unwrap();
         let cache = Arc::new(HotStandbys::new(root.path(), 4096, 1).unwrap());
         cache.observe("owner/g", range(0), range(1), &[entry("a", 1, 1, 1, 1, 0)]);

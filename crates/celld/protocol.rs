@@ -74,9 +74,13 @@ pub const SUPPORTED_DEPLOYMENT_FEATURES: &[&str] = &[
     FEATURE_WASM_V1,
     FEATURE_WORKFLOWS_V1,
     FEATURE_PYTHON_WORKERS_V1,
+    FEATURE_CELL_PLACEMENT_V1,
 ];
 
 pub const FEATURE_ASSETS_V1: &str = "assets-v1";
+/// Hard placement registration and routing. Required by new DO deployments;
+/// source inspection cannot prove that a namespace never calls `create()`.
+pub const FEATURE_CELL_PLACEMENT_V1: &str = "cell-placement-v1";
 /// A deployment with `containers`. Required because a build without the
 /// container engine would load the manifest, build a `ctx` with no
 /// `container`, and fail only when the object first touches it.

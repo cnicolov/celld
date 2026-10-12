@@ -197,6 +197,17 @@ pub fn set_rpc_call_tx(tx: tokio::sync::mpsc::UnboundedSender<RpcCallReq>) {
     let _ = RPC_CALL_TX.set(tx);
 }
 
+pub struct CellCreateReq {
+    pub scope: String,
+    pub placement_pool: celld_logic::placement::Pool,
+    pub reply: tokio::sync::oneshot::Sender<Result<()>>,
+}
+pub(crate) static CELL_CREATE_TX: OnceLock<tokio::sync::mpsc::UnboundedSender<CellCreateReq>> =
+    OnceLock::new();
+pub fn set_cell_create_tx(tx: tokio::sync::mpsc::UnboundedSender<CellCreateReq>) {
+    let _ = CELL_CREATE_TX.set(tx);
+}
+
 static OUTBOUND_WS_TX: OnceLock<tokio::sync::mpsc::UnboundedSender<OutboundWsReq>> =
     OnceLock::new();
 pub fn set_outbound_ws_tx(tx: tokio::sync::mpsc::UnboundedSender<OutboundWsReq>) {
