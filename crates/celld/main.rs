@@ -16,7 +16,8 @@ use celld::actor::*;
 use celld::bucket::Bucket;
 use celld::cell_dispatch::{
     dispatch_call_attempt, dispatch_gate, local_dispatch_request_id, local_request_error,
-    local_response_stream, split_do_call, CallAttempt, CallPayload, RoutedRequestError,
+    local_response_stream, requests_websocket_upgrade, split_do_call, CallAttempt, CallPayload,
+    RoutedRequestError, WEBSOCKET_WITHOUT_UPGRADE,
 };
 use celld::fleet;
 use celld::generation::{
@@ -247,6 +248,24 @@ type HttpReply = Response<UnsyncBoxBody<Bytes, std::io::Error>>;
 
 const STALE_ROUTE_HEADER: &str = "x-cells-route-error";
 const STALE_ROUTE_VALUE: &str = "stale-owner";
+/// Marks a forwarded fetch whose handler failed on the owner, so the caller's
+/// `stub.fetch()` rejects as it does for a local owner. Without the marker a
+/// remote handler failure looks like an application 500 response.
+const HANDLER_FAILURE_HEADER: &str = "x-cells-handler-failure";
+const HANDLER_FAILURE_PREFIX: &str = "cell Worker failed: ";
+
+/// A handler failure that the owner reported for a forwarded fetch. The owner
+/// ran the handler, so a retry would run it a second time.
+#[derive(Debug)]
+struct RemoteHandlerFailure(String);
+
+impl std::fmt::Display for RemoteHandlerFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for RemoteHandlerFailure {}
 const DURABLE_OBJECT_ROUTING_ERROR_MARKER: &str = "__CELLD_DO_ROUTING_ERROR__:";
 
 fn owner_unreachable(scope: &str, owner: &str, source: anyhow::Error) -> anyhow::Error {
@@ -1037,13 +1056,8 @@ async fn internal_reload(app: AppHandle) -> HttpReply {
 
 async fn dispatch_do_call(app: AppHandle, call: DoCallReq) {
     let (mut call, mut payload, reply) = split_do_call(call);
-    let mut websocket_timing = payload
-        .headers
-        .iter()
-        .any(|(name, value)| {
-            name.eq_ignore_ascii_case("upgrade") && value.eq_ignore_ascii_case("websocket")
-        })
-        .then(|| WebSocketRouteTiming {
+    let mut websocket_timing =
+        requests_websocket_upgrade(&payload.headers).then(|| WebSocketRouteTiming {
             started: Instant::now(),
             route_resolution_us: 0,
             dispatch_us: 0,
@@ -1096,6 +1110,24 @@ async fn dispatch_do_call(app: AppHandle, call: DoCallReq) {
                         );
                     }
                     break result;
+                }
+                CallAttempt::RefusedWebSocket { error, websocket } => {
+                    websocket::reject_accepted_websocket(&app, &websocket, &error.to_string())
+                        .await;
+                    if let Some(timing) = websocket_timing.as_mut() {
+                        timing.dispatch_us = timing
+                            .dispatch_us
+                            .saturating_add(dispatch_started.elapsed().as_micros() as u64);
+                        timing.emit(
+                            &app,
+                            &call.scope,
+                            call.request_id,
+                            "error",
+                            "local",
+                            app.runtime.as_ref().map_or("", |runtime| runtime.node()),
+                        );
+                    }
+                    break Err(error);
                 }
                 CallAttempt::Remote {
                     node,
@@ -1156,6 +1188,7 @@ async fn dispatch_do_call(app: AppHandle, call: DoCallReq) {
                         name: name.clone(),
                         request_id,
                         capacity_handoff: epoch == 0,
+                        parent: call.parent,
                     };
                     let attempt_body = match body {
                         celld::js::RequestBody::Bytes(bytes) => {
@@ -1249,6 +1282,22 @@ async fn dispatch_do_call(app: AppHandle, call: DoCallReq) {
                             observed_position: None,
                         });
                     }
+                    if response.headers().contains_key(HANDLER_FAILURE_HEADER) {
+                        // The owner ran the handler, so the attempt is
+                        // complete: the owner needs no abort, and the error
+                        // must not reach the redispatch policy below.
+                        abort.disarm();
+                        let body = Limited::new(response.into_body(), MAX_PEER_CONTROL_BODY_BYTES)
+                            .collect()
+                            .await
+                            .map(|body| body.to_bytes())
+                            .unwrap_or_default();
+                        let body = String::from_utf8_lossy(&body);
+                        let message = body.strip_prefix(HANDLER_FAILURE_PREFIX).unwrap_or(&body);
+                        return Err(anyhow::Error::new(RemoteHandlerFailure(
+                            message.to_string(),
+                        )));
+                    }
                     let response_headers = response
                         .headers()
                         .iter()
@@ -1295,6 +1344,12 @@ async fn dispatch_do_call(app: AppHandle, call: DoCallReq) {
                         timing.emit(&app, scope, request_id, "ok", "remote", &node);
                     }
                     break Ok(response);
+                }
+                Err(error) if error.downcast_ref::<RemoteHandlerFailure>().is_some() => {
+                    if let Some(timing) = websocket_timing.as_ref() {
+                        timing.emit(&app, scope, request_id, "error", "remote", &node);
+                    }
+                    break Err(error);
                 }
                 Err(error) => {
                     // A streamed upload is not replayable after the HTTP
@@ -1626,10 +1681,15 @@ fn internal_do_worker_error(error: anyhow::Error) -> HttpReply {
     if cell_overload_error(&error) {
         return cell_overload_response();
     }
-    response(
+    let mut failed = response(
         StatusCode::INTERNAL_SERVER_ERROR,
-        format!("cell Worker failed: {error:#}"),
-    )
+        format!("{HANDLER_FAILURE_PREFIX}{error:#}"),
+    );
+    failed.headers_mut().insert(
+        hyper::header::HeaderName::from_static(HANDLER_FAILURE_HEADER),
+        hyper::header::HeaderValue::from_static("1"),
+    );
+    failed
 }
 
 /// Divide an ingress request into its metadata and a body that the Worker
@@ -1868,6 +1928,7 @@ fn request_url(parts: &hyper::http::request::Parts, trust_forwarded_headers: boo
 /// rather than only the node it connected to. `/do/` and `/runtime/` share this:
 /// they differ in what they authenticate, not in how they reach a cell.
 async fn dispatch_cell_fetch(
+    app: &AppHandle,
     cell: String,
     name: Option<String>,
     url: String,
@@ -1908,7 +1969,7 @@ async fn dispatch_cell_fetch(
     let _hangup = HangUp(Some(cancel_tx));
     match receive.await {
         Ok(Ok(worker_response)) => {
-            runtime_response(worker_response, preserve_representation_length)
+            reply_without_upgrade(app, worker_response, preserve_representation_length).await
         }
         Ok(Err(error)) if request_body_limit_error(&error) => {
             response(StatusCode::PAYLOAD_TOO_LARGE, "request body too large")
@@ -1939,6 +2000,7 @@ pub(crate) struct ForwardedFetch {
     pub(crate) headers: Vec<(String, String)>,
     pub(crate) request_id: Option<celld::js::RequestId>,
     pub(crate) capacity_handoff: bool,
+    pub(crate) parent: Option<celld::telemetry::TraceContext>,
 }
 
 pub(crate) enum ForwardedFetchOutcome {
@@ -1965,6 +2027,7 @@ pub(crate) async fn dispatch_forwarded_fetch(
         headers,
         request_id,
         capacity_handoff,
+        parent,
     } = fetch;
     let _request_body_guard = celld::js::RequestBodyGuard::of(&request_body);
     let preserve_representation_length = method.eq_ignore_ascii_case("HEAD");
@@ -1999,6 +2062,8 @@ pub(crate) async fn dispatch_forwarded_fetch(
                 drain_pins: app.drain_pins.clone(),
                 handler_active: true,
             };
+            let upgrade = requests_websocket_upgrade(&headers);
+            let mut accepted = None;
             let completed = local
                 .run(async {
                     let result = runtime
@@ -2011,10 +2076,10 @@ pub(crate) async fn dispatch_forwarded_fetch(
                                 body: request_body,
                                 headers,
                                 request_id,
-                                // A peer's call has no caller in this process, and the
-                                // peer protocol does not carry trace context.
+                                // No local caller order; observational trace context
+                                // travels in the authenticated tunnel's reserved header.
                                 order: None,
-                                parent: None,
+                                parent,
                             },
                             None,
                         )
@@ -2023,10 +2088,28 @@ pub(crate) async fn dispatch_forwarded_fetch(
                     // gate wait below cancels the request's remaining work, not a
                     // handler that is still running.
                     abort.handler_answered();
-                    result
+                    let response = result?;
+                    if let Some(HttpResponseWebSocket::Cell(target)) = &response.websocket {
+                        accepted = Some(target.clone());
+                        // The same object-level check as a local call, so a
+                        // caller sees one answer whichever node owns the cell.
+                        anyhow::ensure!(upgrade, "TypeError: {WEBSOCKET_WITHOUT_UPGRADE}");
+                    }
+                    Ok(response)
                 })
                 .await;
             let activity = completed.activity;
+            // A failure after the cell returned a socket discards the response,
+            // which is the socket's only owner.
+            if let (Err(failure), Some(target)) = (&completed.result, accepted.as_ref()) {
+                let reason = match failure {
+                    LocalRequestFailure::Handler(error) => error.to_string(),
+                    LocalRequestFailure::OutputGate { verdict, .. } => {
+                        RoutedRequestError(*verdict).to_string()
+                    }
+                };
+                websocket::reject_accepted_websocket(&app, target, &reason).await;
+            }
             let result = match completed.result {
                 Ok(answer) => Ok(answer),
                 Err(LocalRequestFailure::Handler(error)) => Err(error),
@@ -2040,18 +2123,18 @@ pub(crate) async fn dispatch_forwarded_fetch(
             match result {
                 Ok(mut worker_response) => {
                     if let Some(HttpResponseWebSocket::Cell(target)) = &worker_response.websocket {
-                        let kind = if celld::js::ws_hibernatable(target.id).unwrap_or(false) {
+                        let (cell, hibernatable) = celld::js::ws_core_registration(target);
+                        let kind = if hibernatable {
                             WebSocketKind::Hibernatable
                         } else {
                             WebSocketKind::Regular
                         };
-                        if let Err(error) = app
-                            .websocket_opened(target.scope.clone(), target.id, kind)
-                            .await
-                        {
+                        if let Err(error) = app.websocket_opened(cell, target.id, kind).await {
+                            let reason = format!("WebSocket core registration failed: {error:#}");
+                            websocket::reject_accepted_websocket(&app, target, &reason).await;
                             return ForwardedFetchOutcome::Reply(peer_response(response(
                                 StatusCode::SERVICE_UNAVAILABLE,
-                                format!("WebSocket core registration failed: {error:#}"),
+                                reason,
                             )));
                         }
                     }
@@ -2076,7 +2159,8 @@ pub(crate) async fn dispatch_forwarded_fetch(
                         abort.disarm();
                         drop(activity);
                     }
-                    runtime_response(worker_response, preserve_representation_length)
+                    reply_without_upgrade(&app, worker_response, preserve_representation_length)
+                        .await
                 }
                 Err(error) => internal_do_worker_error(error),
             }
@@ -2255,11 +2339,17 @@ pub(crate) async fn dispatch_forwarded_rpc(
     }
 }
 
+#[path = "main/cluster_monitor.rs"]
+mod cluster_monitor;
+#[path = "main/monitor.rs"]
+mod monitor;
 #[path = "main/peer_tunnel.rs"]
 mod peer_tunnel;
+#[path = "main/trace_monitor.rs"]
+mod trace_monitor;
 #[path = "main/websocket.rs"]
 mod websocket;
-use websocket::{handle_websocket, outbound_websocket_task};
+use websocket::{handle_websocket, outbound_websocket_task, reply_without_upgrade};
 
 async fn handle_ingress(
     request: Request<Incoming>,
@@ -2311,7 +2401,9 @@ async fn handle_ingress(
         .fetch_worker(url, method, body, headers, connection)
         .await
     {
-        Ok(worker_response) => runtime_response(worker_response, preserve_representation_length),
+        Ok(worker_response) => {
+            reply_without_upgrade(&app, worker_response, preserve_representation_length).await
+        }
         Err(error) if request_body_limit_error(&error) => {
             response(StatusCode::PAYLOAD_TOO_LARGE, "request body too large")
         }
@@ -2740,6 +2832,15 @@ async fn internal_log(request: Request<Incoming>, app: AppHandle, path: String) 
             },
             Err(error) => Err(error.into()),
         },
+        "/peer/log/tail-page" => {
+            match serde_json::from_slice::<celld::node_log::TailPageReq>(&body) {
+                Ok(req) => follower
+                    .tail_page(&req)
+                    .await
+                    .map(|tail| celld::node_log::encode_tail_page(&tail)),
+                Err(error) => Err(error.into()),
+            }
+        }
         _ => Err(anyhow::anyhow!("unknown log endpoint")),
     };
     match result {
@@ -2811,10 +2912,33 @@ async fn handle_internal(
     let cell_scope = path.strip_prefix("/cell/");
     let evict_scope = path.strip_prefix("/evict/");
     let result = match path.as_str() {
+        _ if path == "/monitor" || path.starts_with("/monitor/") => {
+            monitor::handle(request, app).await
+        }
+        "/peer/monitor" => monitor::peer(request, app).await,
         "/peer/probe" => internal_probe(request, app).await,
         "/peer/handoff" => internal_handoff(request, app).await,
         _ if path.starts_with("/peer/log/") => internal_log(request, app, path.clone()).await,
         "/state" => response(StatusCode::OK, app.snapshot().await),
+        "/hot-recovery" => response(
+            StatusCode::OK,
+            app.follower
+                .as_ref()
+                .map_or_else(
+                    || serde_json::json!({"enabled": false, "candidates": []}),
+                    |follower| follower.hot_recovery_status(),
+                )
+                .to_string(),
+        ),
+        "/gc/follower-log" if request.method() != hyper::Method::POST => {
+            response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed")
+        }
+        "/gc/follower-log" => {
+            if let Some(follower) = &app.follower {
+                follower.gc_fragments().await;
+            }
+            response(StatusCode::OK, "{\"ok\":true}")
+        }
         "/reload" if request.method() != hyper::Method::POST => {
             response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed")
         }
@@ -2926,6 +3050,7 @@ async fn handle_internal(
             // consumer. The runtime also proves that this name hashes to the
             // requested scope before it exposes the identity to JavaScript.
             dispatch_cell_fetch(
+                &app,
                 scope,
                 name,
                 "http://cell/".to_string(),
@@ -2975,7 +3100,7 @@ async fn handle_internal(
                 Ok(payload) => payload,
                 Err(response) => return Ok(*response),
             };
-            dispatch_cell_fetch(cell, None, url, method, body, headers).await
+            dispatch_cell_fetch(&app, cell, None, url, method, body, headers).await
         }
         _ if cell_scope.is_some() => {
             let cell = cell_scope.expect("checked prefix");
@@ -3210,7 +3335,7 @@ fn serve_http_connection(
                         HttpSurface::Recovery => {
                             let path = request.uri().path().to_string();
                             Ok(match path.as_str() {
-                                "/peer/log/seal" | "/peer/log/tail" => {
+                                "/peer/log/seal" | "/peer/log/tail" | "/peer/log/tail-page" => {
                                     internal_log(request, app, path).await
                                 }
                                 _ => response(
@@ -3456,6 +3581,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
         Action::Dev(arguments) => return celld::dev::run(arguments).await,
         Action::Cell(arguments) => return celld::cell_cli::run(arguments).await,
         Action::D1(arguments) => return celld::d1_cli::run(arguments).await,
+        Action::Disk(arguments) => return celld::disk_cli::run(arguments).await,
         Action::Kv(arguments) => return celld::kv_cli::run(arguments).await,
         Action::Queue(arguments) => return celld::queue_cli::run(arguments).await,
         Action::R2(arguments) => return celld::r2_cli::run(arguments).await,
@@ -3674,7 +3800,12 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
         });
     });
     let (fence_tx, mut fence_rx) = mpsc::unbounded_channel();
-    let node = std::env::var("CELLD_NODE").unwrap_or_else(|_| random_node_session_id());
+    let data_dir = std::env::var_os("CELLD_TEST_DATA_DIR")
+        .or_else(|| std::env::var_os("CELLD_WATCH"))
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join(format!("celld-{}", std::process::id())));
+    let explicit_node = std::env::var("CELLD_NODE").ok();
+    let node = celld::node_identity::load_or_create(&data_dir, explicit_node.as_deref())?;
     let clean_reload_node = node.clone();
     celld::control_plane::install_reexec_node_session_id(&node)?;
     let probe_public_key = celld::peer_probe::install_signer()?;
@@ -3707,10 +3838,6 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
     };
     let max_releases = celld::env_vars::positive::<usize>("CELLD_RELEASES")?
         .unwrap_or(DEFAULT_MAX_CONCURRENT_RELEASES);
-    let data_dir = std::env::var_os("CELLD_TEST_DATA_DIR")
-        .or_else(|| std::env::var_os("CELLD_WATCH"))
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::env::temp_dir().join(format!("celld-{}", std::process::id())));
     let mut deploy_agent = None;
     // The channel `POST /reload` and a managed notification nudge the pointer
     // watcher through. Without a deployment bucket the receiver is dropped
@@ -4066,6 +4193,9 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
             // The collector path needs no bucket at all.
             celld::telemetry::SinkChoice::Otlp { .. } => None,
         };
+        if celld::monitor::enabled() {
+            trace_monitor::init(sink_bucket.clone(), config.flush.as_millis() as u64);
+        }
         celld::telemetry::init(config, sink_bucket, node.clone(), settings.region.clone())?;
     }
     let peer_auth = Arc::new(PeerAuth::new(peer_key, node.clone())?);
@@ -4118,6 +4248,9 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
     let fleet_bucket = ready_ownership
         .as_ref()
         .map(|ownership| ownership.bucket_client());
+    if celld::monitor::enabled() && ready_ownership.is_none() {
+        cluster_monitor::service().standalone();
+    }
     let explorer_replication = runtime.as_ref().and_then(|runtime| runtime.replication());
     let local_cache_replication = explorer_replication.clone();
     let (websocket_tx, mut websocket_rx) = mpsc::unbounded_channel();
@@ -4206,26 +4339,47 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                 celld::node_log::eviction_policy_from_env()?,
             ));
             *actor.node_log.lock().unwrap() = Some(manager.clone());
-            // Recovery-before-install is fatal for every posture: the
+            let hot_recovery = std::env::var("CELLD_HOT_RECOVERY").unwrap_or_else(|_| "0".into());
+            anyhow::ensure!(
+                matches!(hot_recovery.as_str(), "0" | "1"),
+                "CELLD_HOT_RECOVERY must be 0 or 1"
+            );
+            if hot_recovery == "1" {
+                if let Some(follower) = &follower {
+                    manager.enable_hot_recovery(
+                        follower.clone(),
+                        &data_dir,
+                        celld::env_vars::positive_or("CELLD_HOT_STANDBY_MB", 2048_u64)?
+                            .checked_mul(1024 * 1024)
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("CELLD_HOT_STANDBY_MB overflows bytes")
+                            })?,
+                        celld::env_vars::positive_or("CELLD_HOT_STANDBY_CELLS", 128_usize)?,
+                    )?;
+                }
+            }
+            // Recovery-before-install is mandatory for every posture: the
             // predecessor's folded state lives in the lease record this
             // session is about to replace, and the install writes a fresh
-            // log — so an unrecovered predecessor must stop the boot, or
+            // log — so an unrecovered predecessor must hold startup closed, or
             // the install erases the only evidence recovery was needed.
             // The ladder waits out the predecessor's own lease because the
             // fence recheck refuses a live lease, retries with backoff,
-            // and exits on exhaustion. Serve the retained follower disks
-            // throughout the ladder, including retry backoffs, so a fleet
-            // restart can recover without waiting for another node's lease.
+            // and keeps retrying while witnesses or bucket reads are pending.
+            // Serve the retained follower disks throughout the wait,
+            // including retry backoffs, so a fleet restart can recover without
+            // waiting for another node's lease.
             recover_with_follower_listener(&internal_listener, app.clone(), async {
                 let ttl_backoff =
                     std::time::Duration::from_millis(actor.lease_spec.ttl_ms.max(1_000));
-                let mut recovered = Ok(());
+                let mut attempt = 0_u64;
                 // A boot waits behind a peer's live recovery claim and takes
                 // it over only once its heartbeat is stale, so one attempt
                 // can legitimately last as long as the peer's gather. The
                 // bound is a backstop against a wedge, not a pace.
-                for attempt in 1..=4u32 {
-                    recovered = match tokio::time::timeout(
+                loop {
+                    attempt = attempt.saturating_add(1);
+                    let recovered = match tokio::time::timeout(
                         std::time::Duration::from_secs(15 * 60),
                         manager.recover_self(),
                     )
@@ -4234,23 +4388,22 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                         Ok(result) => result,
                         Err(_) => Err(anyhow::anyhow!("predecessor recovery timed out")),
                     };
-                    if recovered.is_ok() || attempt == 4 {
-                        break;
+                    if recovered.is_ok() {
+                        return Ok(());
                     }
                     if let Err(error) = recovered.as_ref() {
                         eprintln!("celld predecessor recovery attempt {attempt} failed: {error:#}");
                     }
-                    // At least one full TTL between attempts, so a
-                    // refused-because-live predecessor lease has expired
-                    // by the retry.
-                    tokio::time::sleep(ttl_backoff.saturating_mul(attempt)).await;
-                }
-                recovered.map_err(|error| {
-                    anyhow::anyhow!(
-                        "refusing to install a lease over an unrecovered \
-                         predecessor log: {error:#}"
+                    // Pace failed reads without bounding witness return time.
+                    // The usual first wait spans a full predecessor TTL; large
+                    // configured TTLs and later failures use the 30s cap.
+                    tokio::time::sleep(
+                        ttl_backoff
+                            .saturating_mul(attempt.min(30) as u32)
+                            .min(std::time::Duration::from_secs(30)),
                     )
-                })
+                    .await;
+                }
             })
             .await?;
             let mut owner = celld::node_log::DurabilityOwner::new(manager, durability == "fleet");
@@ -4478,8 +4631,16 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                 // lease dead at once: on the 2026-09-05 fleet that closed the
                 // gate and skipped balancing on a third of the ticks.
                 let (view_ms, peers) = match ownership.read_shared_capacity_peers(sample_ms).await {
-                    Ok(view) => view,
+                    Ok(view) => {
+                        if celld::monitor::enabled() {
+                            cluster_monitor::service().update(view.0, &view.1);
+                        }
+                        view
+                    }
                     Err(error) => {
+                        if celld::monitor::enabled() {
+                            cluster_monitor::service().discovery_failed();
+                        }
                         // At info with the chain: a failed tick closes the
                         // format gate, and a fleet run has to say why.
                         tracing::info!(event = "fleet_sample_failed", error = format!("{error:#}"));
@@ -5523,8 +5684,8 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
 }
 
 use celld::machine::{
-    lease_ttl_ms_from_environment, local_cache_max_bytes_from_environment, random_node_session_id,
-    random_peer_key, DEFAULT_MAX_OUTBOUND_WEBSOCKETS, PEER_CONNECT_TIMEOUT,
+    lease_ttl_ms_from_environment, local_cache_max_bytes_from_environment, random_peer_key,
+    DEFAULT_MAX_OUTBOUND_WEBSOCKETS, PEER_CONNECT_TIMEOUT,
 };
 
 /// Signals cancellation when the connection handling this request goes away.

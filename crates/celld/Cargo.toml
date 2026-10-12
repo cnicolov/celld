@@ -1,6 +1,6 @@
 [package]
 name = "celld"
-version = "0.6.1"
+version = "0.6.2"
 edition = "2021"
 rust-version = "1.94.1"
 license = "Apache-2.0"
@@ -20,6 +20,10 @@ check-cfg = ["cfg(celld_internal_tests)", "cfg(celld_proxy_internals)"]
 [lints.clippy]
 disallowed_macros = "forbid"
 
+[features]
+# Releases fail closed if the dashboard was not built before the native binary.
+monitor-ui = []
+
 [dependencies]
 async-trait.workspace = true
 chrono.workspace = true
@@ -32,6 +36,7 @@ axum.workspace = true
 base64.workspace = true
 bytes.workspace = true
 celld-logic.workspace = true
+celld-monitor.workspace = true
 celld-ltx = { workspace = true, features = ["s3"] }
 encoding_rs.workspace = true
 ed25519-dalek.workspace = true
@@ -94,3 +99,7 @@ nix.workspace = true
 
 [dev-dependencies]
 lz4_flex.workspace = true
+
+[build-dependencies]
+base64.workspace = true
+sha2.workspace = true

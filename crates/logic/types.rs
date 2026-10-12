@@ -600,6 +600,15 @@ pub enum Event {
         now_ms: u64,
         now_mono_ms: u64,
     },
+    /// The output gate for an effect that work already running on this cell
+    /// raised. Only the cell's own isolate raises one, so it belongs to
+    /// admitted work and must not queue behind a swap that waits for that
+    /// same work to finish.
+    GateRequestAt {
+        request: RequestId,
+        cell: CellId,
+        now_mono_ms: u64,
+    },
     /// Reserve an idle resident isolate for a top-level Worker request. The
     /// shell falls back to the stateless pool when no resident is available;
     /// choosing and pinning a resident is lifecycle policy and therefore
@@ -1054,9 +1063,10 @@ pub enum Effect {
     },
     /// The takeover interlock, as a core decision (lease-fold): the dead
     /// owner's folded log state was not sealed, so its acked tail may
-    /// exist only on its followers. The executor recovers every
-    /// non-sealed session of `owner` into the bucket and reports
-    /// `NodeLogRecovered`; only then does the claim proceed.
+    /// exist only on its followers. The executor either recovers the session
+    /// into the bucket or certifies this exact cell's complete canonical
+    /// checkpoint and sealed local standby. It reports `NodeLogRecovered`
+    /// only with a usable restore proof; the ownership CAS still must win.
     RecoverNodeLog {
         op: OpId,
         cell: CellId,

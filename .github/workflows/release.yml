@@ -55,7 +55,10 @@ jobs:
           set -euo pipefail
           rustup toolchain install "$RUST_VERSION" --profile minimal
           rustup default "$RUST_VERSION"
-          cargo build --release --locked
+          rustup target add wasm32-unknown-unknown
+          cargo install trunk --version 0.21.14 --locked
+          trunk build --release --locked --config crates/monitor/Trunk.toml
+          cargo build --release --locked -p celld --features monitor-ui
           version=$(sed -n 's/^version = "\(.*\)"$/\1/p' crates/celld/Cargo.toml | head -1)
           target/release/celld --version | grep -F "$version"
 
@@ -126,12 +129,14 @@ jobs:
           path: assets
           merge-multiple: true
 
-      # Assets are minimal: the binaries, nothing else. Integrity is the
-      # attestation plus GitHub's own immutable per-asset digests; gzip's
-      # CRC catches corruption in transit.
+      # Assets are minimal: the binaries plus LICENSE and NOTICE, which
+      # the third-party licenses require to travel with them. Integrity is
+      # the attestation plus GitHub's own immutable per-asset digests;
+      # gzip's CRC catches corruption in transit.
       - name: Check assets
         run: |
           set -euo pipefail
+          cp LICENSE NOTICE assets/
           cd assets
           for target in \
             x86_64-unknown-linux-gnu \

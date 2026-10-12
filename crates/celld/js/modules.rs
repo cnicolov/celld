@@ -25,6 +25,7 @@ static_source!(NODE_PATH_SOURCE, "node_path.js");
 static_source!(NODE_BUFFER_SOURCE, "node_buffer.js");
 static_source!(NODE_CRYPTO_SOURCE, "node_crypto.js");
 static_source!(NODE_ASYNC_HOOKS_SOURCE, "node_async_hooks.js");
+static_source!(TELEMETRY_SOURCE, "telemetry.js");
 static_source!(
     NODE_DIAGNOSTICS_CHANNEL_SOURCE,
     "node_diagnostics_channel.js"
@@ -238,7 +239,10 @@ fn modreg(scope: &mut v8::PinScope) -> Arc<ModuleRegistry> {
 /// or a bare node builtin)? esbuild bundles every npm dep inline and leaves
 /// only builtins external, so a remaining bare specifier is a node builtin.
 fn is_external(spec: &str) -> bool {
-    if spec.starts_with("node:") || spec.starts_with("cloudflare:") || spec == PYTHON_HOST_SPECIFIER
+    if spec.starts_with("node:")
+        || spec.starts_with("cloudflare:")
+        || spec == PYTHON_HOST_SPECIFIER
+        || spec == "celld:telemetry"
     {
         return true;
     }
@@ -344,6 +348,11 @@ struct LazyModule {
 }
 
 const LAZY_MODULES: &[LazyModule] = &[
+    LazyModule {
+        specs: &["celld:telemetry"],
+        global: "__telemetryModule",
+        source: &TELEMETRY_SOURCE,
+    },
     LazyModule {
         specs: &["assert", "node:assert"],
         global: "__assertModule",
@@ -979,7 +988,7 @@ pub(super) fn op_builtin_module(
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
     let spec = args.get(0).to_rust_string_lossy(scope);
-    if spec.starts_with("cloudflare:") || spec == PYTHON_HOST_SPECIFIER {
+    if spec.starts_with("cloudflare:") || spec.starts_with("celld:") {
         return; // not a node builtin
     }
     let Some(expr) = builtin_source(scope, &spec) else {

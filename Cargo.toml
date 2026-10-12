@@ -43,6 +43,7 @@ axum = { version = "0.7", features = ["multipart"] }
 base64 = "0.22"
 bytes = "1"
 celld-logic = { path = "crates/logic" }
+celld-monitor = { path = "crates/monitor" }
 celld-ltx = { path = "crates/ltx" }
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 ed25519-dalek = { version = "2", features = ["pkcs8"] }
@@ -60,6 +61,9 @@ fastwebsockets = { version = "=0.8.1", default-features = false, features = ["up
 flate2 = "1"
 futures-util = "0.3"
 getrandom = "0.3"
+gloo-net = { version = "0.6", features = ["json"] }
+gloo-timers = { version = "0.3", features = ["futures"] }
+js-sys = "0.3"
 glob = "0.3"
 hex = "0.4"
 # The two node:crypto KDFs. Both crates already reach this build without a
@@ -78,6 +82,7 @@ httpdate = "1"
 lol_html = "3.0"
 hyper-util = { version = "0.1", features = ["tokio"] }
 libc = "0.2"
+leptos = { version = "0.8", default-features = false, features = ["csr"] }
 lz4_flex = { version = "0.11", features = ["frame"] }
 md-5 = "0.10"
 nix = { version = "0.31", features = ["feature", "fs"] }
@@ -150,4 +155,5 @@ urlpattern = "=0.4.2"
 # denoland/rusty_v8#2044 and #2045. Both ship in 152.1.0, so this is an
 # ordinary dependency again — no path override, and no hand-built archive.
 v8 = "152.1"
+wasm-bindgen-futures = "0.4"
 webpki-roots = "1"

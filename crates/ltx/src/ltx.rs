@@ -402,7 +402,7 @@ pub fn decode_file(bytes: &[u8]) -> Result<DecodedFile> {
 }
 
 /// Decodes a complete LTX file and retains each decompressed page.
-pub(crate) fn decode_file_with_pages(bytes: &[u8]) -> Result<(DecodedFile, DecodedPages)> {
+pub fn decode_file_with_pages(bytes: &[u8]) -> Result<(DecodedFile, DecodedPages)> {
     decode_file_inner(bytes, true)
 }
 

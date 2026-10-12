@@ -30,6 +30,7 @@ enum MetricsBackend {
 /// All process-like services owned by one execution domain.
 pub struct HostServices {
     domain: OnceLock<crate::asyncrt::DomainToken>,
+    monitor_buffers: OnceLock<Arc<crate::monitor::BufferRegistry>>,
     node_load: OnceLock<Arc<LiveLoad>>,
     wake_entry: crate::js::WakeEntryService,
     websockets: crate::js::WebSocketService,
@@ -40,9 +41,16 @@ pub struct HostServices {
 }
 
 impl HostServices {
+    pub(crate) fn monitor_buffers(&self) -> Arc<crate::monitor::BufferRegistry> {
+        self.monitor_buffers
+            .get_or_init(|| Arc::new(crate::monitor::BufferRegistry::default()))
+            .clone()
+    }
+
     pub(crate) fn production() -> Self {
         Self {
             domain: OnceLock::new(),
+            monitor_buffers: OnceLock::new(),
             node_load: OnceLock::new(),
             wake_entry: crate::js::WakeEntryService::default(),
             websockets: crate::js::WebSocketService::default(),
@@ -57,6 +65,7 @@ impl HostServices {
     pub fn scripted() -> Self {
         Self {
             domain: OnceLock::new(),
+            monitor_buffers: OnceLock::new(),
             node_load: OnceLock::new(),
             wake_entry: crate::js::WakeEntryService::default(),
             websockets: crate::js::WebSocketService::default(),
@@ -111,6 +120,22 @@ impl HostServices {
 
     pub fn node_load(&self) -> Option<Arc<LiveLoad>> {
         self.node_load.get().cloned()
+    }
+
+    /// Unlike the core's integer sample, monitoring distinguishes unsupported
+    /// clocks and the first (baseline-only) reading from measured idle CPU.
+    pub(crate) fn monitor_cpu_percent(&self) -> Option<f64> {
+        match &self.metrics {
+            MetricsBackend::Production(sampler) => sampler
+                .lock()
+                .unwrap()
+                .last_cpu_percent_x100
+                .map(|percent| percent as f64 / 100.0),
+            #[cfg(celld_internal_tests)]
+            MetricsBackend::Scripted(sample) => {
+                Some(sample.lock().unwrap().cpu_percent_x100 as f64 / 100.0)
+            }
+        }
     }
 
     pub(crate) fn wake_entry(&self) -> &crate::js::WakeEntryService {
@@ -195,6 +220,7 @@ impl HostServices {
 struct ProcessLoadSampler {
     previous_cpu_ticks: Option<u64>,
     previous_sample: Option<std::time::Instant>,
+    last_cpu_percent_x100: Option<u64>,
 }
 
 impl ProcessLoadSampler {
@@ -203,6 +229,9 @@ impl ProcessLoadSampler {
     #[allow(clippy::disallowed_methods)]
     fn sample_cpu_percent_x100(&mut self) -> u64 {
         let Some(ticks) = process_cpu_ticks() else {
+            self.last_cpu_percent_x100 = None;
+            self.previous_cpu_ticks = None;
+            self.previous_sample = None;
             return 0;
         };
         let now = std::time::Instant::now();
@@ -210,18 +239,21 @@ impl ProcessLoadSampler {
             (Some(previous_ticks), Some(previous_sample)) => {
                 let elapsed = previous_sample.elapsed().as_secs_f64();
                 let ticks_per_second = clock_ticks_per_second() as f64;
-                if elapsed > 0.0 && ticks_per_second > 0.0 {
-                    (((ticks.saturating_sub(previous_ticks)) as f64 / ticks_per_second / elapsed)
-                        * 10_000.0) as u64
+                if elapsed > 0.0 && ticks_per_second > 0.0 && ticks >= previous_ticks {
+                    Some(
+                        (((ticks - previous_ticks) as f64 / ticks_per_second / elapsed) * 10_000.0)
+                            as u64,
+                    )
                 } else {
-                    0
+                    None
                 }
             }
-            _ => 0,
+            _ => None,
         };
         self.previous_cpu_ticks = Some(ticks);
         self.previous_sample = Some(now);
-        value
+        self.last_cpu_percent_x100 = value;
+        value.unwrap_or_default()
     }
 }
 
@@ -236,7 +268,22 @@ fn process_cpu_ticks() -> Option<u64> {
     Some(fields.get(11)?.parse::<u64>().ok()? + fields.get(12)?.parse::<u64>().ok()?)
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
+fn process_cpu_ticks() -> Option<u64> {
+    let mut time = std::mem::MaybeUninit::<libc::timespec>::uninit();
+    // SAFETY: successful clock_gettime initializes the complete timespec.
+    if unsafe { libc::clock_gettime(libc::CLOCK_PROCESS_CPUTIME_ID, time.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    let time = unsafe { time.assume_init() };
+    let nanos = u128::try_from(time.tv_sec)
+        .ok()?
+        .checked_mul(1_000_000_000)?
+        .checked_add(u128::try_from(time.tv_nsec).ok()?)?;
+    u64::try_from(nanos * u128::from(clock_ticks_per_second()) / 1_000_000_000).ok()
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn process_cpu_ticks() -> Option<u64> {
     None
 }

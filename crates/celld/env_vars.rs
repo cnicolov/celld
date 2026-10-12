@@ -234,6 +234,7 @@ pub fn validate() -> anyhow::Result<()> {
         "CELLD_CLOUD",
         "CELLD_LTX_COMPACTION",
         "CELLD_LTX_PAGED",
+        "CELLD_MONITOR",
         "CELLD_TRUST_FORWARDED_HEADERS",
         "CELLD_UNSAFE_PUBLIC_ADVERTISE",
     ] {

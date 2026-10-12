@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light" />
+    <title>celld monitor</title>
+    <link data-trunk rel="icon" type="image/svg+xml" href="favicon.svg" />
+    <!-- Rust's release profile already optimizes WASM. Avoid a second
+         wasm-opt toolchain with independently versioned feature support. -->
+    <link data-trunk rel="rust" data-bin="celld-monitor-ui" data-wasm-opt="0" />
+    <link data-trunk rel="css" href="style.css" />
+  </head>
+  <body>
+    <noscript>The Rust/WebAssembly dashboard needs JavaScript enabled to load WebAssembly.</noscript>
+  </body>
+</html>

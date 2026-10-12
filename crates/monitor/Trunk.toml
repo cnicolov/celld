@@ -1,0 +1,8 @@
+[build]
+target = "index.html"
+dist = "../../target/monitor-ui"
+public_url = "/monitor/"
+filehash = true
+
+[serve]
+port = 9878

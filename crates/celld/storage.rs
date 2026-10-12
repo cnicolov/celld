@@ -91,6 +91,67 @@ struct OpenCell {
     published_position: Option<u64>,
 }
 
+/// SQLite's own connection-local allocations, read only while the isolate
+/// permit is held. The monitor never opens another connection or runs SQL.
+pub(crate) fn monitor_memory() -> std::collections::BTreeMap<String, celld_monitor::SqliteMemory> {
+    dbs(|dbs| {
+        dbs.borrow()
+            .iter()
+            .filter_map(|(scope, cell)| {
+                sqlite_memory(&cell.connection).map(|memory| (scope.clone(), memory))
+            })
+            .collect()
+    })
+}
+
+fn sqlite_memory(connection: &Connection) -> Option<celld_monitor::SqliteMemory> {
+    fn current(connection: &Connection, operation: i32) -> Option<u64> {
+        let mut used = 0;
+        let mut highwater = 0;
+        // SAFETY: the caller holds the isolate's permit and connection lives
+        // throughout this call. reset=0 preserves its statistics.
+        let result = unsafe {
+            rusqlite::ffi::sqlite3_db_status(
+                connection.handle(),
+                operation,
+                &mut used,
+                &mut highwater,
+                0,
+            )
+        };
+        (result == rusqlite::ffi::SQLITE_OK)
+            .then(|| u64::try_from(used).ok())
+            .flatten()
+    }
+    Some(celld_monitor::SqliteMemory {
+        cache_bytes: current(connection, rusqlite::ffi::SQLITE_DBSTATUS_CACHE_USED)?,
+        schema_bytes: current(connection, rusqlite::ffi::SQLITE_DBSTATUS_SCHEMA_USED)?,
+        statement_bytes: current(connection, rusqlite::ffi::SQLITE_DBSTATUS_STMT_USED)?,
+    })
+}
+
+#[cfg(test)]
+mod monitor_tests {
+    use super::*;
+
+    #[test]
+    fn sqlite_statistics_report_allocations_without_changing_data() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch("CREATE TABLE data(value TEXT); INSERT INTO data VALUES ('hello')")
+            .unwrap();
+        let statement = connection.prepare("SELECT value FROM data").unwrap();
+        let before = total_changes(&connection);
+        let memory = sqlite_memory(&connection).unwrap();
+        assert!(memory.cache_bytes > 0);
+        assert!(memory.schema_bytes > 0);
+        assert!(memory.statement_bytes > 0);
+        assert_eq!(total_changes(&connection), before);
+        drop(statement);
+        assert!(sqlite_memory(&connection).unwrap().statement_bytes < memory.statement_bytes);
+    }
+}
+
 enum StorageBacking {
     File {
         path: String,
@@ -104,6 +165,10 @@ enum StorageBacking {
         root_path: String,
         root_scope: String,
         facet_path: Vec<String>,
+        /// Unique to this opening of the facet within the process. A facet
+        /// that its root reopens, even at the same scope and epoch after a
+        /// generation swap, is a new actor and takes a new value.
+        opening: u64,
         /// The root cell's gate sample, see [`StorageIdentity::root_position`].
         root_position: u64,
         root_observed: Option<u64>,
@@ -1006,6 +1071,40 @@ pub(crate) fn embedded_root_gate(scope: &str) -> Option<RootGate> {
     })
 }
 
+/// The opening of the facet `scope` in this isolate, while it is open.
+pub(crate) fn facet_opening(scope: &str) -> Option<u64> {
+    dbs(|databases| match &databases.borrow().get(scope)?.backing {
+        StorageBacking::Embedded { opening, .. } => Some(*opening),
+        StorageBacking::File { .. } => None,
+    })
+}
+
+/// The facets open in this isolate below the facet at `facet_path` of `root`,
+/// deepest first, so each closes before its parent.
+pub(crate) fn embedded_facets_below(root: &str, facet_path: &[String]) -> Vec<String> {
+    dbs(|databases| {
+        let databases = databases.borrow();
+        let mut below: Vec<(usize, String)> = databases
+            .iter()
+            .filter_map(|(scope, cell)| match &cell.backing {
+                StorageBacking::Embedded {
+                    root_scope,
+                    facet_path: path,
+                    ..
+                } if root_scope == root
+                    && path.len() > facet_path.len()
+                    && path.starts_with(facet_path) =>
+                {
+                    Some((path.len(), scope.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        below.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        below.into_iter().map(|(_, scope)| scope).collect()
+    })
+}
+
 /// Take the root cell's gate sample of a facet that is already open, so the
 /// egress of this call is held against what the root cell had committed when
 /// the call left it, not against what it had committed when the facet first
@@ -1104,6 +1203,7 @@ pub(crate) fn open_embedded(
         sqlite_vec,
         StorageBacking::Embedded {
             stream,
+            opening: NEXT_FACET_OPENING.fetch_add(1, Ordering::Relaxed),
             root_path: parent.root_path.clone(),
             root_scope: parent.root_scope.clone(),
             facet_path,
@@ -1139,6 +1239,7 @@ pub(crate) fn delete_legacy_facet(parent: &StorageIdentity, name: &str) -> anyho
 }
 
 static NEXT_BATCH_SAVEPOINT: AtomicU64 = AtomicU64::new(1);
+static NEXT_FACET_OPENING: AtomicU64 = AtomicU64::new(1);
 static NEXT_SYNC_LIST_CURSOR: AtomicU64 = AtomicU64::new(1);
 static NEXT_SQL_CURSOR: AtomicU64 = AtomicU64::new(1);
 

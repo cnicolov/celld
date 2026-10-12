@@ -6,6 +6,7 @@
 //! path.
 use crate::asyncrt;
 use crate::engine_api::WsTarget;
+use crate::monitor::{BufferCharge, BufferCounters, BufferKind, Buffered};
 use anyhow::Result;
 use std::collections::HashMap;
 use std::sync::atomic::AtomicU64;
@@ -32,6 +33,10 @@ pub struct OutboundWsReq {
     /// to run and no connection to open: the host only has to carry frames
     /// between two isolates.
     pub target: Option<WsTarget>,
+    /// The facet that dialed, when `scope` names a Durable Object facet. The
+    /// op derives it from the running event, so the socket routes through
+    /// the facet's root and never names the facet as a cell.
+    pub facet: Option<FacetSocket>,
     pub reply: tokio::sync::oneshot::Sender<Result<OutboundWsOpen>>,
 }
 
@@ -56,6 +61,174 @@ pub enum WsOut {
     Text(String),
     Binary(Vec<u8>),
     Close(u16, String),
+}
+
+impl WsOut {
+    fn payload_capacity(&self) -> usize {
+        match self {
+            Self::Text(text) | Self::Close(_, text) => text.capacity(),
+            Self::Binary(bytes) => bytes.capacity(),
+        }
+    }
+}
+
+/// The production channel retains a payload's charge until dequeue. The raw
+/// arm keeps the engine-neutral test seam compatible; it releases at handoff.
+pub enum WsOutputSender {
+    Raw(tokio::sync::mpsc::UnboundedSender<WsOut>),
+    Buffered(tokio::sync::mpsc::UnboundedSender<Buffered<WsOut>>),
+}
+
+impl From<tokio::sync::mpsc::UnboundedSender<WsOut>> for WsOutputSender {
+    fn from(sender: tokio::sync::mpsc::UnboundedSender<WsOut>) -> Self {
+        Self::Raw(sender)
+    }
+}
+impl From<tokio::sync::mpsc::UnboundedSender<Buffered<WsOut>>> for WsOutputSender {
+    fn from(sender: tokio::sync::mpsc::UnboundedSender<Buffered<WsOut>>) -> Self {
+        Self::Buffered(sender)
+    }
+}
+
+impl WsOutputSender {
+    fn send(&self, frame: Buffered<WsOut>) {
+        match self {
+            Self::Raw(sender) => {
+                let _ = sender.send(frame.into_inner());
+            }
+            Self::Buffered(sender) => {
+                let _ = sender.send(frame);
+            }
+        }
+    }
+}
+
+pub struct WsOutputReceiver(tokio::sync::mpsc::UnboundedReceiver<Buffered<WsOut>>);
+
+impl WsOutputReceiver {
+    pub async fn recv(&mut self) -> Option<WsOut> {
+        self.0.recv().await.map(Buffered::into_inner)
+    }
+    pub fn try_recv(&mut self) -> Result<WsOut, tokio::sync::mpsc::error::TryRecvError> {
+        self.0.try_recv().map(Buffered::into_inner)
+    }
+}
+
+#[cfg(test)]
+mod monitor_buffer_tests {
+    use super::*;
+    use crate::monitor::BufferRegistry;
+
+    fn metadata() -> WsMeta {
+        WsMeta {
+            scope: "Counter:a".into(),
+            hibernatable: false,
+            tags: vec![],
+            attachment: None,
+            pending: vec![],
+            auto_response_at: None,
+            facet: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn websocket_input_counts_capacity_and_releases_pending_sends() {
+        let registry = Arc::new(BufferRegistry::default());
+        let owner = registry.owner("Counter:a");
+        let (tx, mut rx) = ws_pull_channel_owned(Some(owner.clone()));
+        let mut bytes = Vec::with_capacity(4096);
+        bytes.push(1);
+        assert!(tx.send(WsPull::Binary(bytes)).await.is_ok());
+        assert_eq!(owner.snapshot().websocket_bytes, 4096);
+        assert!(matches!(rx.recv().await, Some(WsPull::Binary(_))));
+        assert_eq!(owner.snapshot().websocket_bytes, 0);
+
+        assert!(tx
+            .send(WsPull::Binary(vec![0; WS_PULL_QUEUE_MAX_BYTES]))
+            .await
+            .is_ok());
+        let mut pending = Box::pin(tx.send(WsPull::Binary(vec![0; 512])));
+        assert!(futures_util::poll!(pending.as_mut()).is_pending());
+        assert_eq!(
+            owner.snapshot().websocket_bytes,
+            (WS_PULL_QUEUE_MAX_BYTES + 512) as u64
+        );
+        drop(pending);
+        assert_eq!(
+            owner.snapshot().websocket_bytes,
+            WS_PULL_QUEUE_MAX_BYTES as u64
+        );
+        assert!(tx.send_close(1000, "bye".into(), true).is_ok());
+        drop(rx);
+        assert_eq!(owner.snapshot().websocket_bytes, 0);
+        assert!(tx.send(WsPull::Binary(vec![0; 128])).await.is_err());
+        assert_eq!(owner.snapshot().websocket_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn websocket_pending_gate_and_output_queue_transfer_one_charge() {
+        let owners = Arc::new(BufferRegistry::default());
+        let owner = owners.owner("Counter:a");
+        let other = owners.owner("Counter:b");
+        let mut registry = WsRegistry::default();
+        registry.metadata.insert(7, metadata());
+        registry.monitor_socket(7, Some(owner.clone()));
+        registry.emit(7, WsOut::Binary(vec![0; 1024]));
+        assert_eq!(owner.snapshot().websocket_bytes, 1024);
+        let (tx, mut rx) = ws_output_channel();
+        registry.register(7, tx);
+        assert_eq!(owner.snapshot().websocket_bytes, 1024);
+        assert!(matches!(rx.recv().await, Some(WsOut::Binary(_))));
+        assert_eq!(owner.snapshot().websocket_bytes, 0);
+
+        let registry = std::sync::Mutex::new(registry);
+        let state = Arc::new(WsFlushState::default());
+        let flush = state
+            .emit_or_defer(&registry, [(7, WsOut::Text("hello".into()))], true)
+            .unwrap();
+        assert_eq!(owner.snapshot().websocket_bytes, 5);
+        flush.release(&registry, Ok(()));
+        assert_eq!(owner.snapshot().websocket_bytes, 5);
+        assert_eq!(other.snapshot().websocket_bytes, 0);
+        assert!(matches!(rx.recv().await, Some(WsOut::Text(_))));
+        assert_eq!(owner.snapshot().websocket_bytes, 0);
+
+        let mut flush = None;
+        let mut tails = HashMap::new();
+        state.capture(
+            &registry,
+            &mut flush,
+            &mut tails,
+            7,
+            WsOut::Binary(vec![0; 256]),
+        );
+        assert_eq!(owner.snapshot().websocket_bytes, 256);
+        flush.unwrap().discard(&registry);
+        assert_eq!(owner.snapshot().websocket_bytes, 0);
+        let refused = state
+            .emit_or_defer(&registry, [(7, WsOut::Binary(vec![0; 512]))], true)
+            .unwrap();
+        refused.release(&registry, Err("refused".into()));
+        assert!(matches!(rx.recv().await, Some(WsOut::Close(1011, _))));
+        assert_eq!(owner.snapshot().websocket_bytes, 0);
+
+        registry
+            .lock()
+            .unwrap()
+            .emit(7, WsOut::Binary(vec![0; 2048]));
+        registry.lock().unwrap().unregister(7);
+        assert_eq!(owner.snapshot().websocket_bytes, 2048);
+        drop(rx);
+        assert_eq!(owner.snapshot().websocket_bytes, 0);
+    }
+}
+
+pub fn ws_output_channel() -> (
+    tokio::sync::mpsc::UnboundedSender<Buffered<WsOut>>,
+    WsOutputReceiver,
+) {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    (tx, WsOutputReceiver(rx))
 }
 
 /// Outbound frames together with any positions already reserved in their sockets.
@@ -115,7 +288,7 @@ impl WsBatch {
         };
         batch
             .state
-            .capture(&mut batch.flush, &mut batch.tails, id, out);
+            .capture(&batch.registry, &mut batch.flush, &mut batch.tails, id, out);
         batch.frames += 1;
     }
 
@@ -230,6 +403,7 @@ impl WsPull {
 }
 
 struct WsPullCharge {
+    _monitor: Option<BufferCharge>,
     #[cfg(all(test, celld_internal_tests))]
     bytes: usize,
     #[cfg(all(test, celld_internal_tests))]
@@ -262,6 +436,7 @@ struct WsPullSendState {
 #[derive(Clone)]
 pub struct WsPullSender {
     state: Arc<std::sync::Mutex<WsPullSendState>>,
+    owner: Option<Arc<BufferCounters>>,
     #[cfg(all(test, celld_internal_tests))]
     queued_bytes: Arc<std::sync::atomic::AtomicUsize>,
     capacity: Arc<tokio::sync::Semaphore>,
@@ -274,12 +449,19 @@ pub struct WsPullReceiver {
 }
 
 pub fn ws_pull_channel() -> (WsPullSender, WsPullReceiver) {
+    ws_pull_channel_owned(None)
+}
+
+pub(crate) fn ws_pull_channel_owned(
+    owner: Option<Arc<BufferCounters>>,
+) -> (WsPullSender, WsPullReceiver) {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     #[cfg(all(test, celld_internal_tests))]
     let queued_bytes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let capacity = Arc::new(tokio::sync::Semaphore::new(WS_PULL_QUEUE_MAX_BYTES));
     (
         WsPullSender {
+            owner,
             state: Arc::new(std::sync::Mutex::new(WsPullSendState {
                 tx,
                 terminal_sent: false,
@@ -297,6 +479,13 @@ pub fn ws_pull_channel() -> (WsPullSender, WsPullReceiver) {
 }
 
 impl WsPull {
+    fn payload_capacity(&self) -> usize {
+        match self {
+            Self::Text(text) | Self::Open(text) | Self::Close(_, text, _) => text.capacity(),
+            Self::Binary(bytes) => bytes.capacity(),
+        }
+    }
+
     fn queue_bytes(&self) -> usize {
         let payload = match self {
             Self::Open(protocol) | Self::Text(protocol) => protocol.len(),
@@ -321,6 +510,11 @@ impl WsPullSender {
             frame => frame,
         };
         let bytes = frame.queue_bytes();
+        let monitor = BufferCharge::new(
+            self.owner.as_ref(),
+            BufferKind::WebSocket,
+            frame.payload_capacity(),
+        );
         // One message can exceed this queue limit until the separate incoming
         // message limit rejects it. Reserving the complete budget admits that
         // message only into an empty queue and prevents a second message from
@@ -347,6 +541,7 @@ impl WsPullSender {
             .send(QueuedWsPull {
                 frame,
                 _charge: WsPullCharge {
+                    _monitor: monitor,
                     #[cfg(all(test, celld_internal_tests))]
                     bytes,
                     #[cfg(all(test, celld_internal_tests))]
@@ -364,6 +559,11 @@ impl WsPullSender {
     /// for capacity, so a stopped isolate cannot keep a host socket task alive.
     pub fn send_close(&self, code: u16, reason: String, was_clean: bool) -> Result<(), WsPull> {
         let frame = WsPull::Close(code, reason, was_clean);
+        let monitor = BufferCharge::new(
+            self.owner.as_ref(),
+            BufferKind::WebSocket,
+            frame.payload_capacity(),
+        );
         #[cfg(all(test, celld_internal_tests))]
         let bytes = frame.queue_bytes();
         let mut state = self.state.lock().unwrap();
@@ -380,6 +580,7 @@ impl WsPullSender {
             .send(QueuedWsPull {
                 frame,
                 _charge: WsPullCharge {
+                    _monitor: monitor,
                     #[cfg(all(test, celld_internal_tests))]
                     bytes,
                     #[cfg(all(test, celld_internal_tests))]
@@ -481,6 +682,19 @@ pub enum WsIn {
     Binary(Vec<u8>),
 }
 
+pub fn buffer_ws_input(cell: &str, data: WsIn) -> Buffered<WsIn> {
+    let capacity = match &data {
+        WsIn::Text(text) => text.capacity(),
+        WsIn::Binary(bytes) => bytes.capacity(),
+    };
+    Buffered::new(
+        data,
+        crate::monitor::buffer_owner(cell).as_ref(),
+        BufferKind::WebSocket,
+        capacity,
+    )
+}
+
 impl From<WsIn> for WsPull {
     fn from(frame: WsIn) -> Self {
         match frame {
@@ -498,25 +712,51 @@ pub struct WsMeta {
     /// Structured-clone bytes, not JSON: `serializeAttachment` accepts
     /// anything cloneable, so Date, Map and Set must survive a round trip.
     pub attachment: Option<Vec<u8>>,
-    pub pending: Vec<WsOut>,
+    pub pending: Vec<Buffered<WsOut>>,
     /// When the shell last answered this socket with the cell's auto-response,
     /// unix ms. Lives here rather than in the isolate because the reply is
     /// sent while the cell may not be resident at all.
     pub auto_response_at: Option<f64>,
+    /// The root cell and facet stream behind a socket that a Durable Object
+    /// facet accepted, dialed, or bound. `None` for a socket of an ordinary
+    /// cell. `scope` then names the facet.
+    pub facet: Option<FacetSocket>,
+}
+
+/// Where the events of a facet's socket go, and what proves their output.
+///
+/// A facet is not a cell: no Worker exports its class under the facet's
+/// scope, so routing an event by that scope activated a cell that cannot
+/// start (denoland/celld#252). The root cell owns the facet, its residency,
+/// and its gate, so the socket routes and registers under `root`. The facet's
+/// own writes are proved on `stream` at `epoch`.
+///
+/// Recorded by the host, never read from a `WsTarget`. A target crosses
+/// application JavaScript, which could otherwise name another root.
+#[derive(Clone, Debug)]
+pub struct FacetSocket {
+    pub root: String,
+    pub stream: String,
+    pub epoch: u64,
+    /// The opening of the facet that holds the socket. An event reaches
+    /// that opening only, never a later one at the same scope.
+    pub opening: u64,
 }
 #[derive(Default)]
 #[doc(hidden)]
 pub struct WsRegistry {
-    pub(crate) outputs: HashMap<u64, tokio::sync::mpsc::UnboundedSender<WsOut>>,
+    pub(crate) outputs: HashMap<u64, WsOutputSender>,
     pub metadata: HashMap<u64, WsMeta>,
+    monitor_owners: HashMap<u64, Arc<BufferCounters>>,
     pub(crate) worker_handoffs: HashMap<u64, WsPullSender>,
 }
 impl WsRegistry {
     #[doc(hidden)]
-    pub fn register(&mut self, id: u64, tx: tokio::sync::mpsc::UnboundedSender<WsOut>) {
+    pub fn register(&mut self, id: u64, tx: impl Into<WsOutputSender>) {
+        let tx = tx.into();
         if let Some(meta) = self.metadata.get_mut(&id) {
             for pending in meta.pending.drain(..) {
-                let _ = tx.send(pending);
+                tx.send(pending);
             }
         }
         self.outputs.insert(id, tx);
@@ -524,14 +764,42 @@ impl WsRegistry {
 
     fn unregister(&mut self, id: u64) -> Option<WsMeta> {
         self.outputs.remove(&id);
+        self.monitor_owners.remove(&id);
         self.metadata.remove(&id)
     }
 
     #[doc(hidden)]
     pub fn emit(&mut self, id: u64, out: WsOut) {
+        let out = self.buffer(id, out);
+        self.emit_buffered(id, out);
+    }
+
+    pub(crate) fn monitor_socket(&mut self, id: u64, owner: Option<Arc<BufferCounters>>) {
+        if let Some(owner) = owner {
+            self.monitor_owners.insert(id, owner);
+        }
+    }
+
+    fn buffer(&self, id: u64, out: WsOut) -> Buffered<WsOut> {
+        let capacity = out.payload_capacity();
+        Buffered::new(
+            out,
+            self.monitor_owners.get(&id),
+            BufferKind::WebSocket,
+            capacity,
+        )
+    }
+
+    fn emit_buffered(&mut self, id: u64, out: Buffered<WsOut>) {
+        let capacity = out.value.payload_capacity();
+        let out = out.track_if_untracked(
+            self.monitor_owners.get(&id),
+            BufferKind::WebSocket,
+            capacity,
+        );
         if let Some(tx) = self.outputs.get(&id) {
             tracing::debug!(ws_id = id, "queued outbound WebSocket frame");
-            let _ = tx.send(out);
+            tx.send(out);
         } else if let Some(meta) = self.metadata.get_mut(&id) {
             tracing::debug!(ws_id = id, "buffered pre-upgrade WebSocket frame");
             meta.pending.push(out);
@@ -642,21 +910,89 @@ fn unix_ms() -> f64 {
     asyncrt::wall_ms() as f64
 }
 
-pub fn ws_hibernatable(id: u64) -> Option<bool> {
+/// Mark a socket as accepted by the facet `scope`, so its events reach the
+/// facet through `facet.root`. A socket that `scope` did not accept keeps its
+/// own route: a facet can return a socket that another cell accepted.
+pub(crate) fn ws_attach_facet(id: u64, scope: &str, facet: FacetSocket) {
+    let owner = crate::monitor::buffer_owner(&facet.root);
+    let registry = ws_registry();
+    let mut registry = registry.lock().unwrap();
+    if let Some(meta) = registry.metadata.get_mut(&id) {
+        if meta.scope == scope {
+            meta.facet = Some(facet);
+            registry.monitor_socket(id, owner);
+        }
+    }
+}
+
+/// The facet route of a socket, when a facet accepted it.
+pub fn ws_facet(id: u64) -> Option<FacetSocket> {
     ws_registry()
         .lock()
         .unwrap()
         .metadata
         .get(&id)
-        .map(|meta| meta.hibernatable)
+        .and_then(|meta| meta.facet.clone())
 }
+
+/// The cell the core holds `target` under, and whether that registration can
+/// hibernate.
+///
+/// A facet's socket registers under its root, as a socket that cannot
+/// hibernate. A root that hibernated would close its facets, and nothing can
+/// restart a facet without the root's code: the class came from the root's
+/// startup callback. The socket therefore keeps the root resident, as a
+/// regular socket does.
+pub fn ws_core_registration(target: &WsTarget) -> (String, bool) {
+    let registry = ws_registry();
+    let registry = registry.lock().unwrap();
+    match registry.metadata.get(&target.id) {
+        Some(WsMeta {
+            facet: Some(facet), ..
+        }) => (facet.root.clone(), false),
+        meta => (
+            target.scope.clone(),
+            meta.is_some_and(|meta| meta.hibernatable),
+        ),
+    }
+}
+
+/// Remove the registration of a socket that the facet `scope` accepted for a
+/// response that never left. No socket task exists for it, so nothing else
+/// would remove it.
+pub(crate) fn ws_release_unanswered(id: u64, scope: &str) {
+    let accepted = ws_registry()
+        .lock()
+        .unwrap()
+        .metadata
+        .get(&id)
+        .is_some_and(|meta| meta.scope == scope);
+    if accepted {
+        ws_unregister(id);
+    }
+}
+
+/// Register a socket that a facet accepted, through a cfg-gated execution
+/// backend that has no facet call to record it.
+#[cfg(celld_internal_tests)]
+#[doc(hidden)]
+pub fn ws_register_facet_for_test(
+    id: u64,
+    scope: &str,
+    facet: FacetSocket,
+    tx: tokio::sync::mpsc::UnboundedSender<WsOut>,
+) {
+    ws_register_hibernatable_for_test(id, scope, tx);
+    ws_attach_facet(id, scope, facet);
+}
+
 pub fn ws_next_id() -> u64 {
     asyncrt::services()
         .websockets()
         .next_id
         .fetch_add(1, Ordering::Relaxed)
 }
-pub fn ws_register(id: u64, tx: tokio::sync::mpsc::UnboundedSender<WsOut>) {
+pub fn ws_register(id: u64, tx: impl Into<WsOutputSender>) {
     ws_registry().lock().unwrap().register(id, tx);
 }
 
@@ -670,6 +1006,7 @@ pub(crate) fn ws_register_hibernatable_for_test(
     let registry = ws_registry();
     let mut registry = registry.lock().unwrap();
     registry.register(id, tx);
+    registry.monitor_socket(id, crate::monitor::buffer_owner(scope));
     registry.metadata.insert(
         id,
         WsMeta {
@@ -679,10 +1016,15 @@ pub(crate) fn ws_register_hibernatable_for_test(
             attachment: None,
             pending: Vec::new(),
             auto_response_at: None,
+            facet: None,
         },
     );
 }
-pub fn ws_register_outbound(id: u64, scope: &str) {
+/// Register an outbound socket of `scope`. A socket that a facet opened
+/// takes its facet record in the same insertion, so no event, close, or
+/// `ws_close_facet` can find the entry without it.
+pub fn ws_register_outbound(id: u64, scope: &str, facet: Option<FacetSocket>) {
+    let owner = crate::monitor::buffer_owner(facet.as_ref().map_or(scope, |facet| &facet.root));
     let inserted = {
         let registry = ws_registry();
         let mut registry = registry.lock().unwrap();
@@ -694,7 +1036,9 @@ pub fn ws_register_outbound(id: u64, scope: &str) {
                 attachment: None,
                 pending: Vec::new(),
                 auto_response_at: None,
+                facet,
             });
+            registry.monitor_socket(id, owner);
             true
         } else {
             false
@@ -750,7 +1094,7 @@ struct WsSegment {
     /// Names this segment to the flush that owns it. The position in the
     /// queue cannot: an earlier segment can drain first and move it.
     token: u64,
-    frames: Vec<WsOut>,
+    frames: Vec<Buffered<WsOut>>,
     /// What the gate answered for this segment, once its flush has an answer.
     /// A segment with no owning flush carries `Ok` from the start: the frames
     /// are already released and only wait for the order in front of them.
@@ -823,6 +1167,7 @@ impl WsFlushState {
         let mut mine = std::collections::HashSet::new();
         let mut segments = Vec::new();
         for (id, out) in frames {
+            let out = registry.lock().unwrap().buffer(id, out);
             if mine.contains(&id) {
                 deferred
                     .get_mut(&id)
@@ -878,6 +1223,7 @@ impl WsFlushState {
     /// this frame opens a new one behind it, so send order still holds.
     fn capture(
         self: &Arc<Self>,
+        registry: &std::sync::Mutex<WsRegistry>,
         flush: &mut Option<WsFlushGuard>,
         tails: &mut HashMap<u64, u64>,
         id: u64,
@@ -887,6 +1233,7 @@ impl WsFlushState {
         // `emit_or_defer`: a teardown must not observe a queued frame with no
         // flush behind it.
         let mut deferred = self.deferred.lock().unwrap();
+        let out = registry.lock().unwrap().buffer(id, out);
         let queue = deferred.entry(id).or_default();
         let own_tail = tails
             .get(&id)
@@ -1091,7 +1438,7 @@ impl WsFlushGuard {
 fn drain_settled(
     deferred: &mut HashMap<u64, std::collections::VecDeque<WsSegment>>,
     id: u64,
-    sending: &mut Vec<(u64, WsOut)>,
+    sending: &mut Vec<(u64, Buffered<WsOut>)>,
 ) {
     let Some(queue) = deferred.get_mut(&id) else {
         return;
@@ -1114,10 +1461,10 @@ fn drain_settled(
         deferred.remove(&id);
         sending.push((
             id,
-            WsOut::Close(
+            Buffered::untracked(WsOut::Close(
                 1011,
                 "celld could not prove the write behind this message durable".to_string(),
-            ),
+            )),
         ));
     } else if queue.is_empty() {
         deferred.remove(&id);
@@ -1174,7 +1521,7 @@ pub async fn ws_await_all_flushes() {
 /// owns the socket instead of to whichever instance that runtime reaches.
 fn emit_frames(
     registry: &std::sync::Mutex<WsRegistry>,
-    frames: impl IntoIterator<Item = (u64, WsOut)>,
+    frames: impl IntoIterator<Item = (u64, Buffered<WsOut>)>,
 ) {
     let mut frames = frames.into_iter().peekable();
     if frames.peek().is_none() {
@@ -1182,7 +1529,7 @@ fn emit_frames(
     }
     let mut registry = registry.lock().unwrap();
     for (id, out) in frames {
-        registry.emit(id, out);
+        registry.emit_buffered(id, out);
     }
 }
 
@@ -1207,19 +1554,57 @@ pub fn ws_close(id: u64, code: u16, reason: &str) {
 /// Break a cell's sockets: the output gate could not prove a write durable, so
 /// close every socket the cell owns rather than let a client keep a connection
 /// whose acknowledged effects may not have persisted (a reset DO).
+///
+/// The sockets of the cell's facets close too. A facet's writes trail the
+/// root cell's gate, and the facet does not outlive its root.
 pub fn ws_close_scope(scope: &str, code: u16, reason: &str) {
+    let mut scopes = vec![scope.to_string()];
+    {
+        let registry = ws_registry();
+        let mut registry = registry.lock().unwrap();
+        let ids: Vec<u64> = registry
+            .metadata
+            .iter()
+            .filter(|(_, meta)| {
+                let facet_of_scope = meta.facet.as_ref().is_some_and(|facet| facet.root == scope);
+                if facet_of_scope && !scopes.contains(&meta.scope) {
+                    scopes.push(meta.scope.clone());
+                }
+                meta.scope == scope || facet_of_scope
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        for id in ids {
+            registry.emit(id, WsOut::Close(code, reason.to_string()));
+        }
+    }
     // A reset cell is a new actor; workerd's hibernation manager dies with
     // the old one and takes the auto-response pair with it.
+    let pairs = ws_auto_responses();
+    let mut pairs = pairs.lock().unwrap();
+    for scope in &scopes {
+        pairs.remove(scope);
+    }
+}
+
+/// Close the sockets of a facet that stopped: an abort, a delete, or its
+/// root's give-back.
+///
+/// No later event can reach the facet, and a facet restarted under the same
+/// name is a new actor that never accepted these sockets. Leaving them open
+/// would accept frames that no handler can receive. 1001 is the code for an
+/// endpoint that is going away.
+pub(crate) fn ws_close_facet(scope: &str, reason: &str) {
     ws_auto_responses().lock().unwrap().remove(scope);
     let registry = ws_registry();
     let mut registry = registry.lock().unwrap();
     let ids: Vec<u64> = registry
         .metadata
         .iter()
-        .filter(|(_, meta)| meta.scope == scope)
+        .filter(|(_, meta)| meta.scope == scope && meta.facet.is_some())
         .map(|(id, _)| *id)
         .collect();
     for id in ids {
-        registry.emit(id, WsOut::Close(code, reason.to_string()));
+        registry.emit(id, WsOut::Close(1001, reason.to_string()));
     }
 }

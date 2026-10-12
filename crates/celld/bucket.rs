@@ -18,7 +18,7 @@
 //! read answers and a conditional write consumes.
 //!
 //! Error contract, relied on by the self-fence: `put_cas` answers
-//! `Ok(None)` only for a clean 412/409 rejection; every other failure
+//! `Ok(None)` only for a definitive precondition rejection; every other failure
 //! surfaces as `Err`. An `Err` is ambiguous — the write may have
 //! committed — unless `cas_write_did_not_commit` recognizes an answer
 //! that proves the store wrote no object. In the same spirit a response
@@ -209,7 +209,7 @@ pub struct CommonPrefixPage {
 }
 
 /// One bounded page of object descriptions from a recursive listing.
-pub(crate) struct ObjectPage {
+pub struct ObjectPage {
     pub objects: Vec<ObjectMeta>,
     pub page_token: Option<String>,
 }
@@ -224,6 +224,44 @@ pub fn is_clean_cas_rejection(error: &Error) -> bool {
         error,
         Error::Precondition { .. } | Error::AlreadyExists { .. }
     )
+}
+
+/// object_store maps every HTTP 409 to AlreadyExists. For S3 conditional
+/// PUTs, 409 is ConditionalRequestConflict, not evidence of an ETag mismatch:
+/// the request did not commit, and the caller may retry within its authority.
+/// For If-None-Match, object_store also wraps a typed 412 Precondition inside
+/// AlreadyExists. Preserve that definitive rejection without parsing messages.
+fn is_s3_cas_conflict(error: &Error) -> bool {
+    match error {
+        Error::AlreadyExists { source, .. } => {
+            !source.downcast_ref::<Error>().is_some_and(|source| {
+                matches!(
+                    source,
+                    Error::Precondition { .. } | Error::NotModified { .. }
+                )
+            })
+        }
+        _ => false,
+    }
+}
+
+#[derive(Debug)]
+struct S3CasConflict(Error);
+
+impl std::fmt::Display for S3CasConflict {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "S3 conditional request conflict (409), safe to retry: {}",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for S3CasConflict {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
 }
 
 /// Whether a failed conditional write proves that the store holds no new
@@ -247,6 +285,9 @@ pub fn is_clean_cas_rejection(error: &Error) -> bool {
 /// until the upstream type is reachable.
 #[doc(hidden)]
 pub fn cas_write_did_not_commit(error: &anyhow::Error) -> bool {
+    if error.downcast_ref::<S3CasConflict>().is_some() {
+        return true;
+    }
     // `put_cas` wraps the store error in context, so read the chain rather
     // than the outermost error. A chain that carries no `object_store`
     // error at all -- an applied write whose response had no CAS token --
@@ -1067,6 +1108,13 @@ impl Bucket {
                     })?;
                 Ok(Some(token))
             }
+            Err(error) if self.backend == StorageBackend::S3 && is_s3_cas_conflict(&error) => {
+                Err(anyhow!(S3CasConflict(error)).context(format!(
+                    "conditional write {}://{}/{key} was rejected by a retryable conflict",
+                    self.scheme(),
+                    self.name
+                )))
+            }
             Err(error) if is_clean_cas_rejection(&error) => Ok(None),
             Err(error) => Err(anyhow!(error).context(format!(
                 "conditional write {}://{}/{key} may have committed",
@@ -1170,7 +1218,7 @@ impl Bucket {
     /// limit. A maintenance caller must finish and release this page before
     /// it asks for the next one, or pagination would bound requests without
     /// bounding retained object descriptions.
-    pub(crate) async fn objects_page(
+    pub async fn objects_page(
         &self,
         prefix: &str,
         page_token: Option<String>,

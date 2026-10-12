@@ -21,6 +21,7 @@
 use crate::bucket::Bucket;
 use anyhow::anyhow;
 use anyhow::bail;
+use std::borrow::Cow;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::sync::OnceLock;
@@ -219,7 +220,8 @@ impl Config {
 pub const KIND_INTERNAL: u8 = 1;
 pub const KIND_SERVER: u8 = 2;
 pub const KIND_CLIENT: u8 = 3;
-pub const KIND_CONSUMER: u8 = 4;
+pub const KIND_PRODUCER: u8 = 4;
+pub const KIND_CONSUMER: u8 = 5;
 
 /// A recorded span's identity.
 #[derive(Clone, Copy, Debug)]
@@ -296,7 +298,7 @@ pub fn traceparent(context: &TraceContext) -> String {
     )
 }
 
-fn unhex<const N: usize>(text: &[u8]) -> Option<[u8; N]> {
+pub(crate) fn unhex<const N: usize>(text: &[u8]) -> Option<[u8; N]> {
     if text.len() != N * 2 {
         return None;
     }
@@ -322,7 +324,7 @@ fn hex_nibble(byte: u8) -> Option<u8> {
 pub struct Span {
     pub ids: TraceIds,
     pub parent_span_id: Option<[u8; 8]>,
-    pub name: &'static str,
+    pub name: Cow<'static, str>,
     pub kind: u8,
     pub start_unix_us: i64,
     pub duration_us: i64,
@@ -338,6 +340,9 @@ pub struct Span {
     /// `Some(true)` for a parent extracted from a caller's traceparent,
     /// `Some(false)` for an in-process parent, `None` for a root.
     pub parent_remote: Option<bool>,
+    /// Bounded application metadata: typed attributes, events, links and scope.
+    /// Kept as JSON to extend the flat Parquet schema without the Arrow stack.
+    pub metadata: Option<serde_json::Value>,
     /// Scalar domain attributes, preserved by both OTLP and Parquet.
     pub attributes: Vec<(String, AttributeValue)>,
 }
@@ -447,6 +452,8 @@ pub struct Log {
     pub time_unix_us: i64,
     pub severity: Severity,
     pub body: String,
+    /// Structured body, annotations and instrumentation identity, when present.
+    pub metadata: Option<serde_json::Value>,
 }
 
 /// The OpenTelemetry severity of a console line. One value yields both the
@@ -454,13 +461,26 @@ pub struct Log {
 /// number with the wrong text.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Severity {
+    Trace,
     Debug,
     Info,
     Warn,
     Error,
+    Fatal,
 }
 
 impl Severity {
+    pub fn from_number(number: i32) -> Option<Self> {
+        match number {
+            1 => Some(Self::Trace),
+            5 => Some(Self::Debug),
+            9 => Some(Self::Info),
+            13 => Some(Self::Warn),
+            17 => Some(Self::Error),
+            21 => Some(Self::Fatal),
+            _ => None,
+        }
+    }
     /// `console.log` and any unknown level are INFO, the level every line
     /// carried before the console method reached the exporter.
     pub fn from_console_level(level: &str) -> Severity {
@@ -476,29 +496,33 @@ impl Severity {
     /// value of each range.
     pub fn number(self) -> i32 {
         match self {
+            Severity::Trace => 1,
             Severity::Debug => 5,
             Severity::Info => 9,
             Severity::Warn => 13,
             Severity::Error => 17,
+            Severity::Fatal => 21,
         }
     }
 
     pub fn text(self) -> &'static str {
         match self {
+            Severity::Trace => "TRACE",
             Severity::Debug => "DEBUG",
             Severity::Info => "INFO",
             Severity::Warn => "WARN",
             Severity::Error => "ERROR",
+            Severity::Fatal => "FATAL",
         }
     }
 }
 
 impl Span {
-    pub fn new(ids: TraceIds, name: &'static str, kind: u8) -> Span {
+    pub fn new(ids: TraceIds, name: impl Into<Cow<'static, str>>, kind: u8) -> Span {
         Span {
             ids,
             parent_span_id: None,
-            name,
+            name: name.into(),
             kind,
             start_unix_us: 0,
             duration_us: 0,
@@ -513,6 +537,7 @@ impl Span {
             http_status: None,
             parent_remote: None,
             attributes: Vec::new(),
+            metadata: None,
         }
     }
 }
@@ -546,8 +571,18 @@ impl Event {
                                 }
                         })
                         .sum::<usize>()
+                    + span
+                        .metadata
+                        .as_ref()
+                        .map_or(0, |value| value.to_string().len())
             }
-            Event::Log(log) => 40 + log.body.len(),
+            Event::Log(log) => {
+                40 + log.body.len()
+                    + log
+                        .metadata
+                        .as_ref()
+                        .map_or(0, |value| value.to_string().len())
+            }
         }
     }
 }
@@ -687,13 +722,21 @@ pub fn child_context(parent: &TraceContext) -> TraceContext {
 /// Queue a finished span. Never blocks: a full channel counts a drop —
 /// telemetry sheds, requests do not.
 pub fn record(span: Span) {
-    send(Event::Span(span));
+    let _ = try_record(span);
+}
+
+pub(crate) fn try_record(span: Span) -> bool {
+    send(Event::Span(span))
 }
 
 /// Queue a captured console line, truncated to the cap.
-pub fn record_log(mut log: Log) {
+pub fn record_log(log: Log) {
+    let _ = try_record_log(log);
+}
+
+pub(crate) fn try_record_log(mut log: Log) -> bool {
     cap_body(&mut log.body);
-    send(Event::Log(log));
+    send(Event::Log(log))
 }
 
 /// Bound a captured error the way a log body is bound, so one runaway
@@ -715,13 +758,21 @@ pub fn cap_body(body: &mut String) {
     body.truncate(end);
 }
 
-fn send(event: Event) {
+pub(crate) fn count_rejected() {
+    if let Some(telemetry) = TELEMETRY.get() {
+        telemetry.dropped.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+fn send(event: Event) -> bool {
     let Some(telemetry) = TELEMETRY.get() else {
-        return;
+        return false;
     };
     if telemetry.tx.try_send(event).is_err() {
         telemetry.dropped.fetch_add(1, Ordering::Relaxed);
+        return false;
     }
+    true
 }
 
 pub fn now_unix_us() -> i64 {
@@ -1222,6 +1273,7 @@ message celld_span {
   optional int32 http_status (INTEGER(16,false));
   optional boolean parent_remote;
   optional binary attributes_json (STRING);
+  optional binary metadata_json (STRING);
 }";
 
 /// The logs signal: one row per captured console line, joined to traces
@@ -1236,6 +1288,7 @@ message celld_log {
   required int32 severity_number;
   required binary severity_text (STRING);
   required binary body (STRING);
+  optional binary metadata_json (STRING);
 }";
 
 /// The native column-writer API rather than the arrow one: the schema is
@@ -1298,7 +1351,7 @@ pub fn encode_spans(spans: &[Span], node: &str, region: &str) -> anyhow::Result<
     column!(ByteArrayType, req each.clone().map(|s| text(&hex(&s.ids.trace_id))).collect::<Vec<_>>());
     column!(ByteArrayType, req each.clone().map(|s| text(&hex(&s.ids.span_id))).collect::<Vec<_>>());
     column!(ByteArrayType, opt each.clone().map(|s| s.parent_span_id.map(|id| text(&hex(&id)))).collect::<Vec<_>>());
-    column!(ByteArrayType, req each.clone().map(|s| text(s.name)).collect::<Vec<_>>());
+    column!(ByteArrayType, req each.clone().map(|s| text(&s.name)).collect::<Vec<_>>());
     column!(Int32Type, req each.clone().map(|s| s.kind as i32).collect::<Vec<_>>());
     column!(Int64Type, req each.clone().map(|s| s.start_unix_us).collect::<Vec<_>>());
     column!(Int64Type, req each.clone().map(|s| s.duration_us).collect::<Vec<_>>());
@@ -1318,6 +1371,7 @@ pub fn encode_spans(spans: &[Span], node: &str, region: &str) -> anyhow::Result<
             .map(|(key, value)| (key.as_str(), value)).collect();
         Some(text(&serde_json::to_string(&attributes).expect("scalar attributes")))
     }).collect::<Vec<_>>());
+    column!(ByteArrayType, opt each.clone().map(|s| s.metadata.as_ref().map(|value| text(&value.to_string()))).collect::<Vec<_>>());
 
     group.close()?;
     Ok(writer.into_inner()?)
@@ -1376,6 +1430,7 @@ pub fn encode_logs(logs: &[Log], node: &str, region: &str) -> anyhow::Result<Vec
     column!(Int32Type, req each.clone().map(|l| l.severity.number()).collect::<Vec<_>>());
     column!(ByteArrayType, req each.clone().map(|l| text(l.severity.text())).collect::<Vec<_>>());
     column!(ByteArrayType, req each.clone().map(|l| text(&l.body)).collect::<Vec<_>>());
+    column!(ByteArrayType, opt each.clone().map(|l| l.metadata.as_ref().map(|value| text(&value.to_string()))).collect::<Vec<_>>());
 
     group.close()?;
     Ok(writer.into_inner()?)

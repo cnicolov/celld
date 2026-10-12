@@ -736,8 +736,10 @@ pub(super) fn inject_queue_config(scope: &mut v8::PinScope, config: &WorkerConfi
 /// `__cell.entrypoints`, so a service binding with `entrypoint = "Name"` can
 /// resolve it, and every export deriving from `DurableObject` in
 /// `__cell.doExports`, so misrouting a DO class as a stateless entrypoint is
-/// reported as such (Workerd getExportedHandler()). Runs once per load; the
-/// check is a prototype walk, not a call into user code.
+/// reported as such (Workerd getExportedHandler()). Every class export that
+/// is not an entrypoint or a workflow also lands in `__cell.classes`, so a
+/// facet can start it. Runs once per load; the check is a prototype walk, not a
+/// call into user code.
 pub(super) fn register_entrypoints(
     scope: &mut v8::PinScope,
     ns: v8::Local<v8::Object>,
@@ -772,6 +774,10 @@ pub(super) fn register_entrypoints(
     let durable_base = cf
         .get(scope, key.into())
         .ok_or_else(|| anyhow!("missing DurableObject base"))?;
+    let key = v8::String::new(scope, "WorkflowEntrypoint").unwrap();
+    let workflow_base = cf
+        .get(scope, key.into())
+        .ok_or_else(|| anyhow!("missing WorkflowEntrypoint base"))?;
     let Some(names) = ns.get_own_property_names(scope, Default::default()) else {
         return Ok(());
     };
@@ -800,6 +806,14 @@ pub(super) fn register_entrypoints(
             entrypoints.set(scope, name, value);
         } else if call_extends(scope, extends, value, durable_base)? {
             do_exports.set(scope, name, yes.into());
+            classes.set(scope, name, value);
+        } else if !call_extends(scope, extends, value, workflow_base)? {
+            // Workerd processEntrypointClass(): a class that extends none of
+            // the runtime bases is a Durable Object class (missingSuperclass).
+            // A loaded Worker's facet class reaches `_instance` only through
+            // this registry, so without it a plain class fails with "no DO
+            // class". It stays out of `doExports`: that entry grants RPC
+            // without the js_rpc flag, which workerd gives only a subclass.
             classes.set(scope, name, value);
         }
     }
@@ -1003,6 +1017,7 @@ fn finish_cell_adoption(tc: &mut v8::PinScope, cell: &str, owned: bool) -> Resul
             let source = format!("__celld.__cell.release({facet:?});");
             run_internal_snippet(tc, &source).ok_or_else(|| anyhow!("release failed"))?;
             storage::close(&facet);
+            crate::ws_registry::ws_close_facet(&facet, "the parent Durable Object was released");
         }
         storage::close(cell);
         return Ok(None);

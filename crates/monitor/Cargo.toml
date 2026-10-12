@@ -1,0 +1,25 @@
+[package]
+name = "celld-monitor"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.94.1"
+license = "Apache-2.0"
+publish = false
+
+[lib]
+path = "lib.rs"
+
+[[bin]]
+name = "celld-monitor-ui"
+path = "main.rs"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+gloo-net.workspace = true
+gloo-timers.workspace = true
+js-sys.workspace = true
+leptos.workspace = true
+wasm-bindgen-futures.workspace = true

@@ -17,10 +17,10 @@
 //! bucket as complete. The decisions are `celld_logic::log_tier`; this
 //! module is their executor.
 //!
-//! v0 limits, deliberate: entries travel as base64 JSON; a follower
-//! failure degrades the node to bucket-proof acks until a periodic
-//! re-recruit CASes a fresh ensemble; recovery gathers from every
-//! reachable sealed member and requires at least one.
+//! A follower failure degrades the node to bucket-proof acks until a periodic
+//! re-recruit CASes a fresh ensemble. Recovery seals reachable members and
+//! transfers one complete matching witness in bounded binary pages. Missing
+//! witnesses preserve the recovery obligation rather than authorizing loss.
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -45,7 +45,15 @@ use crate::bucket::Bucket;
 use crate::ltx_repl::ShipEntry;
 use crate::peer_auth::PeerAuth;
 
+mod hot_recovery;
 mod recovery_progress;
+mod recovery_tail;
+mod retirement;
+mod tail_page;
+pub use retirement::{check_disk_retirement, DiskRetirement};
+
+#[cfg(all(test, not(celld_internal_tests)))]
+mod recovery_tests;
 
 /// The one peer-POST boundary used by the node log.
 ///
@@ -271,6 +279,11 @@ where
         cycle_started = ack_done;
     }
 }
+
+/// Followers a node recruits: three copies of an acknowledged write. The
+/// ensemble keeps acknowledging on fewer (`NodeLogManager::healthy`), and
+/// `maintain` grows it back to this width when peers allow.
+const RECRUIT_FOLLOWERS: usize = 2;
 
 /// Concurrent per-cell upload lanes during node-log recovery. The
 /// sequential version cost ~47 s for 180 entries on the lab fleet; more
@@ -595,6 +608,37 @@ pub(crate) async fn read_record(
     }))
 }
 
+/// Only an observed successor generation or a closed fragment authorizes
+/// releasing a follower disk. A missing lease or failed read proves nothing.
+async fn follower_fragment_closed(
+    bucket: &Bucket,
+    session: &str,
+    fragment_epoch: u64,
+) -> anyhow::Result<bool> {
+    let (node, generation) = session.split_once('/').unwrap_or((session, ""));
+    let Some((bytes, _)) = bucket.get(&lease_key(node)).await? else {
+        return Ok(false);
+    };
+    let wire: crate::ownership_store::NodeLeaseWire = serde_json::from_slice(&bytes)?;
+    anyhow::ensure!(wire.node == node, "follower lease identity mismatch");
+    if !generation.is_empty() {
+        if wire.generation.is_empty() {
+            return Ok(false);
+        }
+        if wire.generation != generation {
+            // Recovery-before-install prevents replacing an unrecovered session.
+            return Ok(true);
+        }
+    }
+    let Some(log) = &wire.log else {
+        return Ok(false);
+    };
+    Ok(log_tier::fragment_closed(
+        &log_from_wire(log)?,
+        fragment_epoch,
+    ))
+}
+
 /// CAS a DEAD session's folded log fields. Authority fields ride through
 /// from the wire the caller read; expiry is never extended, so this write
 /// can only fence, never revive.
@@ -756,6 +800,7 @@ const APPEND_MAGIC: &[u8; 4] = b"CLA1";
 // does not prove that its retained range is complete.
 const LEGACY_TAIL_MAGIC: &[u8; 4] = b"CLT1";
 const TAIL_MAGIC: &[u8; 4] = b"CLT2";
+const TAIL_PAGE_MAGIC: &[u8; 4] = b"CLP1";
 const ENTRY_MAGIC: &[u8; 4] = b"CLE1";
 
 pub struct Entry {
@@ -904,8 +949,16 @@ fn decode_entries(buf: &mut &[u8], what: &str) -> anyhow::Result<Vec<Entry>> {
 }
 
 pub fn encode_tail_resp(resp: &TailResp) -> Vec<u8> {
+    encode_ranged_tail(resp, TAIL_MAGIC)
+}
+
+pub fn encode_tail_page(resp: &TailResp) -> Vec<u8> {
+    encode_ranged_tail(resp, TAIL_PAGE_MAGIC)
+}
+
+fn encode_ranged_tail(resp: &TailResp, magic: &[u8; 4]) -> Vec<u8> {
     let mut out = Vec::new();
-    out.extend_from_slice(TAIL_MAGIC);
+    out.extend_from_slice(magic);
     out.extend_from_slice(&resp.range.fragment_epoch.to_le_bytes());
     out.extend_from_slice(&resp.range.base.to_le_bytes());
     out.extend_from_slice(&resp.range.end.to_le_bytes());
@@ -928,6 +981,40 @@ pub fn decode_tail_resp(mut body: &[u8]) -> anyhow::Result<TailReply> {
         magic if magic == TAIL_MAGIC => {}
         _ => return Err(anyhow!("log wire: bad tail magic")),
     }
+    let resp = decode_ranged_tail(buf)?;
+    if resp.range.complete
+        && !tail_covers_sealed_range(resp.range.base, resp.range.end, &resp.entries)
+    {
+        anyhow::bail!("log wire: complete tail does not cover its range");
+    }
+    Ok(TailReply::Ranged(resp))
+}
+
+fn decode_tail_page(mut body: &[u8]) -> anyhow::Result<TailResp> {
+    let buf = &mut body;
+    anyhow::ensure!(
+        take(buf, 4, "tail page magic")? == TAIL_PAGE_MAGIC,
+        "log wire: bad tail page magic"
+    );
+    let resp = decode_ranged_tail(buf)?;
+    anyhow::ensure!(
+        resp.entries
+            .first()
+            .is_none_or(|entry| entry.seq > resp.range.base)
+            && resp
+                .entries
+                .last()
+                .is_none_or(|entry| entry.seq <= resp.range.end)
+            && resp
+                .entries
+                .windows(2)
+                .all(|pair| pair[0].seq.checked_add(1) == Some(pair[1].seq)),
+        "log wire: tail page has a gap or out-of-range entry"
+    );
+    Ok(resp)
+}
+
+fn decode_ranged_tail(buf: &mut &[u8]) -> anyhow::Result<TailResp> {
     let fragment_epoch = take_u64(buf, "tail fragment_epoch")?;
     let base = take_u64(buf, "tail base")?;
     let end = take_u64(buf, "tail end")?;
@@ -944,10 +1031,7 @@ pub fn decode_tail_resp(mut body: &[u8]) -> anyhow::Result<TailReply> {
         complete,
     };
     let entries = decode_entries(buf, "tail")?;
-    if range.complete && !tail_covers_sealed_range(range.base, range.end, &entries) {
-        anyhow::bail!("log wire: complete tail does not cover its range");
-    }
-    Ok(TailReply::Ranged(TailResp { range, entries }))
+    Ok(TailResp { range, entries })
 }
 
 /// The frames one commit may carry: consecutive stream frames of ONE
@@ -1033,6 +1117,20 @@ pub struct TailReq {
     pub leader: String,
 }
 
+/// A bounded read from a fixed retained range. Later requests carry the range
+/// returned by the first page, so adoption or truncation cannot silently move
+/// the recovery cut while a reader transfers it.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct TailPageReq {
+    #[serde(deserialize_with = "deserialize_log_leader")]
+    pub leader: String,
+    pub after: Option<u64>,
+    pub max_bytes: usize,
+    pub range: Option<TailRange>,
+}
+
+const TAIL_PAGE_BYTES: usize = 4 * 1024 * 1024;
+
 #[derive(Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
 #[serde(try_from = "u8", into = "u8")]
 enum TailFormat {
@@ -1109,7 +1207,7 @@ impl TailWireReq {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TailRange {
     pub fragment_epoch: u64,
     pub base: u64,
@@ -1157,9 +1255,16 @@ struct CommittedBatch {
 }
 
 struct CommittedBatchScan {
-    batches: Vec<CommittedBatch>,
+    batches: Vec<CommittedBatchMeta>,
     unreadable_ranges: Vec<(u64, u64)>,
     unknown_unreadable_range: bool,
+}
+
+struct CommittedBatchMeta {
+    state: FollowerState,
+    first: u64,
+    last: u64,
+    path: PathBuf,
 }
 
 #[derive(Clone, Copy)]
@@ -1318,6 +1423,8 @@ pub struct FollowerStore {
     /// floor the 2026-08-25 gate decomposition landed on. A restart
     /// starts empty and conservatively re-syncs each chain once.
     synced_namespaces: Mutex<std::collections::BTreeSet<String>>,
+    tail_indexes: Mutex<HashMap<String, Arc<tail_page::TailIndex>>>,
+    hot_standbys: Mutex<Option<Arc<crate::hot_recovery::HotStandbys>>>,
     #[cfg(celld_internal_tests)]
     directory_sync_for_test: Arc<DirectorySyncForTest>,
 }
@@ -1335,6 +1442,8 @@ impl FollowerStore {
             logs: Mutex::new(HashMap::new()),
             guards: Mutex::new(HashMap::new()),
             synced_namespaces: Mutex::new(std::collections::BTreeSet::new()),
+            tail_indexes: Mutex::new(HashMap::new()),
+            hot_standbys: Mutex::new(None),
             #[cfg(celld_internal_tests)]
             directory_sync_for_test: Arc::new(move |path| directory_filesystem.sync_all(path)),
         }
@@ -1553,7 +1662,12 @@ impl FollowerStore {
                     if batch.entries.first().map(|entry| entry.seq) == Some(named_first)
                         && batch.entries.last().map(|entry| entry.seq) == Some(named_last) =>
                 {
-                    batches.push(batch);
+                    batches.push(CommittedBatchMeta {
+                        state: batch.state,
+                        first: named_first,
+                        last: named_last,
+                        path: item.path,
+                    });
                 }
                 Ok(_) => {
                     unreadable_ranges.push((named_first, named_last));
@@ -1574,7 +1688,7 @@ impl FollowerStore {
                 }
             }
         }
-        batches.sort_by_key(|batch| batch.entries.first().map_or(0, |entry| entry.seq));
+        batches.sort_by_key(|batch| batch.first);
         Ok(CommittedBatchScan {
             batches,
             unreadable_ranges,
@@ -1589,12 +1703,12 @@ impl FollowerStore {
     fn recover_committed_state(
         &self,
         seed: FollowerState,
-        batches: &[CommittedBatch],
+        batches: &[CommittedBatchMeta],
     ) -> FollowerState {
         if seed.fragment_epoch == 0 {
             return seed;
         }
-        let mut candidates: Vec<&CommittedBatch> = batches
+        let mut candidates: Vec<&CommittedBatchMeta> = batches
             .iter()
             .filter(|batch| {
                 batch.state.fragment_epoch == seed.fragment_epoch && batch.state.end > seed.end
@@ -1607,16 +1721,8 @@ impl FollowerStore {
                 .iter()
                 .filter(|batch| batch.state.fragment_epoch == seed.fragment_epoch)
             {
-                let first = batch
-                    .entries
-                    .first()
-                    .expect("committed batches are non-empty")
-                    .seq;
-                let last = batch
-                    .entries
-                    .last()
-                    .expect("committed batches are non-empty")
-                    .seq;
+                let first = batch.first;
+                let last = batch.last;
                 if last <= covered {
                     continue;
                 }
@@ -1664,6 +1770,7 @@ impl FollowerStore {
     }
 
     fn cache_state(&self, leader: &str, state: FollowerState) {
+        self.tail_indexes.lock().unwrap().remove(leader);
         let mut logs = self.logs.lock().unwrap();
         let disk_recovery_gap = logs.get(leader).and_then(|loaded| {
             let gap = loaded.disk_recovery_gap?;
@@ -2064,6 +2171,19 @@ impl FollowerStore {
         if !state_ok {
             return refusals(frame_count, state);
         }
+        let hot = self.hot_standbys.lock().unwrap().clone();
+        if let Some(hot) = hot {
+            let leader = leader.clone();
+            // Standby I/O cannot starve lease/peer tasks on the async pool.
+            // Its cache is advisory: failure never changes this disk ack.
+            if let Err(error) = crate::asyncrt::blocking(move || {
+                hot.observe(&leader, state, new_state, &accepted);
+            })
+            .await
+            {
+                warn!(%error, "standby materializer failed; follower log remains durable");
+            }
+        }
         lasts
             .into_iter()
             .map(|last| {
@@ -2104,15 +2224,11 @@ impl FollowerStore {
         // ignores the newer range fields. The actual epoch travels
         // separately so a new caller can still gather the readable prefix
         // and classify the incomplete fragment conclusively.
-        let tail = self.read_tail(&TailReq {
-            leader: req.leader.clone(),
-        })?;
-        let range = tail.range;
+        let range = self.tail_index(&req.leader)?.range;
         let retained_complete = range.fragment_epoch == state.fragment_epoch
             && range.base == state.base
             && range.end == end
-            && range.complete
-            && tail_covers_sealed_range(range.base, range.end, &tail.entries);
+            && range.complete;
         if !retained_complete {
             warn!(
                 leader = req.leader,
@@ -2146,10 +2262,6 @@ impl FollowerStore {
         let Some(bucket) = &self.bucket else { return };
         let leaders = self.followed_sessions();
         for leader in leaders {
-            let Ok(Some(folded)) = read_record(bucket, &leader).await else {
-                continue;
-            };
-            let record = folded.record;
             let guard = self.guard(&leader);
             let _held = guard.lock().await;
             let Ok(state) = self.load(&leader) else {
@@ -2158,28 +2270,15 @@ impl FollowerStore {
             if state.fragment_epoch == 0 {
                 continue;
             }
-            let closed = log_tier::fragment_closed(&record, state.fragment_epoch);
+            let closed = follower_fragment_closed(bucket, &leader, state.fragment_epoch)
+                .await
+                .unwrap_or(false);
             if !closed {
                 continue;
             }
-            if state.base == state.end
-                && self
-                    .filesystem
-                    .metadata(&self.dir(&leader).join("state.json"))
-                    .is_ok_and(|metadata| metadata.is_file)
-            {
-                // Already empty; nothing to remove, and the state file
-                // stays as the seal-mark carrier.
-                let _ = self.persist(
-                    &leader,
-                    FollowerState {
-                        sealed_to: state.sealed_to.max(state.fragment_epoch),
-                        ..state
-                    },
-                );
-                continue;
-            }
-            let _ = self.remove_entries_below(&leader, u64::MAX);
+            // Persist the empty/fenced state before deletion. Even when an
+            // earlier pass already wrote it, retry removal: a crash or unlink
+            // error can leave payloads behind an "empty" marker.
             if self
                 .persist(
                     &leader,
@@ -2192,6 +2291,13 @@ impl FollowerStore {
                 )
                 .is_ok()
             {
+                if let Err(error) = self
+                    .remove_entries_below(&leader, u64::MAX)
+                    .and_then(|()| self.sync_leader_directory(&leader, &self.dir(&leader)))
+                {
+                    warn!(leader, %error, "closed follower fragment cleanup failed; retaining disk");
+                    continue;
+                }
                 info!(
                     leader,
                     epoch = state.fragment_epoch,
@@ -2208,6 +2314,12 @@ impl FollowerStore {
         let guard = self.guard(&req.leader);
         let _held = guard.lock().await;
         self.read_tail(req)
+    }
+
+    pub async fn tail_page(&self, req: &TailPageReq) -> anyhow::Result<TailResp> {
+        let guard = self.guard(&req.leader);
+        let _held = guard.lock().await;
+        self.read_tail_page(req)
     }
 
     fn read_tail(&self, req: &TailReq) -> anyhow::Result<TailResp> {
@@ -2231,13 +2343,20 @@ impl FollowerStore {
         // still has no bounded range that replacement coverage can discharge.
         let mut retained_files_complete =
             !batch_scan.unknown_unreadable_range && self.recovered_disk_range_complete(&req.leader);
-        let mut entries: Vec<Entry> = batch_scan
+        let mut entries: Vec<Entry> = Vec::new();
+        for batch in batch_scan
             .batches
             .into_iter()
             .filter(|batch| batch.state.fragment_epoch == state.fragment_epoch)
-            .flat_map(|batch| batch.entries)
-            .filter(|entry| entry.seq > base)
-            .collect();
+        {
+            let bytes = self.filesystem.read(&batch.path)?;
+            entries.extend(
+                decode_committed_batch(&bytes)?
+                    .entries
+                    .into_iter()
+                    .filter(|entry| entry.seq > base),
+            );
+        }
         let dir = self.dir(&req.leader);
         match self.filesystem.read_dir(&dir) {
             Ok(read) => {
@@ -2457,10 +2576,11 @@ fn tail_covers_sealed_range(base: u64, end: u64, entries: &[Entry]) -> bool {
     covered == end
 }
 
-/// The signed production implementation. It preserves the previous request
-/// construction, authentication, response validation, and timeout behavior.
+/// Signed production transport. Ordinary requests retain their total deadline;
+/// paged recovery instead times out only stalled headers or body progress.
 struct SignedPeerTransport {
     http: reqwest::Client,
+    recovery_http: reqwest::Client,
     auth: Arc<PeerAuth>,
 }
 
@@ -2472,6 +2592,11 @@ impl SignedPeerTransport {
                 .tcp_nodelay(true)
                 .build()
                 .expect("build log peer client"),
+            recovery_http: reqwest::Client::builder()
+                .connect_timeout(crate::machine::PEER_CONNECT_TIMEOUT)
+                .tcp_nodelay(true)
+                .build()
+                .expect("build recovery peer client"),
             auth,
         }
     }
@@ -2489,12 +2614,25 @@ impl LogTransport for SignedPeerTransport {
         Box<dyn std::future::Future<Output = anyhow::Result<bytes::Bytes>> + Send + 'a>,
     > {
         Box::pin(async move {
-            let mut builder = self.http.post(format!("http://{addr}{path}"));
+            let paged_tail = path == "/peer/log/tail-page";
+            let http = if paged_tail {
+                &self.recovery_http
+            } else {
+                &self.http
+            };
+            let mut builder = http.post(format!("http://{addr}{path}"));
             if let Some(deadline) = deadline {
                 builder = builder.timeout(deadline);
             }
             let request = self.auth.sign(builder, "POST", path, &body, node)?;
-            let response = request.body(body).send().await?;
+            let send = request.body(body).send();
+            let response = if paged_tail {
+                crate::asyncrt::timeout(std::time::Duration::from_secs(10), send)
+                    .await
+                    .context("recovery peer did not send response headers within 10s")??
+            } else {
+                send.await?
+            };
             // Status before response-auth: an older peer can answer an
             // unsigned route error, and callers need that status to classify
             // a protocol-incapable member separately from transport failure.
@@ -2504,7 +2642,21 @@ impl LogTransport for SignedPeerTransport {
                     .context(format!("peer {node} answered {status}")));
             }
             crate::peer_auth::validate_response(response.headers())?;
-            Ok(response.bytes().await?)
+            if !paged_tail {
+                return Ok(response.bytes().await?);
+            }
+            // A page may contain one large indivisible entry. Timeout stalled
+            // progress, not a healthy transfer whose total duration exceeds 10s.
+            let mut chunks = response.bytes_stream();
+            let mut bytes = bytes::BytesMut::new();
+            while let Some(chunk) =
+                crate::asyncrt::timeout(std::time::Duration::from_secs(10), chunks.next())
+                    .await
+                    .context("recovery peer made no body progress for 10s")?
+            {
+                bytes.extend_from_slice(&chunk?);
+            }
+            Ok(bytes.freeze())
         })
     }
 
@@ -3892,17 +4044,22 @@ impl FleetShipper {
 
 /// The wait before epoch GC retries a cell whose last pass decided nothing
 /// or left an epoch inside the grace.
-const EPOCH_GC_RETRY_MS: u64 = 5 * 60 * 1000;
+pub(crate) const EPOCH_GC_RETRY_MS: u64 = 5 * 60 * 1000;
+
+/// The period of the node-log maintenance loop, which runs epoch GC.
+pub(crate) const LOG_MAINTENANCE_TICK_MS: u64 = 30 * 1000;
 
 /// The wait before epoch GC looks again at a cell whose last pass deleted
 /// everything it could.
 const EPOCH_GC_SETTLED_RETRY_MS: u64 = 60 * 60 * 1000;
 
 /// The most cells one maintenance pass examines for epoch GC. Each costs a
-/// few bucket listings, and the pass shares the 30 s tick with the lease
-/// and log maintenance, so a node holding thousands of cells spreads them
-/// over several ticks instead of stalling the others behind one pass.
-const EPOCH_GC_CELLS_PER_PASS: usize = 32;
+/// few bucket listings, and on a fleet node the pass shares the 30 s tick
+/// with the lease and log maintenance, so a node holding thousands of cells
+/// spreads them over several ticks instead of stalling the others behind
+/// one pass. A bucket node runs the pass alone on the tick, and the bound
+/// still keeps one tick from listing the bucket thousands of times.
+pub(crate) const EPOCH_GC_CELLS_PER_PASS: usize = 32;
 
 /// Everything node-log recovery needs from the node: the bucket, the signed
 /// peer client, address resolution, and the raw per-cell upload.
@@ -3917,6 +4074,7 @@ pub struct NodeLogManager {
     session: String,
     bucket: Arc<Bucket>,
     ownership: Arc<crate::ownership_store::BucketOwnership>,
+    hot_follower: Mutex<Option<Arc<FollowerStore>>>,
     ltx: Arc<crate::ltx_repl::LtxRepl>,
     transport: Arc<dyn LogTransport>,
     /// The current ensemble's shipper, swapped whole by the maintenance
@@ -3937,15 +4095,12 @@ pub struct NodeLogManager {
     /// Process-local; a restart re-confirms once.
     gc_confirmed_empty: Mutex<std::collections::HashSet<String>>,
     /// When each resident (cell, epoch) pair is next due for an epoch-GC
-    /// attempt, in monotonic milliseconds. A
+    /// attempt, in monotonic milliseconds. A pair enters at the time a pass
+    /// first sees it, so it waits behind the overdue pairs. A
     /// pass that decides nothing (an idle cell whose opener is not listed
     /// yet, a paged cell still filling, an epoch inside the grace) waits
     /// [`EPOCH_GC_RETRY_MS`] instead of listing the bucket every tick.
     epoch_gc_due: Mutex<BTreeMap<(String, u64), u64>>,
-    /// Retained bundles this process has already declared unreadable. The
-    /// record is the durable one; this only keeps one process from
-    /// rewriting the same declaration on every scan.
-    declared_bundle_losses: Mutex<BTreeSet<String>>,
     /// One-slot cache for the compactor's fetches: bundles are read many
     /// rows at a time, and re-GETting per row would refund the savings.
     bundle_cache: tokio::sync::Mutex<Option<(String, Arc<Vec<u8>>)>>,
@@ -4152,13 +4307,16 @@ impl DurabilityOwner {
             stack.node_log_tasks.roots.is_empty(),
             "node-log background tasks were already started"
         );
-        if stack.fleet {
-            spawn_maintenance(
-                stack.manager.clone(),
-                stack.node_log_tasks.stop.clone(),
-                &stack.node_log_tasks.roots,
-            );
-        }
+        // Every posture runs the maintenance loop, because epoch GC
+        // (denoland/celld#240) does not depend on the posture: every
+        // activation adds a whole-database image in either one. The loop
+        // runs the fleet phases only on a fleet node.
+        spawn_maintenance(
+            stack.manager.clone(),
+            stack.node_log_tasks.stop.clone(),
+            &stack.node_log_tasks.roots,
+            stack.fleet,
+        );
         if let Some(follower) = follower {
             assert!(
                 self.follower_tasks.store.is_none(),
@@ -4440,6 +4598,7 @@ impl NodeLogManager {
             live_log,
             bucket,
             ownership,
+            hot_follower: Mutex::new(None),
             ltx,
             transport,
             inner: Mutex::new(None),
@@ -4471,7 +4630,6 @@ impl NodeLogManager {
             recovery_locks: Mutex::new(BTreeMap::new()),
             gc_confirmed_empty: Mutex::new(std::collections::HashSet::new()),
             epoch_gc_due: Mutex::new(BTreeMap::new()),
-            declared_bundle_losses: Mutex::new(BTreeSet::new()),
             task_stop,
             child_tasks,
         }
@@ -4713,22 +4871,6 @@ impl NodeLogManager {
             .post(node, addr, path, serde_json::to_vec(req)?, None)
             .await?;
         Ok(serde_json::from_slice(&bytes)?)
-    }
-
-    /// The tail POST: a JSON request, a binary response (the entries
-    /// dominate it).
-    async fn post_tail(&self, node: &str, addr: &str, req: &TailReq) -> anyhow::Result<TailReply> {
-        let bytes = self
-            .transport
-            .post(
-                node,
-                addr,
-                "/peer/log/tail",
-                serde_json::to_vec(&TailWireReq::ranged(req.clone()))?,
-                None,
-            )
-            .await?;
-        decode_tail_resp(&bytes)
     }
 
     /// Node-log recovery, the model's StartRecovery/SealFollower/
@@ -5034,42 +5176,22 @@ impl NodeLogManager {
                 return Ok(());
             }
 
-            let now = crate::ownership_store::now_ms();
             let pass_started = mono_ms();
             let mut complete_witnesses = 0_usize;
-            // A member is CONCLUSIVE when its fate is known: lease provably
-            // expired and unreachable, reachable with a different fragment
-            // epoch, or reachable with an explicitly incomplete retained
-            // range. A failed tail or an old response without that range is
-            // inconclusive. Only a fully conclusive, witness-free epoch with
-            // possible fleet acknowledgements may declare bounded loss.
+            // Failed reads never prove the absence of acknowledged rows.
+            // Count only complete, matching fragments as recovery witnesses.
             let mut inconclusive = 0_usize;
             let mut gathered: BTreeMap<(String, u64, u64), Vec<u8>> = BTreeMap::new();
-            // "A blink is not death" applies to loss declaration too: a
-            // member whose lease merely lapsed (a restart, a fleet-wide
-            // power cycle) is NOT conclusively gone — its fsync'd fragments
-            // boot back in seconds, and declaring loss against boot order
-            // would discard acked writes sitting intact on disk — so a
-            // 3x-TTL grace applies to MEMBER fate here, unrelated to the
-            // sweep (which, under the fold, judges the record's own
-            // published expiry with no grace).
-            let grace_ms = (self.ownership.lease_ttl_ms() * 3).max(20_000);
+            let mut recovered_tail = None;
             for member in &record.ensemble {
                 self.beat_claim(dead, &mut beat).await?;
                 let lease = self.ownership.read_node_lease(member).await;
-                let lease_live = matches!(&lease, Ok(Some(lease)) if lease.expires_ms > now);
-                let lease_long_dead = matches!(
-                    &lease,
-                    Ok(Some(lease)) if lease.expires_ms.saturating_add(grace_ms) < now
-                );
                 let addr = match lease {
                     Ok(Some(lease)) => Some(lease.addr),
                     _ => None,
                 };
                 let Some(addr) = addr else {
-                    if lease_live || !lease_long_dead {
-                        inconclusive += 1;
-                    }
+                    inconclusive += 1;
                     continue;
                 };
                 let seal = SealReq {
@@ -5081,40 +5203,39 @@ impl NodeLogManager {
                     .await
                 {
                     Ok(sealed) => sealed,
-                    Err(error) => {
+                    Err(_error) => {
                         // Startup serves follower requests before it renews
                         // the lease. An HTTP error proves a response, not a
                         // missing fragment: a transient scan failure on an
                         // expired member must not seal away its intact rows.
-                        let answered = error.downcast_ref::<PeerHttpError>().is_some()
-                            || error.downcast_ref::<serde_json::Error>().is_some();
-                        if answered || lease_live || !lease_long_dead {
-                            inconclusive += 1;
-                        }
+                        inconclusive += 1;
                         continue;
                     }
                 };
                 let held_fragment_epoch =
                     sealed.held_fragment_epoch.unwrap_or(sealed.fragment_epoch);
-                let tail = TailReq {
-                    leader: dead.to_string(),
+                if recovered_tail.is_some() {
+                    continue;
+                }
+                let Some(base) = sealed.base else {
+                    inconclusive += 1;
+                    continue;
                 };
-                let mut tail = match self.post_tail(member, &addr, &tail).await {
-                    Ok(TailReply::Ranged(tail)) => tail,
-                    Ok(TailReply::Legacy { .. }) => {
-                        // A legacy body has no retained range, even when the
-                        // seal claims an empty or different fragment. Do not
-                        // turn missing evidence into conclusive amnesia through
-                        // the failed-read classifier below.
-                        inconclusive += 1;
-                        warn!(
-                            member,
-                            dead,
-                            epoch = record.epoch,
-                            "recovery received a legacy tail without range evidence"
-                        );
-                        continue;
-                    }
+                if held_fragment_epoch != record.epoch || sealed.fragment_epoch != record.epoch {
+                    inconclusive += 1;
+                    continue;
+                }
+                let range = TailRange {
+                    fragment_epoch: record.epoch,
+                    base,
+                    end: sealed.end,
+                    complete: true,
+                };
+                let tail = match self
+                    .fetch_tail(member, &addr, dead, Some(range), Some((dead, &mut beat)))
+                    .await
+                {
+                    Ok(tail) => tail,
                     Err(error) => {
                         // The seal answer and the fragment are TWO requests,
                         // and only the second carries the data. Counting the
@@ -5139,119 +5260,26 @@ impl NodeLogManager {
                         continue;
                     }
                 };
-                tail.entries.sort_by_key(|entry| entry.seq);
-                // A matching fragment epoch identifies the right fragment,
-                // but it does not prove that every retained sequence is still
-                // readable. The seal and tail responses must describe the same
-                // range, and the ranged tail must certify its own complete read.
-                // A legacy response was kept inconclusive above, so it cannot
-                // certify recovery or declare loss.
-                if held_fragment_epoch == record.epoch {
-                    match sealed.base {
-                        Some(base)
-                            if tail.range.fragment_epoch == held_fragment_epoch
-                                && tail.range.base == base
-                                && tail.range.end == sealed.end
-                                && tail.range.complete
-                                && sealed.fragment_epoch == held_fragment_epoch
-                                && tail_covers_sealed_range(base, sealed.end, &tail.entries) =>
-                        {
-                            complete_witnesses += 1;
-                        }
-                        Some(base)
-                            if tail.range.fragment_epoch == held_fragment_epoch
-                                && tail.range.base == base
-                                && tail.range.end == sealed.end
-                                && (!tail.range.complete
-                                    || !tail_covers_sealed_range(
-                                        base,
-                                        sealed.end,
-                                        &tail.entries,
-                                    )) =>
-                        {
-                            warn!(
-                                dead,
-                                member,
-                                base,
-                                end = sealed.end,
-                                "sealed follower returned an incomplete tail"
-                            );
-                        }
-                        Some(base) => {
-                            inconclusive += 1;
-                            warn!(
-                                dead,
-                                member,
-                                base,
-                                end = sealed.end,
-                                tail_epoch = tail.range.fragment_epoch,
-                                tail_base = tail.range.base,
-                                tail_end = tail.range.end,
-                                tail_complete = tail.range.complete,
-                                "sealed follower returned inconsistent tail metadata"
-                            );
-                        }
-                        None => {
-                            inconclusive += 1;
-                            warn!(
-                                dead,
-                                member, "sealed follower did not report its retained range"
-                            );
-                        }
-                    }
-                }
-                for entry in tail.entries {
-                    gathered.insert((entry.cell, entry.cell_epoch, entry.txid), entry.bytes);
-                }
+                // Count a witness only after every page has been read and
+                // validated against the persisted seal's exact range.
+                complete_witnesses += 1;
+                recovered_tail = Some(tail);
             }
             let members_ms = mono_ms().saturating_sub(pass_started);
-            // `may_have_fleet_acks` was CASed before the epoch's first fleet
-            // credit, so this marker without a complete witness means that
-            // acked frames can be missing. If any member's state remains
-            // inconclusive, keep failing loudly because its data can still
-            // become readable. If every member is conclusive, declare the
-            // bounded loss AS A RECORD: a permanent object beside the log
-            // record stating what was unrecoverable, then proceed to the
-            // drain and the seal. "Loss is a record, never a prompt." The
-            // verdict rests on the members alone, so it is reached before
-            // the bundle drain: a pass that must refuse to seal refuses
-            // before it reads the session, not after.
-            if complete_witnesses == 0 && may_have_fleet_acks && !record.ensemble.is_empty() {
-                anyhow::ensure!(
-                    inconclusive == 0,
-                    "node-log recovery for {dead}: no complete true witness among {:?} and \
-                     {inconclusive} member(s) undecided; refusing to seal while \
-                     member state remains unverified",
-                    record.ensemble
-                );
-                let loss = serde_json::json!({
-                    "leader": dead,
-                    "epoch": record.epoch,
-                    "declared_at_ms": now,
-                    "declared_by": self.node,
-                    "ensemble": record.ensemble.iter().collect::<Vec<_>>(),
-                    "note": "no complete true witness survived; acked writes within the \
-                             final flush window may be unrecovered",
-                });
-                self.bucket
-                    .put(
-                        &format!("log/{dead}.e{}.loss.json", record.epoch),
-                        serde_json::to_vec(&loss)?,
-                    )
-                    .await?;
-                warn!(
-                    dead,
-                    epoch = record.epoch,
-                    "declared bounded loss: no complete true witness for an active log; \
-                     recovery record written"
-                );
-            }
+            // The activation marker precedes the first fleet credit. Without
+            // a complete witness, potentially acknowledged frames remain a
+            // recovery obligation even when every follower lease has expired.
+            anyhow::ensure!(
+                log_tier::recovery_has_witness(may_have_fleet_acks, complete_witnesses),
+                "node-log recovery for {dead}: no complete true witness among {:?} and \
+                 {inconclusive} member(s) undecided; refusing to seal or discard acknowledged \
+                 writes; restore a follower with its original node identity and recovery disk",
+                record.ensemble
+            );
             // The dead leader's un-drained bundles are bucket-durable
             // coverage that recovery folds into the per-cell prefixes —
             // one GET per bundle, sliced locally, the same idempotent
-            // per-cell PUTs as the follower gather. This runs regardless
-            // of the witness outcome: even a declared loss drains what
-            // the bucket already holds. EVERY retained bundle, not only
+            // per-cell PUTs as the follower gather. EVERY retained bundle, not only
             // the record epoch's: a live reconfiguration steps the epoch
             // behind a barrier that counts bundle coverage as tiered, so
             // rows can be durable only in a prior epoch's bundle — an
@@ -5281,7 +5309,7 @@ impl NodeLogManager {
             // flush re-read from the same durable txid), and never a lower
             // range. Flush order is numeric (epoch, seq) order — a key sort
             // puts `e10-` before `e9-` — and the follower tails, the newest
-            // acked rows of the current epoch, fold with the LAST window;
+            // acked rows of the current epoch, fold AFTER every bundle window;
             // folded first, their txids would have raised the watermark
             // over every bundled row behind them and orphaned the session.
             let bundle_metas = self
@@ -5309,8 +5337,7 @@ impl NodeLogManager {
             let mut bundles_ms = 0_u64;
             let mut upload_ms = 0_u64;
             let mut gathered_bytes = 0_u64;
-            let mut tail = Some(std::mem::take(&mut gathered));
-            for (index, window) in windows.into_iter().enumerate() {
+            for window in windows {
                 let fetch_started = mono_ms();
                 let fetches = window.into_iter().map(|key| {
                     let bucket = self.bucket.clone();
@@ -5340,14 +5367,6 @@ impl NodeLogManager {
                     }
                 }
                 drop(fetches);
-                if index + 1 == window_count {
-                    // The same bytes under the same key wherever a row is
-                    // held; the follower's copy stays the one uploaded, as
-                    // it was when the whole session folded at once.
-                    for (key, bytes) in tail.take().into_iter().flatten() {
-                        gathered.insert(key, bytes);
-                    }
-                }
                 bundles_ms += mono_ms().saturating_sub(fetch_started);
                 let held: u64 = gathered.values().map(|bytes| bytes.len() as u64).sum();
                 #[cfg(all(test, celld_internal_tests))]
@@ -5382,6 +5401,28 @@ impl NodeLogManager {
                     )
                     .await?;
                 upload_ms += mono_ms().saturating_sub(upload_started);
+            }
+            if let Some(mut tail) = recovered_tail {
+                while let Some(entries) = tail.next()? {
+                    self.beat_claim(dead, &mut beat).await?;
+                    let rows = entries
+                        .into_iter()
+                        .map(|entry| ((entry.cell, entry.cell_epoch, entry.txid), entry.bytes))
+                        .collect::<BTreeMap<_, _>>();
+                    gathered_bytes += rows.values().map(|bytes| bytes.len() as u64).sum::<u64>();
+                    if rows.is_empty() {
+                        continue;
+                    }
+                    if progress.is_none() {
+                        progress =
+                            Some(recovery_progress::Progress::load(self, dead, &mut beat).await?);
+                    }
+                    let started = mono_ms();
+                    count += self
+                        .upload_gathered(rows, Some((dead, &mut beat, progress.as_mut().unwrap())))
+                        .await?;
+                    upload_ms += mono_ms().saturating_sub(started);
+                }
             }
             // The record is re-read for the token the beats moved.
             let mut sealed = false;
@@ -5637,6 +5678,15 @@ impl NodeLogManager {
         }
     }
 
+    /// Followers in the installed ensemble, whether or not it is active.
+    fn ensemble_width(&self) -> usize {
+        self.inner
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map_or(0, |shipper| shipper.members.len())
+    }
+
     pub fn healthy(&self) -> bool {
         self.inner
             .lock()
@@ -5668,7 +5718,14 @@ impl NodeLogManager {
         if self.task_stop.is_stopped() {
             return Ok(());
         }
-        if self.healthy() {
+        // A healthy ensemble below the recruitment target still reads peers.
+        // Returning on `healthy` alone kept a one-follower ensemble at one
+        // forever, because one follower is healthy: a third node that was not
+        // live when the ensemble formed never joined, and the acknowledged
+        // tail had one witness on a three-node fleet (denoland/celld#245).
+        // The width check below returns before any change when no further
+        // peer is eligible, so the cost is one peer listing per tick.
+        if self.healthy() && self.ensemble_width() >= RECRUIT_FOLLOWERS {
             return Ok(());
         }
         // Self-suspicion parks recruitment: opening epochs into our own
@@ -5695,10 +5752,9 @@ impl NodeLogManager {
             // latency rule can judge it again and the swap rate cap is what
             // bounds flapping.
             .filter(|peer| !self.health.lock().unwrap().quarantined(&peer.node, mono))
-            // Recruit up to two followers — three copies — while the ensemble
-            // may serve on one. Replication factor and the in-sync floor are
-            // separate numbers.
-            .take(2)
+            // Replication factor and the in-sync floor are separate numbers:
+            // recruit to the target, serve on one.
+            .take(RECRUIT_FOLLOWERS)
             .map(|peer| Member {
                 node: peer.node,
                 addr: peer.addr,
@@ -5977,27 +6033,15 @@ impl NodeLogManager {
             }
         }
         drop(fetches);
-        // Bundles whose bytes this pass read and could not use. They are
-        // declared together below, before the scan answers, so no caller
-        // proceeds past an undeclared loss.
-        let mut unreadable: BTreeMap<String, (String, Vec<celld_ltx::bundle::BundleRow>)> =
-            BTreeMap::new();
         let mut bundles = Vec::new();
         for (key, item) in fetched {
             let (rows, bytes) = match item {
-                Fetched::Payload(bytes) => match celld_ltx::bundle::decode_rows(&bytes) {
-                    Ok(rows) => (rows, Some(bytes)),
-                    // The envelope is unreadable, so the object no longer
-                    // says what it held and the declaration cannot name a
-                    // row. Skipping it instead reported a bundle with no
-                    // rows, which seals over whatever it carried.
-                    Err(error) => {
-                        unreadable
-                            .entry(key)
-                            .or_insert_with(|| (error.to_string(), Vec::new()));
-                        continue;
-                    }
-                },
+                Fetched::Payload(bytes) => {
+                    let rows = celld_ltx::bundle::decode_rows(&bytes).with_context(|| {
+                        format!("decode retained bundle {key}; fold remains pending")
+                    })?;
+                    (rows, Some(bytes))
+                }
                 Fetched::Indexed(rows) => (rows, None),
             };
             bundles.push((key, rows, bytes));
@@ -6063,102 +6107,19 @@ impl NodeLogManager {
                     let Some(bytes) = bytes.as_ref() else {
                         continue;
                     };
-                    match celld_ltx::bundle::slice(bytes, &row) {
-                        Ok(payload) => {
-                            uncovered
-                                .entry((row.cell.clone(), row.cell_epoch, row.txid))
-                                .or_insert_with(|| payload.to_vec());
-                        }
-                        // The envelope decoded, and this row does not lie
-                        // inside the object. The row reached here only
-                        // because the per-cell layout does not cover it, so
-                        // this is one acknowledged row with no remaining
-                        // bucket copy, and the declaration can name it.
-                        Err(error) => {
-                            let entry = unreadable
-                                .entry(key.clone())
-                                .or_insert_with(|| (error.to_string(), Vec::new()));
-                            entry.1.push(row);
-                        }
-                    }
+                    // An unreadable bucket copy is not proof that the owner
+                    // disk or a follower has lost the row. Refuse the fold
+                    // rather than certifying a gap by declaring automatic loss.
+                    let payload = celld_ltx::bundle::slice(bytes, &row).with_context(|| {
+                        format!("read retained bundle {key}; fold remains pending")
+                    })?;
+                    uncovered
+                        .entry((row.cell.clone(), row.cell_epoch, row.txid))
+                        .or_insert_with(|| payload.to_vec());
                 }
             }
         }
-        // Declare before answering. A caller that seals or restores on this
-        // answer must do it against a durable record of what was lost.
-        for (key, (reason, rows)) in unreadable {
-            self.declare_bundle_loss(&key, &rows, &reason).await?;
-        }
         Ok(uncovered)
-    }
-
-    /// Record a retained bundle that this session wrote and cannot read
-    /// back.
-    ///
-    /// The scan reads `log/<session>/bundle/` only, so the writer is this
-    /// process running this binary. Bytes that do not decode are therefore
-    /// corruption, not a newer envelope this reader does not know, and no
-    /// retry and no other reader can do better. That leaves a permanent
-    /// refusal or a record. A refusal wedges every activation waiting on
-    /// the fold, so the loss becomes a record and the scan continues --
-    /// the shape the amnesiac ensemble already uses, and the reason "loss
-    /// is a record, never a prompt" is a rule here.
-    ///
-    /// `rows` names what was lost when one row failed to slice out of an
-    /// envelope that decoded. It is empty when the envelope itself was
-    /// unreadable, because the object then no longer says what it held.
-    ///
-    /// The record sits beside `log/<session>/`, never inside its `bundle/`
-    /// subtree, so no bundle listing tries to decode a declaration.
-    async fn declare_bundle_loss(
-        &self,
-        key: &str,
-        rows: &[celld_ltx::bundle::BundleRow],
-        reason: &str,
-    ) -> anyhow::Result<()> {
-        if !self
-            .declared_bundle_losses
-            .lock()
-            .unwrap()
-            .insert(key.to_string())
-        {
-            return Ok(());
-        }
-        let name = key.rsplit('/').next().unwrap_or(key);
-        let record = format!("log/{}.bundle-{name}.loss.json", self.session);
-        let body = serde_json::json!({
-            "session": self.session,
-            "bundle": key,
-            "declared_at_ms": crate::ownership_store::now_ms(),
-            "declared_by": self.node,
-            "reason": reason,
-            "rows": rows
-                .iter()
-                .map(|row| {
-                    serde_json::json!({
-                        "cell": row.cell,
-                        "cell_epoch": row.cell_epoch,
-                        "txid": row.txid,
-                    })
-                })
-                .collect::<Vec<_>>(),
-            "note": "a retained bundle this session wrote could not be read \
-                     back; an acknowledged row it carried that the per-cell \
-                     layout does not cover is unrecovered",
-        });
-        if let Err(error) = self.bucket.put(&record, serde_json::to_vec(&body)?).await {
-            // The scan must not answer until the record is durable, so a
-            // failed declaration un-latches and the next pass retries it.
-            self.declared_bundle_losses.lock().unwrap().remove(key);
-            return Err(error.context(format!("declare the unreadable bundle {key}")));
-        }
-        warn!(
-            bundle = key,
-            reason,
-            rows = rows.len(),
-            "declared a retained bundle this session cannot read back"
-        );
-        Ok(())
     }
 
     /// Does the ownership record still name this node at `epoch`? Epoch GC
@@ -6185,15 +6146,20 @@ impl NodeLogManager {
         };
         let resident: BTreeSet<(String, u64)> = self.ltx.resident_epochs().into_iter().collect();
         let now = mono_ms();
-        // The longest-waiting cells go first, so a set of cells that never
-        // decide anything cannot hold the pass's budget ahead of the rest.
+        // The cells that have been due longest go first. A cell this pass
+        // sees for the first time is due from now, so it queues behind every
+        // overdue cell and ages like them. Due time 0 for an unseen cell put
+        // a node that gains more than `EPOCH_GC_CELLS_PER_PASS` cells per
+        // tick ahead of every overdue cell for as long as the arrivals lasted.
+        // Stamping `now` without recording it would restart the
+        // wait of an unexamined cell on every pass, so the stamp is kept.
         let due: Vec<(String, u64)> = {
             let mut schedule = self.epoch_gc_due.lock().unwrap();
             schedule.retain(|key, _| resident.contains(key));
             let mut due: Vec<(u64, (String, u64))> = resident
                 .into_iter()
                 .filter(|(cell, _)| !crate::engine_api::is_facet_cell(cell))
-                .map(|key| (schedule.get(&key).copied().unwrap_or(0), key))
+                .map(|key| (*schedule.entry(key.clone()).or_insert(now), key))
                 .filter(|(at, _)| *at <= now)
                 .collect();
             due.sort();
@@ -6469,16 +6435,29 @@ impl NodeLogManager {
 /// gray-follower detection cannot wait thirty seconds when one slow fsync
 /// tail is every ack's tail, so verdicts poll at a sub-second cadence and
 /// an eviction repairs the ensemble immediately.
+///
+/// Without `fleet`, the tick runs only epoch GC, and no eviction watch
+/// starts. A bucket node installs no registration, so it has no ensemble
+/// to recruit or repair, no bundles to collect, and no posture to watch.
+/// Its acks wait for per-cell uploads, so its restore chain base already
+/// holds every acknowledged row when epoch GC deletes below it. A fleet
+/// predecessor's follower-only rows reach the bucket before this node can
+/// hold the cell: the boot runs `recover_self` before it builds the owner
+/// and starts this loop, and a takeover runs `ensure_recovered` before the
+/// restore. The actor reaches that interlock through the manager in every
+/// posture, so neither step depends on the fleet phases here.
 fn spawn_maintenance(
     manager: Arc<NodeLogManager>,
     stop: crate::ltx_repl::StopToken,
     roots: &crate::ltx_repl::TaskGroup,
+    fleet: bool,
 ) {
     let maintenance_manager = Arc::downgrade(&manager);
     let watcher = Arc::downgrade(&manager);
     let maintenance_stop = stop.clone();
     roots.spawn_owned("node_log_maintenance", async move {
-        let mut tick = crate::asyncrt::interval(std::time::Duration::from_secs(30));
+        let mut tick =
+            crate::asyncrt::interval(std::time::Duration::from_millis(LOG_MAINTENANCE_TICK_MS));
         tick.set_missed_tick_behavior(crate::asyncrt::MissedTickBehavior::Delay);
         loop {
             crate::asyncrt::select_biased! {
@@ -6498,12 +6477,14 @@ fn spawn_maintenance(
             // archaeology session. The pass still runs to completion —
             // this observes, it does not cancel: an aborted maintenance
             // phase could orphan a half-installed ensemble.
-            for (phase, work) in [
-                ("maintain", manager.maintain().boxed()),
-                ("dead-leader sweep", manager.sweep_dead_leaders().boxed()),
-                ("bundle GC", manager.gc_bundles().boxed()),
-                ("epoch GC", manager.gc_superseded_epochs().boxed()),
-            ] {
+            let mut phases = Vec::with_capacity(4);
+            if fleet {
+                phases.push(("maintain", manager.maintain().boxed()));
+                phases.push(("dead-leader sweep", manager.sweep_dead_leaders().boxed()));
+                phases.push(("bundle GC", manager.gc_bundles().boxed()));
+            }
+            phases.push(("epoch GC", manager.gc_superseded_epochs().boxed()));
+            for (phase, work) in phases {
                 let started = mono_ms();
                 let mut work = work;
                 loop {
@@ -6528,6 +6509,9 @@ fn spawn_maintenance(
             }
         }
     });
+    if !fleet {
+        return;
+    }
     roots.spawn_owned("node_log_posture_watch", async move {
         let mut tick = crate::asyncrt::interval(std::time::Duration::from_millis(250));
         tick.set_missed_tick_behavior(crate::asyncrt::MissedTickBehavior::Delay);
@@ -6859,30 +6843,16 @@ impl NodeLogManager {
                 }
             };
             let mut tail = match self
-                .post_tail(
-                    member,
-                    &addr,
-                    &TailReq {
-                        leader: self.session.clone(),
-                    },
-                )
+                .fetch_tail(member, &addr, &self.session, None, None)
                 .await
             {
-                Ok(TailReply::Ranged(tail)) => tail,
-                Ok(TailReply::Legacy { .. }) => {
-                    warn!(
-                        cell,
-                        member, "live-session fold received a legacy tail without range evidence"
-                    );
-                    continue;
-                }
+                Ok(tail) => tail,
                 Err(error) => {
                     warn!(cell, member, %error, "live-session fold could not read a follower tail");
                     continue;
                 }
             };
-            tail.entries.sort_by_key(|entry| entry.seq);
-            let range = tail.range;
+            let range = tail.range.expect("a transferred tail has range evidence");
             if range.fragment_epoch != record.epoch {
                 warn!(
                     cell,
@@ -6893,7 +6863,7 @@ impl NodeLogManager {
                 );
                 continue;
             }
-            if range.complete && tail_covers_sealed_range(range.base, range.end, &tail.entries) {
+            if range.complete {
                 complete_witnesses += 1;
             } else {
                 warn!(
@@ -6905,13 +6875,15 @@ impl NodeLogManager {
                     "live-session fold rejected an incomplete follower tail"
                 );
             }
-            for entry in tail.entries {
-                if entry.cell != cell {
-                    continue;
+            while let Some(entries) = tail.next()? {
+                for entry in entries {
+                    if entry.cell != cell {
+                        continue;
+                    }
+                    gathered
+                        .entry((entry.cell, entry.cell_epoch, entry.txid))
+                        .or_insert(entry.bytes);
                 }
-                gathered
-                    .entry((entry.cell, entry.cell_epoch, entry.txid))
-                    .or_insert(entry.bytes);
             }
         }
         // Activation is durable before the epoch's first fleet credit. An

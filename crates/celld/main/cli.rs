@@ -39,6 +39,7 @@ pub(crate) enum Action {
     Dev(Vec<String>),
     Cell(Vec<String>),
     D1(Vec<String>),
+    Disk(Vec<String>),
     Kv(Vec<String>),
     Queue(Vec<String>),
     R2(Vec<String>),
@@ -76,6 +77,7 @@ pub(crate) fn action_from_process() -> anyhow::Result<Action> {
             "dev" => return Ok(Action::Dev(arguments)),
             "cell" => return Ok(Action::Cell(arguments)),
             "d1" => return Ok(Action::D1(arguments)),
+            "disk" => return Ok(Action::Disk(arguments)),
             "kv" => return Ok(Action::Kv(arguments)),
             "queue" => return Ok(Action::Queue(arguments)),
             "r2" => return Ok(Action::R2(arguments)),
@@ -244,8 +246,7 @@ pub(crate) fn action_from_process() -> anyhow::Result<Action> {
         anyhow::ensure!(
             !settings.control_plane
                 && settings.bucket.as_deref() == Some("celld-dev")
-                && settings.endpoint.is_none()
-                && settings.advertise.is_none(),
+                && settings.endpoint.is_none(),
             "the internal development store requires the celld dev node configuration"
         );
     }
@@ -270,6 +271,7 @@ USAGE:
   celld deploy [PROJECT] --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS]
   celld dev [PROJECT] [--host IP] [--port PORT] [--logs]
   celld cell list [CLASS] --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS]
+  celld disk check DATA_DIR --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS]
   celld cell gc --dry-run [CLASS] --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS]
   celld d1 migrations apply DATABASE [PROJECT] --bucket [s3://|gs://|az://]NAME[/PREFIX]
   celld d1 execute DATABASE --command SQL [PROJECT] --bucket [s3://|gs://|az://]NAME[/PREFIX]
@@ -335,6 +337,8 @@ ENVIRONMENT:
                                   X-Forwarded-Proto
   CELLD_NODE                      Node-session ID (default: generated)
   CELLD_WATCH                     Local SQLite/replication working directory
+  CELLD_MONITOR                   `1` enables the read-only Rust/WASM monitor
+                                  on the internal listener (on by default in dev)
   CELLD_ESBUILD                   Override esbuild executable path
   CELLD_ACTIVATIONS               Concurrent cold activations
   CELLD_ASSET_CACHE_DIR           Downloaded static-asset cache directory
