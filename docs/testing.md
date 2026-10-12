@@ -154,7 +154,10 @@ and epoch matching, live-lease rejection, newer bucket-only commits, LTX
 growth/truncation and gaps, cache damage/restart, prepared-image budgets, and
 bounded canonical seeding when the first observed entry is a delta. A missing
 canonical baseline also withholds delta publication, preventing GC watermarks
-from advancing over a hole:
+from advancing over a hole. Seed regressions exercise a nonempty checkpoint
+queue, writes arriving during the canonical download, replay gap/checksum
+rejection, peak disk-budget enforcement across growth and truncation, and an
+in-flight seed racing fragment replacement:
 
 ```sh
 cargo test -p celld --lib hot_recovery
@@ -326,6 +329,412 @@ asserted **zero hot promotions** after the correlated restart, then verified
 all main/auxiliary data, five SQLite backups, GC, and retirement again. Artifacts:
 `celld-hot-slow-witness-2/`; its report records the tested binary's SHA-256.
 
+### Hot follower disappearance/rejoin on RustFS (2026-10-12)
+
+```sh
+python3 scripts/hot-follower-rejoin-smoke.py \
+  --endpoint http://127.0.0.1:19000 --down-seconds 60
+```
+
+This launches three real same-version processes in one synthetic `gpu` placement
+pool against an isolated RustFS bucket. After both followers are hot, four
+clients continuously write unique 16 KiB SQLite rows, targeting 20 writes/second.
+One confirmed follower is SIGKILLed, kept down for a minute, and restarted on
+the same address, identity, and recovery disk. The owner is never restarted.
+
+The final debug-build run passed with **2,573 acknowledged rows, zero request
+errors, and no missing or corrupt acknowledged payloads**. The stopped follower
+was absent for 60.27 seconds; **1,180 writes** completed during that measured
+window. The surviving owner's ensemble shrank to one follower in **4.32 seconds**
+and returned to two followers **27.81 seconds** after restart began (including
+1.84 seconds of startup). That wait reflects the normal 30-second recruitment
+cadence, not a cell ownership transfer.
+
+The restarted node rebuilt a SQLite image through the pre-restart canonical
+TXID by **30.12 seconds**, while writes continued. At that observation its image
+was at TXID 1,786 and its checkpoint was at 1,762: materialization is not the same
+as hot-promotion readiness. Advisory readiness was first sampled around **31.2
+seconds** after restart. At the end of a further 15-second restored-load window,
+both images and checkpoints reached TXID 2,049 and both checkpoint queues were
+empty. The final readiness check needed only 3 ms after traffic stopped.
+
+All 2,573 payloads matched independent client SHA-256 digests through **each of
+the three ingress nodes** and in copies of **both private standby databases**;
+both copies passed SQLite `quick_check`. The cell stayed on `gpu-a`, epoch 1,
+across 128 sampled ownership records and the phase-boundary checks. One operator
+probe failed during restart; this was a sampling error, not a workload error.
+Overall write latency was p50 **41.0 ms**, p95 **94.0 ms**, p99 **278.4 ms**, and
+maximum **595.2 ms**. These local debug timings are not production targets.
+
+This workload exposed and now regression-tests two seed-liveness problems:
+waiting for an empty checkpoint queue under continuous writes, and discarding
+a downloaded seed whenever its expected TXID moved. The worker now seeds after
+a published prefix and replays the existing bounded queued tail without falsely
+crediting its bucket coverage. Image-incarnation fencing also prevents a stale
+seed/failure from overwriting or discarding a replacement cache. Gap/checksum,
+promotion-range, canonical-prefix, and peak disk-budget checks remain enforced.
+
+Artifacts are retained in the platform temp `opencode` directory:
+
+- Passing run: `celld-hot-follower-rejoin-m8p7ec6y/`, bucket
+  `celld-follower-rejoin-13567bd000a2`. The report records binary SHA-256, events,
+  phase latency/error counts, rejoin timings, and copied standby evidence.
+- Initial pre-fault seed-starvation failure: `celld-hot-follower-rejoin-wpm8wg8t/`.
+- Intermediate outage/rejoin run with checkpoint lag and a failed strict
+  readiness-under-load gate: `celld-hot-follower-rejoin-2lyb74y5/`.
+
+All test-owned processes were stopped; existing demos were not redeployed or
+restarted. This qualifies a same-version follower crash/rejoin under this local
+workload, **not** mixed-version rolling upgrades, physical GPU execution,
+unlimited checkpoint throughput, or live S3/GCS/Azure provider behavior.
+
+### 4 GiB follower disappearance/rejoin on RustFS (2026-10-12)
+
+```sh
+python3 scripts/hot-follower-rejoin-smoke.py \
+  --binary /path/to/celld --preload-mib 4096 --standby-mb 8192 \
+  --down-seconds 60 --after-seconds 30 --warmup-timeout 600 \
+  --rejoin-timeout 900 --checkpoint-timeout 900
+```
+
+The same-version local debug run passed with **4 GiB of incompressible imported
+application data** (262,144 rows), followed by **15,035 acknowledged 16 KiB
+writes, zero request errors, and no missing or corrupt acknowledged data**.
+Preload took 694.01 seconds. All **277,179 acknowledged rows** matched the
+independent client SHA-256 receipts through every ingress and in both copied
+standby databases; both copies passed full SQLite `integrity_check`. Each final
+standby occupied 4,683,649,024 bytes (4.36 GiB). The owner stayed `gpu-a`, epoch 1,
+across 1,574 ownership samples and the phase-boundary checks.
+
+The follower was down for 61.19 seconds before restart began. The ensemble shrank
+in **3.33 seconds**, returned to two followers **17.03 seconds** after restart
+began, but rebuilding through the pre-restart canonical TXID took **688.91
+seconds** while writes continued. At that point the rebuilt image was at TXID
+17,033, with checkpoint coverage only through 14,963 and `ready=false`. After
+another 30-second write window, both caches again reported `ready=false` and
+nonempty queues. They became fully checkpointed **107.46 seconds after writes
+stopped**, through TXID 17,807, with both queues empty. This is a data-integrity
+and eventual-readiness pass, **not continuous hot-promotion readiness**.
+
+Overall write latency was p50 **47.77 ms**, p95 **114.78 ms**, p99 **456.91 ms**,
+maximum **2,857.28 ms**. Sampled total-process RSS peaked at **8.40 GiB on the
+owner** during rejoin, versus about **302 MiB during preload** and **249 MiB on
+each follower** during the later rebuild. The owner-memory spike and long image
+rebuild are unresolved scalability limits; bounded follower seed streaming does
+not imply bounded owner checkpoint/compaction memory. These measurements are
+sampled process RSS, not per-cell memory or production latency targets. Twelve
+operator probes timed out during rejoin; none were workload request failures.
+Minimum sampled host free space stayed above 33.53 GiB after the earlier cleanup.
+
+Artifacts: `celld-hot-follower-rejoin-wip8q3ia/`, bucket
+`celld-follower-rejoin-ad7c61c2e25c`, in the platform temp `opencode` directory.
+The source report records binary SHA-256
+`49539482fbf96cea17668e7a4b6fd0fe799c24df8f6bbf523d16b584e0749a31`.
+Reports, receipt ledgers, samples, logs, and both verification copies are retained.
+All test-owned processes stopped. This case does **not** establish owner hot
+failover; `scripts/hot-owner-failover-smoke.py` separately kills the actual owner
+and reuses only this stopped, passing suite-owned dataset.
+
+### Owner-crash harness setup regression (2026-10-12)
+
+The first reuse of the passing 8 MiB follower dataset timed out **before any
+owner fault or new workload write**. Both followers had joined, but the harness
+required the owner's wire `log.active` flag before sending its seed write.
+That legacy wire name means **may_have_fleet_acks**, not shipper liveness; a
+read-only activation cannot set it. Fragment repair resets the flag as well,
+as the second setup attempt (`celld-hot-owner-failover-3ys65w4e/`) demonstrated.
+Recruitment gates now require an open two-follower ensemble, not acknowledgement
+history; the measured faults retain the full checkpoint/image gates. A regression
+asserts read-only recruitment, missing-member rejection, and sealed-log
+rejection. No production Rust change was needed for this setup failure.
+Artifacts: `celld-hot-owner-failover-jldu7vvl/`; this failed setup is not an
+owner-recovery qualification result.
+
+### Small owner-crash validation and eager-restore limit (2026-10-12)
+
+The first actual checkpointed owner kill (`celld-hot-owner-failover-ia57jc3j/`)
+recovered the latest acknowledged row in **4.49 seconds**, but correctly used
+**cold** recovery: 2 peer-tail requests and 9,336,597 response-wire bytes, with
+no hot certification/promotion. The caches advertised `ready=true` through TXID
+9, while the owner's canonical bucket chain was newer. Bucket-only acknowledgements
+had outrun the observed follower image during fragment degradation. The harness
+now compares cache coverage with the owner's actual epoch-scoped local LTX
+position and checks the latest acknowledged row inside each quiet standby.
+Cache-local advisory readiness alone is never sufficient evidence.
+
+Sparse catch-up writes still could not stabilize the default eager-restore
+case (`celld-hot-owner-failover-v1o3kh9u/`): **108 additional writes were
+acknowledged**, but the log repeatedly reconfigured (38 rotations in roughly
+three minutes), and the strict checkpoint gate timed out **before the next
+owner fault**. A restored eager baseline's full snapshot repeatedly exceeded
+the debug deployment's append/stall envelope while synchronous standby page
+materialization delayed replies. This path remains an unresolved performance
+limit; no lease deadline or safety check was weakened to obtain a pass.
+
+The path-matching rerun used **`--paged-min-mib 1`**, explicitly selecting the
+paged restore path that the 4 GiB dataset selects at the default 256 MiB
+threshold. It reused the original 8 MiB incompressible preload plus the existing
+rows and all acknowledged receipts from prior attempts; it did not replay
+ambiguous request IDs. This is **not a pass for the small eager-restore default**.
+Both actual owner SIGKILL cases passed:
+
+| Case | Crash-to-first-verified-read | Path | Cold peer-tail requests / bytes | Known acknowledged rows checked through all 3 nodes |
+| --- | ---: | --- | ---: | ---: |
+| Checkpointed | 3.398 s | Hot | 0 / 0 | 2,727 |
+| Continuous writes | 3.698 s | Hot | 0 / 0 | 2,931 |
+
+Each case emitted one certification and one promotion before the recovered
+read, advanced ownership (`gpu-a/e7` → `gpu-b/e8` → `gpu-a/e9`), verified every
+original import digest and acknowledged subsequent row through both survivors
+and the returning old owner, and checked the returning owner's fence and SQLite
+`quick_check`. Sampled owner epochs showed one owner each. The final rebuild
+marker was also verified through all nodes (2,932 known acknowledged rows total).
+The continuous case attempted 264 requests: **203 acknowledged, 61 failed**;
+the failure window was not described as zero-error availability. Checkpointed
+warmup/resumed traffic acknowledged 99/98 writes without errors.
+
+Sampled promoted-node RSS peaked at **92.77 MiB** in the checkpointed fault and
+**97.47 MiB** in the continuous fault. Later bounded 8 MiB response verification
+peaked at **416.16 MiB**, so these are phase-specific process measurements, not
+a universal memory cap. Minimum sampled host free space stayed above 37.97 GiB.
+Artifacts: `celld-hot-owner-failover-hxbdwsel/`, reusing bucket
+`celld-follower-rejoin-9736bef5bc71`. All its processes stopped. The separate
+4 GiB owner suite uses **no paged-threshold override**; its results must be
+reported independently rather than inferred from this small validation.
+
+### Multi-GiB seed scan lock regression (2026-10-12)
+
+The first 4 GiB owner suite (`celld-hot-owner-failover-cykdia85/`) built both
+4.36 GiB standbys, then timed out after **900 seconds of checkpoint catch-up,
+before either owner was killed**. Warmup acknowledged 182 writes and sparse
+catch-up acknowledged another 713, with zero workload request errors. The
+retained ledger includes the setup marker and all **278,075** known acknowledged
+rows. The log opened 10 ensembles, operator cache probes timed out, sampled RSS
+stayed below 0.36 GiB per process, and minimum sampled host free space was 37.08
+GiB. This is a failed readiness qualification, not an owner-failover result.
+
+Inspection found a separate mutex-liveness bug: installing a downloaded seed
+re-read and checksummed the whole multi-GiB file **while holding the cache
+mutex**. The deterministic regression pauses that scan and demonstrates blocked
+status/append observations before the fix. The scan now runs outside the mutex,
+then rechecks the exact image incarnation, current queued tail, and peak disk
+budget before installation. Replayed jobs still need bucket coverage. A second
+regression changes fragments during the scan and proves its obsolete result
+cannot overwrite or discard the replacement image. All 73 celld library/binary
+tests and 13 Python harness regressions passed after this change.
+
+The old test binary was retained; the rebuilt binary SHA-256 is
+`83fa1f302ecfea6a43310d44ca10a4b4d7acc72d28e80b431e89db94a13d04ba`.
+Reusing a dataset with another binary now requires **`--binary-change-reason`**;
+reports record that reason and the source/execution hashes. Every process in
+each rerun uses the same rebuilt binary. This is not a mixed-version rollout
+qualification. Prior-attempt receipt ledgers are supplied with `--previous-state`.
+
+The corrected binary passed the small paged-path validation again
+(`celld-hot-owner-failover-cp9n5am6/`, `--paged-min-mib 1`): checkpointed hot
+recovery **3.703 s**, continuous-write hot recovery **3.615 s**, one certification
+and promotion per case, **zero cold peer-tail requests/bytes**, all acknowledged
+digests through three ingresses, and both returning owners fenced. The final
+marker brought the checked total to 3,332 rows. Continuous traffic acknowledged
+200 of 257 requests (57 failed during the fault window). The default small
+eager-restore limit remains unqualified. The 4 GiB rerun is separate and uses
+no restore-threshold override; moving this scan alone did not prove its complete
+readiness/recovery loop. The subsequent outcomes are recorded below.
+
+### Slow hot-preparation / recovery-sweep race (2026-10-12)
+
+With the seed-scan lock fix, the 4 GiB rerun
+(`celld-hot-owner-failover-ui0bp11n/`) reached exact owner/standby coverage at
+TXID **18,848**, with both queues empty and the latest acknowledged row present
+in each private image. It acknowledged 186 warmup writes without errors, then
+SIGKILLed `gpu-a/e3`. The verified latest row returned through `gpu-b/e4` in
+**26.773 seconds**, but the required hot gate failed: **one certification,
+zero promotions**, and **one cold-tail request / 19,084 response-wire bytes**.
+The full post-fault digest verification, old-owner return, and continuous-write
+case were **not reached**. The ledgers retain 278,262 known acknowledged rows;
+this run does not claim all those rows were reverified after its fault.
+
+The trace showed the eager whole-session sweep sealing the session while the
+cell's hot preparation was still verifying the multi-GiB image. A retry/cold
+activation consumed the absent promotion before its late certificate was
+installed. The paused-preparation regression reproduced this ordering: the
+session became `Sealed` and the retry bypassed the pending hot preparation.
+
+Hot preparation now shares the existing **session recovery single-flight lock**.
+Retries wait, then reuse only an unexpired prepared image matching the exact
+session generation, log fragment epoch, and cell epoch. Same-process eager
+sweeps skip that in-flight session rather than gathering a cold tail underneath
+the certificate. The regression passes with zero peer pages and a retained
+usable promotion. Operation deadlines, lease/CAS checks, checksum validation,
+canonical/bundle proofs, and certificate expiry were **not relaxed**.
+
+The rebuilt binary SHA-256 is
+`dab6b184f7e5d0136993572d7a9b37de0497a6aebb07c7de257e7c2f5cc5a21c`.
+All **74 celld library/binary tests**, **13 Python regressions**, formatting,
+and Clippy (`monitor-ui`, all targets, `-D warnings`) passed. The small paged-path
+rerun (`celld-hot-owner-failover-fhpk9l6x/`, explicit `--paged-min-mib 1`) also
+passed both actual owner crashes: **3.943 s checkpointed**, **3.511 s continuous**,
+one certification/promotion each, zero cold peer-tail traffic, all acknowledged
+digests through every ingress, and returning-owner fences. Its final checked
+total was 3,737 rows. Continuous traffic acknowledged 202 of 257 requests
+(55 failed in the fault window). All small-run processes stopped. The separate
+4 GiB original-scenario rerun retains both prior large-attempt ledgers and uses
+the default restore threshold; its independent outcomes are recorded below.
+
+### 4 GiB owner crash outcomes: hot pass, busy verification incomplete (2026-10-12)
+
+The next default-threshold RustFS run
+(`celld-hot-owner-failover-9_aql7mx/`, binary `dab6b184…`) passed the actual
+**checkpointed 4 GiB owner SIGKILL**:
+
+- Both images matched the owner's captured TXID **19,038**, with checkpoint
+  coverage and empty queues; each image occupied 4,705,312,768 bytes.
+- Ownership advanced **`gpu-a/e5` → `gpu-b/e6`**. The first verified recovered
+  read completed in **25.621 seconds**, after one hot certification and one
+  hot promotion, with **zero cold peer-tail requests or response-wire bytes**.
+- All **278,757 known acknowledged rows** matched independent client digests
+  through both survivors and the restarted old owner. The returning owner
+  remained fenced; the current owner stayed `gpu-b/e6`, and SQLite `quick_check`
+  returned `ok`. Warmup/resumed traffic acknowledged **197 / 296** writes with
+  no request errors in those windows.
+- Sampled promoted-node RSS peaked at **89.78 MiB during the fault**, and
+  **676.33 MiB during subsequent full verification**. The slow checksum proof
+  and local debug timings are not production latency targets. Verification
+  through the promoted node took about 15 minutes; it is separate from the
+  first recovered read.
+
+The **continuous-write owner crash was not a complete qualification pass**.
+It advanced **`gpu-b/e6` → `gpu-a/e7`** and verified the latest pre-crash
+acknowledged row in **9.723 seconds via cold recovery** (one tail request,
+20,838 response-wire bytes; no hot certificate/promotion). Both standby images
+were unready before this fault, with nonempty queues, so no hot-ready claim is
+made. Traffic attempted 535 requests: **456 acknowledged, 79 failed**, including
+the fault's unavailability window. There were **279,214** known acknowledged
+rows when writes stopped.
+
+All original 4 GiB preload digests passed on the recovered ingress before the
+subsequent small tail-row verifier timed out on a **15-second implicit HTTP
+deadline**. No digest mismatch or missing row was reported, but the remainder
+of the acknowledged tail, other ingresses, and second returning-owner fence
+were **not fully verified**. The original report remains `passed=false`.
+Cold fault RSS peaked at **463.05 MiB**, later verification at **1,061.84 MiB**;
+minimum sampled host free space was **24.45 GiB**, with no reserve violation.
+The full digests are not inferred from the successful first recovered read.
+
+Cleanup then exposed a **separate paged-hydrator null-pointer abort** on
+`gpu-a`, at `crates/ltx/src/paged_vfs.rs`: VFS unregistration raced a repeated
+name lookup inside the page loop. All suite processes subsequently stopped;
+the failure, receipt ledgers, samples, and logs remain retained.
+
+### Hydrator retirement and post-restart audit (2026-10-12)
+
+A subprocess regression reproduces the exact non-unwinding abort by retiring
+the registration between its initial lookup and next page iteration. The
+hydrator now uses the registration **pinned by its own open main file**, rather
+than repeatedly looking it up by name, and treats retirement as a controlled
+`vfs is gone` error. The same subprocess test passes and also checks normal
+hydration progress. This fixes the observed shutdown race, not the separate
+large-data read-latency limit.
+
+Verification reads now use explicit deadlines: **60 seconds** in the follower
+suite and **120 seconds** consistently for both preload and tail in the owner
+suite. Owner verification records every requested range and receive/failure in
+`verification-reads.jsonl`; workload write deadlines and all recovery safety
+checks remain unchanged. The owner report now records cleanup return codes and
+requires clean zero exits: self-fencing, aborts/segfaults, forced cleanup kills,
+or cleanup errors cannot make a passing report. Failed reports are not rewritten.
+
+The rebuilt binary SHA-256 is
+`77b49dbe0512aaf536c79c11e78e9781c27e29452b6bc4d33705e3f0cba94f1e`.
+All **75 celld library/binary tests**, **20 Python regressions**, formatting,
+and Clippy for `celld` and `celld-ltx` (all targets, `-D warnings`) passed. Small
+post-restart verification (`celld-hot-owner-failover-ps9g1_78/`, explicit paged
+threshold) checked all 3,737 known acknowledged rows through every node and
+SQLite `quick_check`; all three process cleanup return codes were zero.
+Additional verifier regressions cover a shared preload/tail deadline, precise
+timeout range logging with no hidden retries, and a checkpointed hot gate that
+rejects even a cold-tail request returning zero response bytes.
+
+`--verification-only`, with every relevant `--previous-state`, starts a stopped
+suite-owned dataset and checks all prior client receipts **without new workload
+writes or owner faults**. Its report mode is `post_restart_verification`, not
+`owner_faults`. The first large audit (`celld-hot-owner-failover-dnu820xk/`)
+failed **before any verification**: startup waited 900 seconds for `gpu-a`'s
+Worker health before launching `gpu-b`/`gpu-c`. The predecessor required its
+original witness `gpu-c`; production recovery correctly refused to seal or
+discard acknowledged writes with that witness offline. The process was stopped
+by the startup failure handler, and no suite processes were left running. This
+is a harness startup-order failure, not a digest result or relaxed recovery.
+
+The regression now exercises the real measured-node construction/start path
+with readiness dependent on launching all three peers; it failed with that
+same dependency before the fix. Fleet startup now launches **all three peer
+listeners before waiting for any Worker health**. Individual returning-owner
+startup still waits synchronously, and failed readiness leaves all launched
+nodes available to the report's cleanup loop. The sampler also starts before
+fleet boot so startup failures retain resource evidence. Small live verification
+(`celld-hot-owner-failover-uxpwshm6/`) rechecked all 3,737 rows through every
+ingress, with one sampled owner per epoch, `quick_check=ok`, and all cleanup
+return codes zero.
+
+The corrected-startup large audit (`celld-hot-owner-failover-h411qrly/`, same
+binary and default restore threshold) reached `gpu-a/e8` and verification, then
+failed when the node **self-fenced with exit code 3** at its proven 4-second lease
+deadline. It verified **28 preload ranges / 14,336 rows / 224 MiB** before the
+next range (`first=14336`, 512 rows) disconnected after 9.262 seconds. No digest
+mismatch was reported, but none of the remaining preload, acknowledged tail,
+other ingresses, or SQLite `quick_check` was fully verified in this audit.
+It remains `passed=false`; every test process stopped, and the other two
+processes exited zero. Owner RSS peaked at **870.25 MiB**, minimum sampled free
+space was **31.64 GiB**, and no disk-reserve violation occurred.
+
+All three nodes experienced slow/ambiguous renewals in the same interval.
+`gpu-a`'s final CAS attempt returned ambiguous after 1,420 ms with 1,228 ms of
+previous authority remaining; its ambiguity reconciliation did not finish before
+expiry. The watchdog fenced at the expected deadline. Shared bucket/host
+contention is a hypothesis, **not an established root cause**; the retained logs
+do not separate bucket latency from runtime scheduling sufficiently to justify
+a production change. The TTL, attempt bounds, and proof requirements were not
+relaxed to make the audit pass.
+
+The instrumented read-only audit **passed**
+(`celld-hot-owner-failover-y_k7mmij/`) with the **same binary**, 4-second TTL,
+and default restore threshold, retaining every prior large attempt:
+
+- All **279,214 known acknowledged rows** (262,144 preload plus 17,070 tail)
+  matched their original client digests through **all three ingresses**. Each
+  ingress completed 780 bounded read ranges totaling 4,574,642,176 bytes; there
+  were no failed ranges or digest mismatches. These are routed ingress checks
+  of the recovered owner, not three independent local standby-image checks.
+- SQLite `quick_check` returned `ok`. The sampled and final owner stayed
+  **`gpu-a/e9`**, with no conflicting owner in that epoch. All three process
+  cleanup return codes were **zero**, no self-fence/abort occurred, and no
+  suite processes remained running afterward.
+- The first ingress's cold full-data read took **1,926.760 seconds (32.11 min)**;
+  subsequent ingresses took **26.669 / 26.793 seconds** against that hydrated
+  owner. The background fill logged 1,151,863 pages, 6,596 faults, and 1,515
+  steps in 1,928.054 seconds. This substantial cold-read cost remains a
+  performance limit, not a production latency qualification.
+- Sampled owner RSS peaked at **879.23 MiB**, versus **75.80 / 75.53 MiB** for
+  the other processes. Minimum sampled free space was **30.69 GiB**, with no
+  disk-reserve violation. After cleanup, about **35.37 GiB** was free.
+
+The sampler times its existing ownership-object GET (`owner_read_ms`) and
+whole sample collection (`collection_elapsed_ms`) without adding bucket
+requests. Across 933 timed reads, the GET p50/p95/p99/max was
+**4.454 / 9.796 / 22.509 / 59.430 ms**. There were no ambiguous renewals or
+sampling errors in this successful attempt. Collection itself sometimes took
+up to **12.917 seconds**, so resource sampling is not guaranteed 1 Hz. The
+earlier shared-renewal slowdown was **not reproduced or fixed by this retry**;
+its contention cause remains unresolved.
+
+This is complete **post-restart acknowledged-data durability evidence**,
+not a rewrite of either failed audit or the failed continuous-fault report:
+it does **not** establish zero-error availability, resolve contention, or
+complete the original second returning-owner fence. The actual checkpointed
+4 GiB hot failover passed separately; the busy fault still recovered cold and
+its original in-run verification/fencing qualification remains incomplete.
+
 ### What the larger recovery loop exposed
 
 - The whole-tail decoder required the entire certified range in each body.
@@ -346,6 +755,16 @@ all main/auxiliary data, five SQLite backups, GC, and retirement again. Artifact
 The regression workload retains failed runs, including the acknowledgement
 ledger and recovery journals, so these failures remain attributable and
 repeatable rather than disappearing after a successful rerun.
+
+On 2026-10-12, a user-requested space cleanup pruned the large database/payload
+files from the stopped, passing `celld-hot-600m-{1,2}` and completed 600 MiB import
+runs. Their reports, client receipts, logs, fixtures, and per-run
+`cleanup-manifest.json` remain; those older raw database-copy paths are no longer
+available. Three stopped small RustFS follower-test buckets were also removed
+with `bucket-cleanup.json` records. Failed bulk-import evidence, the active 4 GiB
+dataset, live demos, unrelated notes, and the shared build directory were not
+removed. The detailed cleanup audit is `celld-space-cleanup-20261012.json` in the
+platform temp `opencode` directory.
 
 ## Known failure edges
 
