@@ -771,6 +771,193 @@ impl RuntimeManager {
                 .all(|generation| generation.application_progressing(MAXIMUM_TURN_MS))
     }
 
+    /// Resident resources only. Sampling never wakes a dormant cell, waits for
+    /// a busy isolate, or changes any core decision. Keep the registry lock only
+    /// long enough to clone the metadata and counters that own this residency.
+    pub fn monitor_snapshot(&self, query: &crate::monitor::Query) -> celld_monitor::Snapshot {
+        use celld_monitor::{Cell, Isolate, Node, Snapshot};
+        let sampled_unix_ms = crate::monitor::unix_ms();
+        let monotonic_ms = crate::asyncrt::mono_us() / 1_000;
+        let (current, generations) = {
+            let generations = self.generations.read().expect("generation lock poisoned");
+            let current = generations.current.clone();
+            let all = std::iter::once(current.clone())
+                .chain(generations.draining.iter().cloned())
+                .collect::<Vec<_>>();
+            (current, all)
+        };
+        let residents = {
+            let cells = self.cells.lock().expect("cell registry poisoned");
+            cells
+                .starting
+                .iter()
+                .map(|(id, cell)| (id, cell, true))
+                .chain(cells.published.iter().map(|(id, cell)| (id, cell, false)))
+                .filter_map(|(id, cell, starting)| {
+                    Some((
+                        id.clone(),
+                        cell.epoch,
+                        cell.generation,
+                        starting,
+                        cell.residency.slot().heap_id().to_string(),
+                        cell.residency.monitor_counters()?,
+                        cell.requests.clone(),
+                    ))
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut slots = BTreeMap::new();
+        for generation in &generations {
+            let pools = std::iter::once((
+                generation.script_name.clone(),
+                "stateless",
+                generation.stateless.isolates.clone(),
+            ))
+            .chain(
+                generation
+                    .services
+                    .iter()
+                    .map(|(script, worker)| (script.clone(), "service", worker.isolates.clone())),
+            )
+            .chain(
+                generation
+                    .cell_isolates
+                    .iter()
+                    .map(|(script, pool)| (script.clone(), "cells", pool.clone())),
+            );
+            for (script, kind, pool) in pools {
+                for slot in pool.monitor_slots() {
+                    slots.insert(
+                        slot.heap_id().to_string(),
+                        (script.clone(), kind, generation.id, slot),
+                    );
+                }
+            }
+        }
+        let mut cells_by_isolate: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for resident in &residents {
+            cells_by_isolate
+                .entry(resident.4.clone())
+                .or_default()
+                .push(resident.0.clone());
+        }
+        let mut resources = BTreeMap::new();
+        let mut isolates = Vec::new();
+        for (id, (script, kind, generation, slot)) in &slots {
+            if let Some(sample) = slot.monitor_resources() {
+                let memory_stale = sample.busy
+                    || sample.memory.as_ref().is_none_or(|memory| {
+                        sampled_unix_ms.saturating_sub(memory.heap.sampled_unix_ms) > 5_000
+                    });
+                isolates.push(Isolate {
+                    id: id.clone(),
+                    script: script.clone(),
+                    kind: (*kind).into(),
+                    generation: *generation,
+                    resident_cells: sample.resident_cells,
+                    cells: cells_by_isolate.remove(id).unwrap_or_default(),
+                    requests: sample.requests,
+                    retiring: sample.retiring,
+                    busy: sample.busy,
+                    turns: sample.turns.clone(),
+                    memory: sample.memory.as_ref().map(|memory| memory.heap.clone()),
+                    memory_stale,
+                });
+                resources.insert(id.clone(), (sample, memory_stale));
+            }
+        }
+        let resident_cells = residents.len();
+        let classes = residents
+            .iter()
+            .filter_map(|resident| {
+                resident
+                    .0
+                    .split_once(':')
+                    .map(|(class, _)| class.to_string())
+            })
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let mut cells = residents
+            .into_iter()
+            .filter_map(
+                |(id, epoch, generation, starting, isolate, counters, requests)| {
+                    let class = id
+                        .split_once(':')
+                        .map(|(class, _)| class)
+                        .unwrap_or("")
+                        .to_string();
+                    if (!query.search.is_empty() && !id.to_lowercase().contains(&query.search))
+                        || query.class.as_ref().is_some_and(|filter| filter != &class)
+                    {
+                        return None;
+                    }
+                    let resource = resources.get(&isolate);
+                    let memory = resource.and_then(|(sample, _)| sample.memory.as_ref());
+                    let sqlite = memory.and_then(|memory| memory.sqlite.get(&id)).cloned();
+                    let memory_stale = sqlite.is_none() || resource.is_none_or(|(_, stale)| *stale);
+                    Some(Cell {
+                        script: slots
+                            .get(&isolate)
+                            .map(|slot| slot.0.clone())
+                            .unwrap_or_default(),
+                        id,
+                        class,
+                        epoch,
+                        generation,
+                        residency: counters.residency,
+                        isolate,
+                        starting,
+                        in_flight_requests: requests.in_flight.load(Ordering::Relaxed),
+                        turns: counters.snapshot(),
+                        sqlite,
+                        buffers: counters.buffer_memory(),
+                        memory_sampled_unix_ms: memory.map(|memory| memory.heap.sampled_unix_ms),
+                        memory_stale,
+                    })
+                },
+            )
+            .collect::<Vec<_>>();
+        // Stable residency ordering makes consecutive pages and rate samples
+        // useful. The browser can rank the returned page by its measured rates.
+        cells.sort_by(|left, right| {
+            left.id
+                .cmp(&right.id)
+                .then(left.residency.cmp(&right.residency))
+        });
+        let total_matches = cells.len();
+        let cells = cells
+            .into_iter()
+            .skip(query.offset)
+            .take(query.limit)
+            .collect();
+        let services = crate::asyncrt::services();
+        let load = services.node_load();
+        let host = load.as_ref().and_then(|load| load.stored_sample());
+        Snapshot {
+            schema_version: celld_monitor::SCHEMA_VERSION,
+            process: crate::monitor::process_id().to_string(),
+            sampled_unix_ms,
+            monotonic_ms,
+            node: Node {
+                id: self.node.to_string(),
+                deployment: current.version.clone(),
+                cores: std::thread::available_parallelism().map_or(1, |cores| cores.get()),
+                cpu_percent_of_one_core: services.monitor_cpu_percent(),
+                rss_bytes: host
+                    .map(|sample| sample.rss_bytes)
+                    .filter(|bytes| *bytes > 0),
+                resident_cells,
+                pressured: load.is_some_and(|load| load.pressured.load(Ordering::Relaxed)),
+            },
+            classes,
+            total_matches,
+            offset: query.offset,
+            cells,
+            isolates,
+        }
+    }
+
     /// A deployment with no Durable Object classes can never land a Worker fetch
     /// on a cell, so the core's round-robin routing always returns `None`. Lets
     /// the request path skip the core round-trip entirely for stateless workers.
@@ -1892,7 +2079,7 @@ impl RuntimeManager {
             scope: cell.clone(),
             ws_id,
             facet_opening: None,
-            data,
+            data: js::buffer_ws_input(&cell, data),
             started: Some(started),
             reply,
         };
@@ -1948,7 +2135,7 @@ impl RuntimeManager {
             scope: scope.clone(),
             ws_id,
             facet_opening: Some(facet.opening),
-            data,
+            data: js::buffer_ws_input(&facet.root, data),
             started: Some(started),
             reply,
         };

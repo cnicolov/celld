@@ -91,6 +91,67 @@ struct OpenCell {
     published_position: Option<u64>,
 }
 
+/// SQLite's own connection-local allocations, read only while the isolate
+/// permit is held. The monitor never opens another connection or runs SQL.
+pub(crate) fn monitor_memory() -> std::collections::BTreeMap<String, celld_monitor::SqliteMemory> {
+    dbs(|dbs| {
+        dbs.borrow()
+            .iter()
+            .filter_map(|(scope, cell)| {
+                sqlite_memory(&cell.connection).map(|memory| (scope.clone(), memory))
+            })
+            .collect()
+    })
+}
+
+fn sqlite_memory(connection: &Connection) -> Option<celld_monitor::SqliteMemory> {
+    fn current(connection: &Connection, operation: i32) -> Option<u64> {
+        let mut used = 0;
+        let mut highwater = 0;
+        // SAFETY: the caller holds the isolate's permit and connection lives
+        // throughout this call. reset=0 preserves its statistics.
+        let result = unsafe {
+            rusqlite::ffi::sqlite3_db_status(
+                connection.handle(),
+                operation,
+                &mut used,
+                &mut highwater,
+                0,
+            )
+        };
+        (result == rusqlite::ffi::SQLITE_OK)
+            .then(|| u64::try_from(used).ok())
+            .flatten()
+    }
+    Some(celld_monitor::SqliteMemory {
+        cache_bytes: current(connection, rusqlite::ffi::SQLITE_DBSTATUS_CACHE_USED)?,
+        schema_bytes: current(connection, rusqlite::ffi::SQLITE_DBSTATUS_SCHEMA_USED)?,
+        statement_bytes: current(connection, rusqlite::ffi::SQLITE_DBSTATUS_STMT_USED)?,
+    })
+}
+
+#[cfg(test)]
+mod monitor_tests {
+    use super::*;
+
+    #[test]
+    fn sqlite_statistics_report_allocations_without_changing_data() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch("CREATE TABLE data(value TEXT); INSERT INTO data VALUES ('hello')")
+            .unwrap();
+        let statement = connection.prepare("SELECT value FROM data").unwrap();
+        let before = total_changes(&connection);
+        let memory = sqlite_memory(&connection).unwrap();
+        assert!(memory.cache_bytes > 0);
+        assert!(memory.schema_bytes > 0);
+        assert!(memory.statement_bytes > 0);
+        assert_eq!(total_changes(&connection), before);
+        drop(statement);
+        assert!(sqlite_memory(&connection).unwrap().statement_bytes < memory.statement_bytes);
+    }
+}
+
 enum StorageBacking {
     File {
         path: String,

@@ -722,6 +722,14 @@ async fn start_node(
             "127.0.0.1:0",
         ])
         .env("CELLD_INTERNAL_DEV_STORE", &store.database)
+        .env(
+            "CELLD_MONITOR",
+            if crate::env_vars::flag("CELLD_MONITOR", true)? {
+                "1"
+            } else {
+                "0"
+            },
+        )
         .env("CELLD_WATCH", state.join("runtime"))
         .env("CELLD_NODE", format!("dev-{}", &project_hash[..12]))
         .stdin(Stdio::null())
@@ -808,6 +816,9 @@ async fn start_node(
         return Err(error);
     }
     console.ready(&format!("http://{listener}"));
+    if crate::env_vars::flag("CELLD_MONITOR", true)? {
+        console.detail("monitor", &format!("{internal}/monitor/"));
+    }
     Ok(RunningNode {
         child,
         internal,

@@ -209,7 +209,7 @@ pub struct CommonPrefixPage {
 }
 
 /// One bounded page of object descriptions from a recursive listing.
-pub(crate) struct ObjectPage {
+pub struct ObjectPage {
     pub objects: Vec<ObjectMeta>,
     pub page_token: Option<String>,
 }
@@ -229,6 +229,22 @@ pub fn is_clean_cas_rejection(error: &Error) -> bool {
 /// object_store maps every HTTP 409 to AlreadyExists. For S3 conditional
 /// PUTs, 409 is ConditionalRequestConflict, not evidence of an ETag mismatch:
 /// the request did not commit, and the caller may retry within its authority.
+/// For If-None-Match, object_store also wraps a typed 412 Precondition inside
+/// AlreadyExists. Preserve that definitive rejection without parsing messages.
+fn is_s3_cas_conflict(error: &Error) -> bool {
+    match error {
+        Error::AlreadyExists { source, .. } => {
+            !source.downcast_ref::<Error>().is_some_and(|source| {
+                matches!(
+                    source,
+                    Error::Precondition { .. } | Error::NotModified { .. }
+                )
+            })
+        }
+        _ => false,
+    }
+}
+
 #[derive(Debug)]
 struct S3CasConflict(Error);
 
@@ -1092,10 +1108,7 @@ impl Bucket {
                     })?;
                 Ok(Some(token))
             }
-            Err(error)
-                if self.backend == StorageBackend::S3
-                    && matches!(error, Error::AlreadyExists { .. }) =>
-            {
+            Err(error) if self.backend == StorageBackend::S3 && is_s3_cas_conflict(&error) => {
                 Err(anyhow!(S3CasConflict(error)).context(format!(
                     "conditional write {}://{}/{key} was rejected by a retryable conflict",
                     self.scheme(),
@@ -1205,7 +1218,7 @@ impl Bucket {
     /// limit. A maintenance caller must finish and release this page before
     /// it asks for the next one, or pagination would bound requests without
     /// bounding retained object descriptions.
-    pub(crate) async fn objects_page(
+    pub async fn objects_page(
         &self,
         prefix: &str,
         page_token: Option<String>,

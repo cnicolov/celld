@@ -204,6 +204,8 @@ pub struct Slot {
     // toward the collection boundary. Residency drop retires both counts.
     adopted_cells: AtomicUsize,
     retiring: AtomicBool,
+    /// Observational only. Off means no counters or per-cell registry.
+    monitor: Option<crate::monitor::SlotMonitor>,
     #[cfg(celld_internal_tests)]
     turn_observations: Mutex<Vec<String>>,
 }
@@ -254,6 +256,13 @@ impl Slot {
         }
         self.turns.fetch_add(1, Ordering::Relaxed);
         let _turn = Counted(self);
+        let mut accounting = self.monitor.as_ref().map(|monitor| {
+            let cell = match &lane {
+                TurnLane::Cell(scope) => monitor.cell(scope),
+                TurnLane::Stateless => None,
+            };
+            crate::monitor::TurnAccounting::queued(monitor.turns.clone(), cell)
+        });
         let _scheduled = self.turn_scheduler.acquire(lane.clone()).await;
         let mut worker = self.worker.lock().await;
         let worker = match worker.as_mut() {
@@ -274,7 +283,13 @@ impl Slot {
         }
         *self.active_turn.lock().expect("turn progress poisoned") = Some(std::time::Instant::now());
         let _running = Running(&self.active_turn);
+        if let Some(accounting) = &mut accounting {
+            accounting.start();
+        }
         let result = f(worker);
+        // Finish on the executing thread, before releasing either permit.
+        // Awaiting the scheduler/worker is never counted as CPU.
+        drop(accounting);
         CURRENT_SLOT.set(previous);
         result
     }
@@ -346,6 +361,7 @@ impl Slot {
             cells: AtomicUsize::new(0),
             adopted_cells: AtomicUsize::new(0),
             retiring: AtomicBool::new(false),
+            monitor: crate::monitor::enabled().then(crate::monitor::SlotMonitor::default),
             #[cfg(celld_internal_tests)]
             turn_observations: Mutex::new(Vec::new()),
         })
@@ -379,6 +395,7 @@ impl Slot {
             cells: AtomicUsize::new(0),
             adopted_cells: AtomicUsize::new(0),
             retiring: AtomicBool::new(false),
+            monitor: None,
             turn_observations: Mutex::new(Vec::new()),
         })
     }
@@ -416,6 +433,7 @@ impl Slot {
             slot: self.clone(),
             max_cells,
             adopted: false,
+            monitor_cell: None,
         }
     }
 
@@ -466,6 +484,45 @@ impl Slot {
             .map(|started| u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX))
     }
 
+    /// Non-blocking V8/SQLite sampling. Busy heaps retain their old sample
+    /// and its original timestamp instead of masquerading as empty heaps.
+    pub(crate) fn monitor_resources(&self) -> Option<crate::monitor::SlotResources> {
+        let monitor = self.monitor.as_ref()?;
+        let now = crate::monitor::unix_ms();
+        let cached = monitor.memory.lock().unwrap().clone();
+        let mut busy = false;
+        let memory = match self.worker.try_lock() {
+            Ok(worker) => {
+                let worker = worker.as_ref()?;
+                if cached
+                    .as_ref()
+                    .is_none_or(|sample| now.saturating_sub(sample.heap.sampled_unix_ms) >= 1_000)
+                {
+                    let fresh = worker.monitor_memory();
+                    if let Some(fresh) = &fresh {
+                        *monitor.memory.lock().unwrap() = Some(fresh.clone());
+                    }
+                    fresh.or(cached)
+                } else {
+                    cached
+                }
+            }
+            Err(_) => {
+                busy = true;
+                cached
+            }
+        };
+        let load = self.observe();
+        Some(crate::monitor::SlotResources {
+            busy,
+            turns: monitor.turns.snapshot(),
+            resident_cells: load.cells,
+            requests: load.requests,
+            retiring: load.retiring,
+            memory,
+        })
+    }
+
     fn is_reusable(&self) -> bool {
         let load = self.observe();
         if !celld_logic::isolate::may_free(&load) || load.cells != 0 {
@@ -511,11 +568,18 @@ pub struct Residency {
     slot: Arc<Slot>,
     max_cells: usize,
     adopted: bool,
+    monitor_cell: Option<(String, Arc<crate::monitor::Counters>)>,
 }
 
 impl Residency {
     pub fn slot(&self) -> &Arc<Slot> {
         &self.slot
+    }
+
+    pub(crate) fn monitor_counters(&self) -> Option<Arc<crate::monitor::Counters>> {
+        self.monitor_cell
+            .as_ref()
+            .map(|(_, counters)| counters.clone())
     }
 
     /// Open a reserved cell's storage and return its residency with its alarm snapshot.
@@ -535,6 +599,9 @@ impl Residency {
                 // before this turn drops only the reservation; afterward the
                 // residency owns both counters, including on an error unwind.
                 self.adopted = true;
+                if let Some(monitor) = &slot.monitor {
+                    self.monitor_cell = Some((cell.to_string(), monitor.register(cell)));
+                }
                 let adopted = slot.adopted_cells.fetch_add(1, Ordering::Relaxed) + 1;
                 debug_assert!(adopted <= self.max_cells);
                 if adopted == self.max_cells {
@@ -549,6 +616,9 @@ impl Residency {
 
 impl Drop for Residency {
     fn drop(&mut self) {
+        if let (Some(monitor), Some((cell, counters))) = (&self.slot.monitor, &self.monitor_cell) {
+            monitor.unregister(cell, counters);
+        }
         if self.adopted {
             self.slot.adopted_cells.fetch_sub(1, Ordering::Relaxed);
         }
@@ -657,6 +727,7 @@ impl Pool {
             cells: AtomicUsize::new(0),
             adopted_cells: AtomicUsize::new(0),
             retiring: AtomicBool::new(self.retired.load(Ordering::Relaxed)),
+            monitor: crate::monitor::enabled().then(crate::monitor::SlotMonitor::default),
             #[cfg(celld_internal_tests)]
             turn_observations: Mutex::new(Vec::new()),
         });
@@ -891,6 +962,11 @@ impl Pool {
             .iter()
             .filter(|slot| !slot.is_retiring())
             .count()
+    }
+
+    /// Slots for observational sampling, without taking their execution permits.
+    pub(crate) fn monitor_slots(&self) -> Vec<Arc<Slot>> {
+        self.slots.read().expect("pool poisoned").clone()
     }
 
     /// What the pool holds right now, for `/state`.

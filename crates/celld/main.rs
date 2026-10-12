@@ -1188,6 +1188,7 @@ async fn dispatch_do_call(app: AppHandle, call: DoCallReq) {
                         name: name.clone(),
                         request_id,
                         capacity_handoff: epoch == 0,
+                        parent: call.parent,
                     };
                     let attempt_body = match body {
                         celld::js::RequestBody::Bytes(bytes) => {
@@ -1999,6 +2000,7 @@ pub(crate) struct ForwardedFetch {
     pub(crate) headers: Vec<(String, String)>,
     pub(crate) request_id: Option<celld::js::RequestId>,
     pub(crate) capacity_handoff: bool,
+    pub(crate) parent: Option<celld::telemetry::TraceContext>,
 }
 
 pub(crate) enum ForwardedFetchOutcome {
@@ -2025,6 +2027,7 @@ pub(crate) async fn dispatch_forwarded_fetch(
         headers,
         request_id,
         capacity_handoff,
+        parent,
     } = fetch;
     let _request_body_guard = celld::js::RequestBodyGuard::of(&request_body);
     let preserve_representation_length = method.eq_ignore_ascii_case("HEAD");
@@ -2073,10 +2076,10 @@ pub(crate) async fn dispatch_forwarded_fetch(
                                 body: request_body,
                                 headers,
                                 request_id,
-                                // A peer's call has no caller in this process, and the
-                                // peer protocol does not carry trace context.
+                                // No local caller order; observational trace context
+                                // travels in the authenticated tunnel's reserved header.
                                 order: None,
-                                parent: None,
+                                parent,
                             },
                             None,
                         )
@@ -2336,8 +2339,14 @@ pub(crate) async fn dispatch_forwarded_rpc(
     }
 }
 
+#[path = "main/cluster_monitor.rs"]
+mod cluster_monitor;
+#[path = "main/monitor.rs"]
+mod monitor;
 #[path = "main/peer_tunnel.rs"]
 mod peer_tunnel;
+#[path = "main/trace_monitor.rs"]
+mod trace_monitor;
 #[path = "main/websocket.rs"]
 mod websocket;
 use websocket::{handle_websocket, outbound_websocket_task, reply_without_upgrade};
@@ -2903,6 +2912,10 @@ async fn handle_internal(
     let cell_scope = path.strip_prefix("/cell/");
     let evict_scope = path.strip_prefix("/evict/");
     let result = match path.as_str() {
+        _ if path == "/monitor" || path.starts_with("/monitor/") => {
+            monitor::handle(request, app).await
+        }
+        "/peer/monitor" => monitor::peer(request, app).await,
         "/peer/probe" => internal_probe(request, app).await,
         "/peer/handoff" => internal_handoff(request, app).await,
         _ if path.starts_with("/peer/log/") => internal_log(request, app, path.clone()).await,
@@ -4180,6 +4193,9 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
             // The collector path needs no bucket at all.
             celld::telemetry::SinkChoice::Otlp { .. } => None,
         };
+        if celld::monitor::enabled() {
+            trace_monitor::init(sink_bucket.clone(), config.flush.as_millis() as u64);
+        }
         celld::telemetry::init(config, sink_bucket, node.clone(), settings.region.clone())?;
     }
     let peer_auth = Arc::new(PeerAuth::new(peer_key, node.clone())?);
@@ -4232,6 +4248,9 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
     let fleet_bucket = ready_ownership
         .as_ref()
         .map(|ownership| ownership.bucket_client());
+    if celld::monitor::enabled() && ready_ownership.is_none() {
+        cluster_monitor::service().standalone();
+    }
     let explorer_replication = runtime.as_ref().and_then(|runtime| runtime.replication());
     let local_cache_replication = explorer_replication.clone();
     let (websocket_tx, mut websocket_rx) = mpsc::unbounded_channel();
@@ -4612,8 +4631,16 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                 // lease dead at once: on the 2026-09-05 fleet that closed the
                 // gate and skipped balancing on a third of the ticks.
                 let (view_ms, peers) = match ownership.read_shared_capacity_peers(sample_ms).await {
-                    Ok(view) => view,
+                    Ok(view) => {
+                        if celld::monitor::enabled() {
+                            cluster_monitor::service().update(view.0, &view.1);
+                        }
+                        view
+                    }
                     Err(error) => {
+                        if celld::monitor::enabled() {
+                            cluster_monitor::service().discovery_failed();
+                        }
                         // At info with the chain: a failed tick closes the
                         // format gate, and a fleet run has to say why.
                         tracing::info!(event = "fleet_sample_failed", error = format!("{error:#}"));

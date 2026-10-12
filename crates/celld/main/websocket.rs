@@ -489,8 +489,8 @@ async fn local_websocket_pipe(
     // fetch handler still runs, and the caller can send the moment it
     // accepts.
     let socket = SocketRoute::of(&target);
-    let (caller_tx, mut from_caller) = mpsc::unbounded_channel();
-    let (cell_tx, mut from_cell) = mpsc::unbounded_channel();
+    let (caller_tx, mut from_caller) = celld::js::ws_output_channel();
+    let (cell_tx, mut from_cell) = celld::js::ws_output_channel();
     celld::js::ws_register(id, caller_tx);
     celld::js::ws_register(target.id, cell_tx);
     let _ = reply.send(Ok(celld::js::OutboundWsOpen {
@@ -664,7 +664,7 @@ pub(crate) async fn outbound_websocket_task(
         return Ok(());
     }
 
-    let (outbound, mut outputs) = mpsc::unbounded_channel();
+    let (outbound, mut outputs) = celld::js::ws_output_channel();
     sink.register(id);
     celld::js::ws_register(id, outbound);
     if let Err(error) = sink
@@ -807,7 +807,7 @@ async fn echo_websocket_close<S>(
 /// that follow.
 async fn pump_cell_socket<S, F, Fut>(
     socket: fastwebsockets::WebSocket<S>,
-    outputs: &mut mpsc::UnboundedReceiver<celld::js::WsOut>,
+    outputs: &mut celld::js::WsOutputReceiver,
     outbound_close_is_clean: bool,
     mut inbound: F,
 ) -> (PumpClose, SocketWriter<S>)
@@ -935,7 +935,7 @@ async fn worker_websocket_task<S>(
     socket.set_auto_close(false);
     let id = worker.id();
     let inbound = worker.inbound();
-    let (outbound, mut outputs) = mpsc::unbounded_channel();
+    let (outbound, mut outputs) = celld::js::ws_output_channel();
     celld::js::ws_register(id, outbound);
     let (close, writer) = pump_cell_socket(socket, &mut outputs, true, move |data| {
         let inbound = inbound.clone();
@@ -964,7 +964,7 @@ pub(super) async fn websocket_task<S>(
 {
     socket.set_auto_close(false);
     let route = SocketRoute::of(&target);
-    let (outbound, mut outputs) = mpsc::unbounded_channel();
+    let (outbound, mut outputs) = celld::js::ws_output_channel();
     celld::js::ws_register(target.id, outbound);
     // A close the cell sends does not become the close state here: the echo
     // below decides what the peer observes, so the pump must not claim the

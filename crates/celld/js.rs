@@ -109,9 +109,11 @@ pub(crate) use crate::http_streams::http_stream_read_source_first_for_test;
 pub(crate) use crate::http_streams::http_stream_service;
 #[cfg(all(test, celld_internal_tests))]
 pub(crate) use crate::http_streams::next_http_stream_chunk;
+#[cfg(all(test, celld_internal_tests))]
 pub(crate) use crate::http_streams::prepare_http_stream_tee;
 pub use crate::http_streams::register_body_stream;
 pub(crate) use crate::http_streams::response_stream_close;
+#[cfg(all(test, celld_internal_tests))]
 pub(crate) use crate::http_streams::response_stream_write;
 pub(crate) use crate::http_streams::retain_first_http_cleanup_panic;
 #[cfg(all(test, celld_internal_tests))]
@@ -618,7 +620,7 @@ pub enum CellJob {
         /// The opening of the facet that accepted the socket, for an event of
         /// a facet's socket. See `facet_socket_refusal`.
         facet_opening: Option<u64>,
-        data: WsIn,
+        data: crate::monitor::Buffered<WsIn>,
         /// Released after the first turn, so the socket can deliver the next
         /// message in order without waiting for this handler's async work.
         started: Option<tokio::sync::oneshot::Sender<()>>,
@@ -845,6 +847,19 @@ struct EgressFrame {
 /// The frame of the running event, if a cell event is running at all.
 fn current_cell_event(context: &IoContext) -> Option<EgressFrame> {
     context.egress.lock().unwrap().last().cloned()
+}
+
+fn monitor_buffer_owner(context: &IoContext) -> Option<Arc<crate::monitor::BufferCounters>> {
+    if !crate::monitor::enabled() {
+        return None;
+    }
+    let event = current_cell_event(context)?;
+    crate::monitor::buffer_owner(
+        event
+            .root
+            .as_ref()
+            .map_or(&event.storage, |root| &root.cell),
+    )
 }
 
 /// Return and clear the number of output-gate samples for one test cell.
@@ -1492,7 +1507,7 @@ fn platform_thread_cpu_nanos() -> Option<u64> {
     None
 }
 
-fn thread_cpu_nanos() -> Option<u64> {
+pub(crate) fn thread_cpu_nanos() -> Option<u64> {
     #[cfg(all(test, celld_internal_tests))]
     if let Some(sample) =
         THREAD_CPU_NANOS_SAMPLES_FOR_TEST.with(|samples| samples.borrow_mut().pop_front())
@@ -4199,6 +4214,23 @@ impl Worker {
         })
     }
 
+    /// Called only after the pool obtained the isolate permit with try_lock.
+    /// No query, GC, checkpoint or page fault is requested by the monitor.
+    pub(crate) fn monitor_memory(&self) -> Option<crate::monitor::MemorySample> {
+        let inner = self.inner.as_ref()?;
+        let (mut locker, _cells) = inner.lock();
+        let stats = locker.get_heap_statistics();
+        Some(crate::monitor::MemorySample {
+            heap: celld_monitor::IsolateMemory {
+                sampled_unix_ms: crate::monitor::unix_ms(),
+                heap_used_bytes: stats.used_heap_size() as u64,
+                heap_physical_bytes: stats.total_physical_size() as u64,
+                external_bytes: stats.external_memory() as u64,
+            },
+            sqlite: storage::monitor_memory(),
+        })
+    }
+
     /// Run a request's first turn.
     ///
     /// Returns what is now in flight — `None` when nothing is, the reply
@@ -5412,7 +5444,7 @@ fn begin_cell(tc: &mut v8::PinScope, job: CellJob, event_time: i64) -> Begun {
                 None,
                 true,
                 |tc| {
-                    let (name, data) = match data {
+                    let (name, data) = match data.into_inner() {
                         WsIn::Text(text) => {
                             ("__wsMessage", v8::String::new(tc, &text).unwrap().into())
                         }
@@ -6814,6 +6846,10 @@ ops! { OP_NAMES, install_op_functions,
         "__d1_run" => storage_ops::op_d1_run,
         "__storage_transaction_control" => storage_ops::op_storage_transaction_control,
         "__log" => op_log,
+        "__telemetry_current" => telemetry_ops::op_current,
+        "__telemetry_with_context" => telemetry_ops::op_with_context,
+        "__telemetry_span" => telemetry_ops::op_span,
+        "__telemetry_log" => telemetry_ops::op_log,
         "__storage_put" => storage_ops::op_storage_put,
         "__storage_put_many" => storage_ops::op_storage_put_many,
         "__storage_queue_put" => storage_ops::op_storage_queue_put,
@@ -9390,8 +9426,9 @@ fn op_asset_fetch(
 fn tee_http_stream(
     service: &Arc<HttpStreamService>,
     source: HttpTransferredStream,
+    owner: Option<Arc<crate::monitor::BufferCounters>>,
 ) -> Result<(u64, u64), &'static str> {
-    let (ids, pump) = prepare_http_stream_tee(service, source)?;
+    let (ids, pump) = crate::http_streams::prepare_http_stream_tee_owned(service, source, owner)?;
     asyncrt::op_handle().spawn(pump);
     Ok(ids)
 }
@@ -9427,7 +9464,11 @@ fn op_http_stream_tee(
         scope.throw_exception(exception);
         return;
     };
-    let ids = match tee_http_stream(&service, source) {
+    let ids = match tee_http_stream(
+        &service,
+        source,
+        monitor_buffer_owner(&event_context(scope)),
+    ) {
         Ok(ids) => ids,
         Err(error) => {
             let message = v8::String::new(scope, error).unwrap();
@@ -9455,7 +9496,8 @@ fn op_response_stream_create(
     _args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
-    let (writer, receiver) = tokio::sync::mpsc::channel(1);
+    let (writer, receiver) =
+        crate::http_streams::http_buffer_channel(1, monitor_buffer_owner(&event_context(scope)));
     let (finished, _) = tokio::sync::watch::channel(false);
     let Some(stream_id) = http_stream_service()
         .register_response_pair(receiver, ResponseStreamWriter::new(writer, finished))
@@ -9499,9 +9541,12 @@ fn op_response_stream_write(
     // direction this gate exists to fail in.
     let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::Response);
     let service = http_stream_service();
+    let bytes = bytes.map(|bytes| service.buffer_item(stream_id, Ok(bytes)));
     let id = asyncrt::enqueue(async move {
         await_egress_gate(gate).await?;
-        response_stream_write(service, stream_id, bytes).await?;
+        let item =
+            bytes.ok_or_else(|| "response stream chunks must be ArrayBuffer views".to_string())?;
+        crate::http_streams::response_stream_write_buffered(service, stream_id, item).await?;
         Ok(String::new())
     });
     rv.set(promise_for(scope, id));
@@ -10111,6 +10156,7 @@ fn op_log(
                 time_unix_us: crate::telemetry::now_unix_us(),
                 severity: crate::telemetry::Severity::from_console_level(&level),
                 body: body.clone(),
+                metadata: None,
             });
         }
     }
@@ -10551,6 +10597,7 @@ fn op_test_queue_rearm_bounded(
 // of the object record.
 pub(crate) mod r2_ops;
 mod storage_ops;
+mod telemetry_ops;
 use storage_ops::{actor_runtime_state, throw_storage_error};
 
 /// $$urlParse(input, base?) -> {protocol,username,password,host,port,pathname,search,hash,href}

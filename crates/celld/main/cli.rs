@@ -337,6 +337,8 @@ ENVIRONMENT:
                                   X-Forwarded-Proto
   CELLD_NODE                      Node-session ID (default: generated)
   CELLD_WATCH                     Local SQLite/replication working directory
+  CELLD_MONITOR                   `1` enables the read-only Rust/WASM monitor
+                                  on the internal listener (on by default in dev)
   CELLD_ESBUILD                   Override esbuild executable path
   CELLD_ACTIVATIONS               Concurrent cold activations
   CELLD_ASSET_CACHE_DIR           Downloaded static-asset cache directory

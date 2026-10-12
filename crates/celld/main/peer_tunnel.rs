@@ -45,11 +45,18 @@ pub(crate) const SCOPE_HEADER: &str = "x-cells-scope";
 pub(crate) const NAME_HEADER: &str = "x-cells-do-name";
 pub(crate) const REQUEST_ID_HEADER: &str = "x-cells-request-id";
 pub(crate) const HANDOFF_HEADER: &str = "x-cells-capacity-handoff";
+pub(crate) const TRACE_HEADER: &str = "x-cells-traceparent";
 
 /// The inner headers node A owns. A overwrites them on the way in and B
 /// strips them on the way out, so an application header with a reserved name
 /// is dropped rather than obeyed.
-const CONTROL_HEADERS: [&str; 4] = [SCOPE_HEADER, NAME_HEADER, REQUEST_ID_HEADER, HANDOFF_HEADER];
+const CONTROL_HEADERS: [&str; 5] = [
+    SCOPE_HEADER,
+    NAME_HEADER,
+    REQUEST_ID_HEADER,
+    HANDOFF_HEADER,
+    TRACE_HEADER,
+];
 
 enum TunnelKind {
     Do,
@@ -63,6 +70,16 @@ pub(crate) struct TunnelControl {
     pub(crate) name: Option<String>,
     pub(crate) request_id: Option<celld::js::RequestId>,
     pub(crate) capacity_handoff: bool,
+    pub(crate) parent: Option<celld::telemetry::TraceContext>,
+}
+
+fn trace_parent(headers: &hyper::HeaderMap) -> Option<celld::telemetry::TraceContext> {
+    let parent = celld::telemetry::parse_traceparent(headers.get(TRACE_HEADER)?.to_str().ok()?)?;
+    Some(celld::telemetry::TraceContext {
+        trace_id: parent.trace_id,
+        span_id: parent.span_id,
+        sampled: parent.sampled,
+    })
 }
 
 pub(crate) fn is_tunnel_request(request: &Request<Incoming>) -> bool {
@@ -182,6 +199,7 @@ async fn serve_do(upgraded: hyper::upgrade::Upgraded, app: AppHandle) {
                     .and_then(|value| value.to_str().ok())
                     .and_then(celld::js::parse_request_id),
                 capacity_handoff: inner.headers().get(HANDOFF_HEADER).is_some(),
+                parent: trace_parent(inner.headers()),
             };
             // A tunneled upgrade is the client's own handshake, so the
             // owner answers it directly: fastwebsockets computes the 101
@@ -240,6 +258,7 @@ async fn serve_do(upgraded: hyper::upgrade::Upgraded, app: AppHandle) {
                 headers,
                 request_id: control.request_id,
                 capacity_handoff: control.capacity_handoff,
+                parent: control.parent,
             };
             let outcome = dispatch_forwarded_fetch(app.clone(), control.scope, fetch, body).await;
             let (target, worker_headers) = match outcome {
@@ -422,6 +441,9 @@ fn inner_request(
     }
     if control.capacity_handoff {
         inner = inner.header(HANDOFF_HEADER, "1");
+    }
+    if let Some(parent) = &control.parent {
+        inner = inner.header(TRACE_HEADER, celld::telemetry::traceparent(parent));
     }
     Ok(inner.body(body)?)
 }
@@ -786,6 +808,66 @@ pub(crate) fn response_stream(body: PooledResponseBody) -> HttpChunkStream {
             .map_ok(|data: Bytes| data.to_vec())
             .map_err(|error| error.to_string()),
     )
+}
+
+#[cfg(test)]
+mod monitor_trace_tests {
+    use super::*;
+
+    #[test]
+    fn tunnel_trace_context_is_reserved_and_preserves_the_sampling_decision() {
+        for sampled in [true, false] {
+            let parent = celld::telemetry::TraceContext {
+                trace_id: [0x12; 16],
+                span_id: [0x34; 8],
+                sampled,
+            };
+            let control = TunnelControl {
+                scope: "Cart:alice".into(),
+                name: None,
+                request_id: None,
+                capacity_handoff: false,
+                parent: Some(parent),
+            };
+            let headers = vec![
+                (TRACE_HEADER.into(), "forged".into()),
+                ("traceparent".into(), "application header unchanged".into()),
+            ];
+            let request = inner_request(
+                &control,
+                "http://worker/checkout",
+                "GET",
+                &headers,
+                full_body(Bytes::new()),
+            )
+            .unwrap();
+            let received = trace_parent(request.headers()).unwrap();
+            assert_eq!(received.trace_id, parent.trace_id);
+            assert_eq!(received.span_id, parent.span_id);
+            assert_eq!(received.sampled, sampled);
+            assert_eq!(
+                request.headers()["traceparent"],
+                "application header unchanged"
+            );
+            assert!(CONTROL_HEADERS.contains(&TRACE_HEADER));
+        }
+        let control = TunnelControl {
+            scope: "Cart:alice".into(),
+            name: None,
+            request_id: None,
+            capacity_handoff: false,
+            parent: None,
+        };
+        let request = inner_request(
+            &control,
+            "http://worker/",
+            "GET",
+            &[(TRACE_HEADER.into(), "forged".into())],
+            full_body(Bytes::new()),
+        )
+        .unwrap();
+        assert!(request.headers().get(TRACE_HEADER).is_none());
+    }
 }
 
 #[cfg(all(test, celld_internal_tests))]

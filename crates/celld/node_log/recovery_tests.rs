@@ -1042,6 +1042,16 @@ fn s3_conflict_is_retryable_but_a_failed_precondition_is_a_lost_cas() {
         let rejected = bucket
             .put_cas("precondition", vec![42], Some("prior-etag"))
             .await;
+        let create_conflict = bucket.put_cas("conflict", vec![42], None).await;
+        let create_rejected = bucket.put_cas("precondition", vec![42], None).await;
+        assert!(
+            create_conflict.is_err(),
+            "HTTP 409 on create remains retryable"
+        );
+        assert_eq!(
+            create_rejected?, None,
+            "HTTP 412 on If-None-Match is a definitive create rejection, including RustFS"
+        );
         assert!(
             conflict.is_err(),
             "S3's HTTP 409 does not prove the lease token changed"

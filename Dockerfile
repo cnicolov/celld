@@ -3,6 +3,17 @@
 ARG RUST_VERSION=1.98.1
 ARG CELLD_COMMIT=unknown
 
+FROM --platform=$BUILDPLATFORM rust:${RUST_VERSION}-bookworm AS monitor-ui
+WORKDIR /src
+RUN rustup target add wasm32-unknown-unknown && \
+    cargo install trunk --version 0.21.14 --locked
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+RUN --mount=type=cache,id=celld-monitor-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=celld-monitor-target,target=/src/target,sharing=locked \
+    trunk build --release --locked --config crates/monitor/Trunk.toml && \
+    mkdir -p /out/monitor && cp target/monitor-ui/* /out/monitor/
+
 FROM rust:${RUST_VERSION}-bookworm AS build
 ARG TARGETARCH
 # `release` for shipped artifacts; a fast-loop caller passes `lab` to skip
@@ -11,11 +22,13 @@ ARG CELLD_PROFILE=release
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
+COPY --from=monitor-ui /out/monitor ./monitor-assets
+ENV CELLD_MONITOR_ASSETS=/src/monitor-assets
 RUN --mount=type=cache,id=celld-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=celld-cargo-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=celld-target-${TARGETARCH},target=/src/target,sharing=locked \
     mkdir -p /out && \
-    cargo build --profile "${CELLD_PROFILE}" --locked -p celld && \
+    cargo build --profile "${CELLD_PROFILE}" --locked -p celld --features monitor-ui && \
     install -m 755 "target/${CELLD_PROFILE}/celld" /out/celld
 
 # The final image depends on this stage, so a break in the engine's tests or

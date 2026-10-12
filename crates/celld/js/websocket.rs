@@ -581,7 +581,7 @@ pub(super) fn op_ws_bind_target(
         Ok(facet) => facet,
         Err(error) => return loader_throw(scope, &error),
     };
-    let (pull_tx, pull_rx) = ws_pull_channel();
+    let (pull_tx, pull_rx) = ws_pull_channel_owned(monitor_buffer_owner(&event_context(scope)));
     ws_pull_register(id, pull_rx);
     if cell.is_empty() {
         ws_track_request_socket(id);
@@ -648,6 +648,7 @@ pub(super) fn op_ws_accept(
             )
         }
     };
+    let owner = monitor_buffer_owner(&event_context(scope));
     let replaced_regular_scope = {
         let registry = ws_registry();
         let mut registry = registry.lock().unwrap();
@@ -672,6 +673,7 @@ pub(super) fn op_ws_accept(
                 auto_response_at: None,
                 facet: None,
             });
+        registry.monitor_socket(id, owner);
         replaced_regular_scope
     };
     if let Some(scope) = replaced_regular_scope {
@@ -690,6 +692,7 @@ pub(super) fn op_ws_accept_regular(
         .map(|n| n.value() as u64)
         .unwrap_or(0);
     let cell = args.get(1).to_rust_string_lossy(scope);
+    let owner = monitor_buffer_owner(&event_context(scope));
     let inserted = {
         let registry = ws_registry();
         let mut registry = registry.lock().unwrap();
@@ -704,6 +707,7 @@ pub(super) fn op_ws_accept_regular(
                 auto_response_at: None,
                 facet: None,
             });
+            registry.monitor_socket(id, owner);
             true
         } else {
             false

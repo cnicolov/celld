@@ -79,6 +79,48 @@ fn any_double(value: f64) -> Vec<u8> {
     out
 }
 
+/// Preserve application attribute/body types, including arrays and objects.
+fn any_value(value: &serde_json::Value) -> Vec<u8> {
+    use serde_json::Value;
+    match value {
+        Value::String(value) => any_string(value),
+        Value::Bool(value) => any_bool(*value),
+        Value::Number(value) if value.as_i64().is_some() => any_int(value.as_i64().unwrap()),
+        Value::Number(value) => {
+            let mut out = Vec::new();
+            field_fixed64(&mut out, 4, value.as_f64().unwrap_or_default().to_bits());
+            out
+        }
+        Value::Array(values) => {
+            let mut array = Vec::new();
+            for value in values {
+                field_bytes(&mut array, 1, &any_value(value));
+            }
+            let mut out = Vec::new();
+            field_bytes(&mut out, 5, &array);
+            out
+        }
+        Value::Object(values) => {
+            let mut list = Vec::new();
+            for (key, value) in values {
+                key_value(&mut list, 1, key, any_value(value));
+            }
+            let mut out = Vec::new();
+            field_bytes(&mut out, 6, &list);
+            out
+        }
+        Value::Null => Vec::new(),
+    }
+}
+
+fn application_attributes(out: &mut Vec<u8>, field: u64, value: Option<&serde_json::Value>) {
+    if let Some(values) = value.and_then(serde_json::Value::as_object) {
+        for (name, value) in values {
+            key_value(out, field, name, any_value(value));
+        }
+    }
+}
+
 /// common.v1.KeyValue: key=1, value=2 (AnyValue).
 fn key_value(out: &mut Vec<u8>, field: u64, name: &str, value: Vec<u8>) {
     let mut kv = Vec::with_capacity(name.len() + value.len() + 8);
@@ -103,10 +145,12 @@ fn resource(node: &str, region: &str, service: &str) -> Vec<u8> {
 }
 
 /// common.v1.InstrumentationScope: name=1, version=2.
-fn scope() -> Vec<u8> {
+fn scope(name: &str) -> Vec<u8> {
     let mut out = Vec::new();
-    field_str(&mut out, 1, "celld");
-    field_str(&mut out, 2, env!("CARGO_PKG_VERSION"));
+    field_str(&mut out, 1, name);
+    if name == "celld" {
+        field_str(&mut out, 2, env!("CARGO_PKG_VERSION"));
+    }
     out
 }
 
@@ -118,7 +162,7 @@ fn span_message(span: &Span) -> Vec<u8> {
     if let Some(parent) = span.parent_span_id {
         field_bytes(&mut out, 4, &parent);
     }
-    field_str(&mut out, 5, span.name);
+    field_str(&mut out, 5, &span.name);
     field_varint(&mut out, 6, span.kind as u64);
     let start_ns = span.start_unix_us.max(0) as u64 * 1_000;
     let end_ns = start_ns + span.duration_us.max(0) as u64 * 1_000;
@@ -164,14 +208,62 @@ fn span_message(span: &Span) -> Vec<u8> {
         };
         key_value(&mut out, 9, name, value);
     }
+    if let Some(metadata) = &span.metadata {
+        application_attributes(&mut out, 9, metadata.get("attributes"));
+        if let Some(events) = metadata.get("events").and_then(serde_json::Value::as_array) {
+            for event in events {
+                let mut encoded = Vec::new();
+                if let Some(at) = event
+                    .get("timeUnixNano")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|at| at.parse().ok())
+                {
+                    field_fixed64(&mut encoded, 1, at);
+                }
+                if let Some(name) = event.get("name").and_then(serde_json::Value::as_str) {
+                    field_str(&mut encoded, 2, name);
+                }
+                application_attributes(&mut encoded, 3, event.get("attributes"));
+                field_bytes(&mut out, 11, &encoded);
+            }
+        }
+        if let Some(links) = metadata.get("links").and_then(serde_json::Value::as_array) {
+            for link in links {
+                let mut encoded = Vec::new();
+                if let Some(trace) = link
+                    .get("traceId")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|id| crate::telemetry::unhex::<16>(id.as_bytes()))
+                {
+                    field_bytes(&mut encoded, 1, &trace);
+                }
+                if let Some(span) = link
+                    .get("spanId")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|id| crate::telemetry::unhex::<8>(id.as_bytes()))
+                {
+                    field_bytes(&mut encoded, 2, &span);
+                }
+                application_attributes(&mut encoded, 4, link.get("attributes"));
+                field_bytes(&mut out, 13, &encoded);
+            }
+        }
+    }
     // Status (15): unset when ok, per the spec; ERROR (code=3 value 2)
     // with the message when not.
-    if !span.ok {
+    if !span.ok
+        || span
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("statusCode"))
+            .and_then(serde_json::Value::as_u64)
+            == Some(1)
+    {
         let mut status = Vec::new();
         if let Some(error) = &span.error {
             field_str(&mut status, 2, error);
         }
-        field_varint(&mut status, 3, 2);
+        field_varint(&mut status, 3, if span.ok { 1 } else { 2 });
         field_bytes(&mut out, 15, &status);
     }
     out
@@ -180,16 +272,23 @@ fn span_message(span: &Span) -> Vec<u8> {
 /// collector.v1.ExportTraceServiceRequest: resource_spans=1, holding one
 /// ResourceSpans{resource=1, scope_spans=2{scope=1, spans=2}}.
 pub fn traces_request(spans: &[Span], node: &str, region: &str, service: &str) -> Vec<u8> {
-    let mut scope_spans = Vec::new();
-    field_bytes(&mut scope_spans, 1, &scope());
+    let mut groups = std::collections::BTreeMap::new();
     for span in spans {
-        field_bytes(&mut scope_spans, 2, &span_message(span));
+        let identity = identity(span.metadata.as_ref(), service);
+        let scope_spans = groups.entry(identity).or_insert_with(|| {
+            let mut out = Vec::new();
+            field_bytes(&mut out, 1, &scope(identity.1));
+            out
+        });
+        field_bytes(scope_spans, 2, &span_message(span));
     }
-    let mut resource_spans = Vec::new();
-    field_bytes(&mut resource_spans, 1, &resource(node, region, service));
-    field_bytes(&mut resource_spans, 2, &scope_spans);
     let mut out = Vec::new();
-    field_bytes(&mut out, 1, &resource_spans);
+    for ((service, _), scopes) in groups {
+        let mut resource_spans = Vec::new();
+        field_bytes(&mut resource_spans, 1, &resource(node, region, service));
+        field_bytes(&mut resource_spans, 2, &scopes);
+        field_bytes(&mut out, 1, &resource_spans);
+    }
     out
 }
 
@@ -201,7 +300,22 @@ fn log_message(log: &Log) -> Vec<u8> {
     field_fixed64(&mut out, 1, time_ns);
     field_varint(&mut out, 2, log.severity.number() as u64);
     field_str(&mut out, 3, log.severity.text());
-    field_bytes(&mut out, 5, &any_string(&log.body));
+    let body = log
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("body"));
+    field_bytes(
+        &mut out,
+        5,
+        &body.map_or_else(|| any_string(&log.body), any_value),
+    );
+    application_attributes(
+        &mut out,
+        6,
+        log.metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("attributes")),
+    );
     if let Some(trace_id) = log.trace_id {
         field_bytes(&mut out, 9, &trace_id);
     }
@@ -215,15 +329,120 @@ fn log_message(log: &Log) -> Vec<u8> {
 /// collector.v1.ExportLogsServiceRequest: resource_logs=1, holding one
 /// ResourceLogs{resource=1, scope_logs=2{scope=1, log_records=2}}.
 pub fn logs_request(logs: &[Log], node: &str, region: &str, service: &str) -> Vec<u8> {
-    let mut scope_logs = Vec::new();
-    field_bytes(&mut scope_logs, 1, &scope());
+    let mut groups = std::collections::BTreeMap::new();
     for log in logs {
-        field_bytes(&mut scope_logs, 2, &log_message(log));
+        let identity = identity(log.metadata.as_ref(), service);
+        let scope_logs = groups.entry(identity).or_insert_with(|| {
+            let mut out = Vec::new();
+            field_bytes(&mut out, 1, &scope(identity.1));
+            out
+        });
+        field_bytes(scope_logs, 2, &log_message(log));
     }
-    let mut resource_logs = Vec::new();
-    field_bytes(&mut resource_logs, 1, &resource(node, region, service));
-    field_bytes(&mut resource_logs, 2, &scope_logs);
     let mut out = Vec::new();
-    field_bytes(&mut out, 1, &resource_logs);
+    for ((service, _), scopes) in groups {
+        let mut resource_logs = Vec::new();
+        field_bytes(&mut resource_logs, 1, &resource(node, region, service));
+        field_bytes(&mut resource_logs, 2, &scopes);
+        field_bytes(&mut out, 1, &resource_logs);
+    }
     out
+}
+
+fn identity<'a>(metadata: Option<&'a serde_json::Value>, service: &'a str) -> (&'a str, &'a str) {
+    let name = |key| {
+        metadata
+            .and_then(|value| value.get(key))
+            .and_then(serde_json::Value::as_str)
+    };
+    (
+        name("serviceName").unwrap_or(service),
+        name("scopeName").unwrap_or("celld"),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Read length-delimited protobuf fields without adding a protobuf runtime.
+    fn fields(mut input: &[u8], wanted: u64) -> Vec<&[u8]> {
+        fn take_varint(input: &mut &[u8]) -> u64 {
+            let mut result = 0;
+            for shift in (0..64).step_by(7) {
+                let byte = input[0];
+                *input = &input[1..];
+                result |= u64::from(byte & 0x7f) << shift;
+                if byte < 128 {
+                    return result;
+                }
+            }
+            panic!("invalid test protobuf")
+        }
+        let mut values = Vec::new();
+        while !input.is_empty() {
+            let key = take_varint(&mut input);
+            match key & 7 {
+                0 => {
+                    take_varint(&mut input);
+                }
+                1 => input = &input[8..],
+                2 => {
+                    let length = take_varint(&mut input) as usize;
+                    if key >> 3 == wanted {
+                        values.push(&input[..length]);
+                    }
+                    input = &input[length..];
+                }
+                wire => panic!("unexpected wire {wire}"),
+            }
+        }
+        values
+    }
+
+    #[test]
+    fn application_otlp_preserves_typed_bodies_events_links_and_resource_groups() {
+        let ids = crate::telemetry::TraceIds {
+            trace_id: [1; 16],
+            span_id: [2; 8],
+        };
+        let native = Span::new(ids, "celld.fetch", 2);
+        let mut application = Span::new(ids, String::from("effect.checkout"), 1);
+        application.metadata = Some(serde_json::json!({
+            "serviceName": "checkout", "scopeName": "effect", "statusCode": 1,
+            "attributes": {"verified": true, "items": 2},
+            "events": [{"name": "loaded", "timeUnixNano": "1000000", "attributes": {"hit": true}}],
+            "links": [{"traceId": "03".repeat(16), "spanId": "04".repeat(8), "attributes": {"linked": true}}],
+        }));
+        let encoded = span_message(&application);
+        assert_eq!(fields(&encoded, 11).len(), 1);
+        assert_eq!(
+            fields(fields(&encoded, 11)[0], 2),
+            vec![b"loaded".as_slice()]
+        );
+        assert_eq!(fields(fields(&encoded, 13)[0], 1), vec![[3; 16].as_slice()]);
+        let request = traces_request(&[native, application], "node-a", "local", "celld");
+        assert_eq!(fields(&request, 1).len(), 2);
+        let log = Log {
+            trace_id: Some(ids.trace_id),
+            span_id: Some(ids.span_id),
+            time_unix_us: 1000,
+            severity: crate::telemetry::Severity::Fatal,
+            body: "display".into(),
+            metadata: Some(
+                serde_json::json!({"body": ["structured", 2, true, {"nested": 3}], "attributes": {"verified": true}}),
+            ),
+        };
+        let encoded = log_message(&log);
+        let body = fields(&encoded, 5)[0];
+        let array = fields(body, 5)[0];
+        let elements = fields(array, 1);
+        assert_eq!(elements.len(), 4);
+        assert_eq!(fields(elements[0], 1), vec![b"structured".as_slice()]);
+        assert_eq!(elements[1], any_int(2));
+        assert_eq!(elements[2], any_bool(true));
+        assert_eq!(fields(elements[3], 6).len(), 1);
+        assert_eq!(fields(&encoded, 9), vec![[1; 16].as_slice()]);
+        assert_eq!(fields(&encoded, 3), vec![b"FATAL".as_slice()]);
+    }
 }

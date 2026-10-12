@@ -59,7 +59,8 @@ outbound `fetch()`. A malformed header starts a new trace. A Worker call to a
 Durable Object stays in one trace.
 
 The sampler decides at the start of a request, and an unsampled request
-records nothing. A ratio of `0` records no traces and `1` records all. An
+records no native spans or console logs. Structured application logs are
+independent of trace sampling. A ratio of `0` records no traces and `1` records all. An
 intermediate ratio makes the same trace-id decision on each node. celld keeps
 a valid incoming context that the sampler rejects: an outbound `fetch()` or
 Durable Object call keeps the trace id, uses a new span id, and keeps the
@@ -176,7 +177,85 @@ The suite queries received spans for hierarchy, timeouts, wait/pause intervals,
 repeated occurrences, restart/recovery identity, W3C propagation and async console
 correlation. It uses its own temporary project, port and service name.
 
+## Native application telemetry
+
+The built-in `celld:telemetry` module exposes a narrow in-process interface:
+
+| function | contract |
+| --- | --- |
+| `currentContext()` | Current `{ traceId, spanId, sampled }`, or `undefined` when telemetry is off/outside an entry. |
+| `withContext(context, callback)` | Activate context for the synchronous callback. Restore on return/throw; V8 promise reactions inherit the context. Preserve the ALS frame and native resource owner. Cannot upgrade an unsampled context. |
+| `recordSpan(record)` | Admit a finished, sampled span to the existing bounded native queue. |
+| `recordLog(record)` | Admit a structured application log, independently of trace sampling. |
+
+This is not an HTTP receiver and does not expose the private runtime internals.
+Submission returns a boolean queue-admission result, not a durable flush
+acknowledgement. Invalid/oversized records are refused; queue saturation sheds
+and counts telemetry rather than delaying requests. When disabled, submission
+returns false and does not serialize application values.
+
+Records use hexadecimal IDs and decimal nanosecond timestamp strings; native
+span/log timestamps retain the existing microsecond precision. A finished span
+supplies `traceId`, `spanId`, optional `parentSpanId`, `name`, OTLP-numbered `kind`,
+`startTimeUnixNano`, `endTimeUnixNano`, `sampled`, `statusCode` (0/1/2), optional
+`error`, and optional `metadata`. A log supplies optional `traceId`/`spanId`,
+`timeUnixNano`, `severityNumber` (1/5/9/13/17/21), display `body`, and optional
+`metadata`. A missing log context defaults to the native entry.
+
+`metadata` preserves structured `body`, typed `attributes`, span `events`/`links`,
+`serviceName`, `scopeName`, and `statusCode`. Parquet stores it in the new optional
+`metadata_json` column; older files without that column remain readable. Native
+cell ownership is derived by the host, never accepted as an application column.
+The OTLP sink also preserves these types and instrumentation identities.
+
+The facade bounds serialization to depth 6, 1,024 visited values, 64 entries per
+object/array, 4,096 characters per string and a 12,000-character aggregate budget.
+The native seam rejects payloads above 32 KiB. Cycles become `[circular]`, depth
+limits become `[truncated]`, BigInts become decimal strings, and Errors retain
+name/message/stack. Throwing getters do not fail the application request.
+
+## Effect application traces and logs
+
+[`examples/effect/telemetry.js`](../examples/effect/telemetry.js) is the Effect
+**4.0.3** tracer/logger adapter. Install its `layer({ serviceName: "my-app" })`
+with `Effect.provide`. The layer may be shared between requests: native parenting
+is resolved at span creation, not at layer construction. No OTLP exporter,
+collector URL, credentials or trace/log HTTP endpoints are needed.
+
+Effect root spans join celld's current handler span unless explicitly made roots.
+The tracer context hook activates each fiber's span for one synchronous
+evaluation, so native `fetch()` and console continuations can follow the current
+Effect child across awaits without an isolate-global current span. The adapter
+caps each span at 64 attributes, 32 events and 32 links. Its logger replaces
+existing loggers by default to avoid duplicate console fallback; set
+`mergeWithExisting: true` deliberately if both are wanted.
+
+The fixture checks real persisted spans/logs, including nested and parallel
+fibers, native awaits, typed annotations, all six severities, structured bodies,
+exception causes, interruption, incoming/downstream propagation, Durable Object
+calls, native context restoration, ALS isolation and independent unsampled logs:
+
+```sh
+python3 scripts/effect-tracer-smoke.py --require-dashboard
+```
+
+It installs the pinned library in temporary state, runs an isolated dev node,
+and retains the report and node log. It does not alter the RustFS demo fleet.
+The loopback HTTP helper only answers an application downstream request; the
+native test asserts that it receives **no HTTP telemetry exports**.
+
+`--transport otlp` retains the original official `OtlpTracer`/`OtlpLogger`
+compatibility checks, including request-scope flushing, retry and nonfatal
+exporter refusal. That alternative exports to a separate test collector and is
+not ingested by celld monitor; `--require-dashboard` intentionally fails there.
+
 ## Query the bucket with DuckDB
+
+With `CELLD_MONITOR=1`, the built-in **Traces** view can also run bounded,
+read-only queries over these exports and show cross-node span timelines with
+correlated console/application logs. **Logs only** searches messages/annotations
+even when no span was sampled. See [monitoring.md](monitoring.md#trace-queries-and-logs).
+Use DuckDB below for unrestricted SQL and full-history queries.
 
 ```sql
 INSTALL httpfs; LOAD httpfs;

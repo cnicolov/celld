@@ -55,7 +55,10 @@ jobs:
           set -euo pipefail
           rustup toolchain install "$RUST_VERSION" --profile minimal
           rustup default "$RUST_VERSION"
-          cargo build --release --locked
+          rustup target add wasm32-unknown-unknown
+          cargo install trunk --version 0.21.14 --locked
+          trunk build --release --locked --config crates/monitor/Trunk.toml
+          cargo build --release --locked -p celld --features monitor-ui
           version=$(sed -n 's/^version = "\(.*\)"$/\1/p' crates/celld/Cargo.toml | head -1)
           target/release/celld --version | grep -F "$version"
 

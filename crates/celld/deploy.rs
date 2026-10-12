@@ -2904,6 +2904,7 @@ fn run_esbuild(root: &Path, entry: &str, config: &BundleConfig) -> anyhow::Resul
             .arg(format!("--banner:js={commonjs_builtin_bridge}"))
             .arg("--external:node:*")
             .arg("--external:cloudflare:*")
+            .arg("--external:celld:telemetry")
             .args(
                 crate::js::BARE_NODE_BUILTINS
                     .iter()

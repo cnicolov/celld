@@ -8,6 +8,7 @@ use crate::engine_api::HttpChunkStream;
 use crate::engine_api::HttpResponse;
 use crate::engine_api::HttpResponseWebSocket;
 use crate::engine_api::RequestBody;
+use crate::monitor::{BufferCounters, BufferKind, Buffered};
 use anyhow::Result;
 use futures_util::StreamExt as _;
 use std::collections::HashMap;
@@ -39,7 +40,103 @@ const RESPONSE_STREAM_CLOSE_IN_PROGRESS: &str = "response stream close is alread
 pub(crate) enum HttpStreamSource {
     Response(reqwest::Response),
     Receiver(tokio::sync::mpsc::Receiver<Result<Vec<u8>, String>>),
+    BufferedReceiver(HttpBufferReceiver),
     Stream(HttpChunkStream),
+}
+
+type HttpItem = Result<Vec<u8>, String>;
+
+pub(crate) struct HttpBufferReceiver {
+    receiver: tokio::sync::mpsc::Receiver<Buffered<HttpItem>>,
+}
+
+#[derive(Clone)]
+pub(crate) struct HttpBufferSender {
+    sender: tokio::sync::mpsc::Sender<Buffered<HttpItem>>,
+    owner: Option<Arc<BufferCounters>>,
+}
+
+pub(crate) fn http_buffer_channel(
+    capacity: usize,
+    owner: Option<Arc<BufferCounters>>,
+) -> (HttpBufferSender, HttpBufferReceiver) {
+    let (sender, receiver) = tokio::sync::mpsc::channel(capacity);
+    (
+        HttpBufferSender { sender, owner },
+        HttpBufferReceiver { receiver },
+    )
+}
+
+fn http_payload_capacity(item: &HttpItem) -> usize {
+    match item {
+        Ok(bytes) => bytes.capacity(),
+        Err(error) => error.capacity(),
+    }
+}
+
+impl HttpBufferSender {
+    fn buffer(&self, item: HttpItem) -> Buffered<HttpItem> {
+        let capacity = http_payload_capacity(&item);
+        Buffered::new(item, self.owner.as_ref(), BufferKind::Http, capacity)
+    }
+
+    async fn closed(&self) {
+        self.sender.closed().await;
+    }
+}
+
+#[derive(Clone)]
+pub(crate) enum HttpStreamWriter {
+    Raw(tokio::sync::mpsc::Sender<HttpItem>),
+    Buffered(HttpBufferSender),
+}
+
+impl HttpStreamWriter {
+    fn buffer(&self, item: HttpItem) -> Buffered<HttpItem> {
+        match self {
+            Self::Raw(_) => Buffered::untracked(item),
+            Self::Buffered(sender) => sender.buffer(item),
+        }
+    }
+
+    async fn send(&self, item: HttpItem) -> Result<(), ()> {
+        self.send_buffered(self.buffer(item)).await
+    }
+
+    async fn send_buffered(&self, item: Buffered<HttpItem>) -> Result<(), ()> {
+        match self {
+            Self::Raw(sender) => sender.send(item.into_inner()).await.map_err(|_| ()),
+            Self::Buffered(sender) => sender.sender.send(item).await.map_err(|_| ()),
+        }
+    }
+
+    pub(crate) async fn closed(&self) {
+        match self {
+            Self::Raw(sender) => sender.closed().await,
+            Self::Buffered(sender) => sender.closed().await,
+        }
+    }
+}
+
+impl From<tokio::sync::mpsc::Sender<HttpItem>> for HttpStreamWriter {
+    fn from(sender: tokio::sync::mpsc::Sender<HttpItem>) -> Self {
+        Self::Raw(sender)
+    }
+}
+impl From<HttpBufferSender> for HttpStreamWriter {
+    fn from(sender: HttpBufferSender) -> Self {
+        Self::Buffered(sender)
+    }
+}
+impl From<tokio::sync::mpsc::Receiver<HttpItem>> for HttpStreamSource {
+    fn from(receiver: tokio::sync::mpsc::Receiver<HttpItem>) -> Self {
+        Self::Receiver(receiver)
+    }
+}
+impl From<HttpBufferReceiver> for HttpStreamSource {
+    fn from(receiver: HttpBufferReceiver) -> Self {
+        Self::BufferedReceiver(receiver)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -141,7 +238,7 @@ pub(crate) struct HttpStreamEntry {
 }
 
 pub(crate) struct ResponseStreamWriter {
-    writer: tokio::sync::mpsc::Sender<Result<Vec<u8>, String>>,
+    writer: HttpStreamWriter,
     finished: tokio::sync::watch::Sender<bool>,
 }
 
@@ -173,17 +270,17 @@ impl HttpStreamEntry {
 
 impl ResponseStreamWriter {
     pub(crate) fn new(
-        writer: tokio::sync::mpsc::Sender<Result<Vec<u8>, String>>,
+        writer: impl Into<HttpStreamWriter>,
         finished: tokio::sync::watch::Sender<bool>,
     ) -> Self {
-        Self { writer, finished }
+        Self {
+            writer: writer.into(),
+            finished,
+        }
     }
 }
 
-type ResponseStreamCloseWatch = (
-    tokio::sync::mpsc::Sender<Result<Vec<u8>, String>>,
-    tokio::sync::watch::Receiver<bool>,
-);
+type ResponseStreamCloseWatch = (HttpStreamWriter, tokio::sync::watch::Receiver<bool>);
 
 pub(crate) struct HttpStreamState {
     closed: bool,
@@ -594,16 +691,12 @@ impl HttpStreamService {
     #[must_use = "a rejected response stream must not publish an ID"]
     pub(crate) fn register_response_pair(
         self: &Arc<Self>,
-        receiver: tokio::sync::mpsc::Receiver<Result<Vec<u8>, String>>,
+        receiver: impl Into<HttpStreamSource>,
         writer: ResponseStreamWriter,
     ) -> Option<u64> {
         let stream_id = NEXT_HTTP_STREAM_ID.fetch_add(1, Ordering::Relaxed);
-        self.register(
-            stream_id,
-            HttpStreamSource::Receiver(receiver),
-            Some(writer),
-        )
-        .then_some(stream_id)
+        self.register(stream_id, receiver.into(), Some(writer))
+            .then_some(stream_id)
     }
 
     pub(crate) fn register(
@@ -1120,6 +1213,14 @@ impl HttpStreamService {
         })
     }
 
+    pub(crate) fn buffer_item(&self, stream_id: u64, item: HttpItem) -> Buffered<HttpItem> {
+        let state = self.state.lock().unwrap();
+        match state.response_writers.get(&stream_id) {
+            Some(writer) => writer.writer.buffer(item),
+            None => Buffered::untracked(item),
+        }
+    }
+
     fn finish_activity(
         &self,
         stream_id: u64,
@@ -1474,7 +1575,7 @@ struct HttpStreamActivityLease {
 }
 
 pub(crate) struct HttpStreamActivity {
-    writer: tokio::sync::mpsc::Sender<Result<Vec<u8>, String>>,
+    writer: HttpStreamWriter,
     finished: tokio::sync::watch::Sender<bool>,
     lease: HttpStreamActivityLease,
 }
@@ -1843,6 +1944,12 @@ pub(crate) async fn next_http_stream_chunk(
             Some(Err(error)) => Err(error),
             None => Ok(None),
         },
+        HttpStreamSource::BufferedReceiver(receiver) => receiver
+            .receiver
+            .recv()
+            .await
+            .map(Buffered::into_inner)
+            .transpose(),
         HttpStreamSource::Stream(stream) => stream.next().await.transpose(),
     }
 }
@@ -1903,6 +2010,7 @@ pub(crate) fn http_stream_read_source_first_for_test(
     }
 }
 
+#[cfg(all(test, celld_internal_tests))]
 pub(crate) async fn response_stream_write(
     service: Arc<HttpStreamService>,
     stream_id: u64,
@@ -1911,12 +2019,21 @@ pub(crate) async fn response_stream_write(
     let Some(bytes) = bytes else {
         return Err("response stream chunks must be ArrayBuffer views".into());
     };
+    let item = service.buffer_item(stream_id, Ok(bytes));
+    response_stream_write_buffered(service, stream_id, item).await
+}
+
+pub(crate) async fn response_stream_write_buffered(
+    service: Arc<HttpStreamService>,
+    stream_id: u64,
+    item: Buffered<HttpItem>,
+) -> Result<(), String> {
     // Acquire on the first poll. Merely constructing and dropping this
     // future cannot read the Domain clock or create transient activity.
     let activity = service
         .begin_activity(stream_id, HttpStreamActivityKind::Write)
         .map_err(|error| error.write_message().to_string())?;
-    if activity.writer.send(Ok(bytes)).await.is_err() {
+    if activity.writer.send_buffered(item).await.is_err() {
         activity.lease.cancel_pair();
         return Err(RESPONSE_STREAM_CONSUMER_CANCELED.into());
     }
@@ -1967,6 +2084,10 @@ fn http_chunk_stream(source: HttpStreamSource) -> HttpChunkStream {
         HttpStreamSource::Receiver(receiver) => {
             Box::pin(tokio_stream::wrappers::ReceiverStream::new(receiver))
         }
+        HttpStreamSource::BufferedReceiver(receiver) => Box::pin(
+            tokio_stream::wrappers::ReceiverStream::new(receiver.receiver)
+                .map(Buffered::into_inner),
+        ),
         HttpStreamSource::Stream(stream) => stream,
     }
 }
@@ -1984,8 +2105,8 @@ enum HttpTeeSendOutcome {
 }
 
 async fn reserve_http_tee_send(
-    sender: &tokio::sync::mpsc::Sender<Result<Vec<u8>, String>>,
-    item: Result<Vec<u8>, String>,
+    sender: &HttpBufferSender,
+    item: Buffered<HttpItem>,
     termination: &HttpStreamTermination,
 ) -> HttpTeeSendOutcome {
     // Sender::send enqueues before it resolves, so a select cannot retract a
@@ -1993,7 +2114,7 @@ async fn reserve_http_tee_send(
     // committed source reason before the permit makes the value visible.
     let reservation = asyncrt::select_biased! {
         "a capacity reservation wins a tie because termination is rechecked before the send";
-        reservation = sender.reserve() => Some(reservation),
+        reservation = sender.sender.reserve() => Some(reservation),
         _ = futures_util::future::poll_fn(|context| termination.poll_reason(context)) => None,
     };
     if termination.reason() != HttpStreamTerminationReason::Live {
@@ -2010,16 +2131,19 @@ async fn reserve_http_tee_send(
 }
 
 async fn fan_out_http_tee_item(
-    tx1: &tokio::sync::mpsc::Sender<Result<Vec<u8>, String>>,
-    tx2: &tokio::sync::mpsc::Sender<Result<Vec<u8>, String>>,
+    tx1: &HttpBufferSender,
+    tx2: &HttpBufferSender,
     item: Result<Vec<u8>, String>,
     termination: &HttpStreamTermination,
 ) -> Option<(bool, bool)> {
-    let first = reserve_http_tee_send(tx1, item.clone(), termination).await;
+    // Both allocations exist while the first branch is backpressured.
+    let first_item = tx1.buffer(item.clone());
+    let second_item = tx2.buffer(item);
+    let first = reserve_http_tee_send(tx1, first_item, termination).await;
     if first == HttpTeeSendOutcome::SourceTerminated {
         return None;
     }
-    let second = reserve_http_tee_send(tx2, item, termination).await;
+    let second = reserve_http_tee_send(tx2, second_item, termination).await;
     if second == HttpTeeSendOutcome::SourceTerminated {
         return None;
     }
@@ -2029,24 +2153,30 @@ async fn fan_out_http_tee_item(
     ))
 }
 
-async fn both_http_tee_receivers_closed(
-    tx1: &tokio::sync::mpsc::Sender<Result<Vec<u8>, String>>,
-    tx2: &tokio::sync::mpsc::Sender<Result<Vec<u8>, String>>,
-) {
+async fn both_http_tee_receivers_closed(tx1: &HttpBufferSender, tx2: &HttpBufferSender) {
     tx1.closed().await;
     tx2.closed().await;
 }
 
+#[cfg(all(test, celld_internal_tests))]
 pub(crate) fn prepare_http_stream_tee(
     service: &Arc<HttpStreamService>,
-    mut source: HttpTransferredStream,
+    source: HttpTransferredStream,
 ) -> Result<((u64, u64), HttpTeePump), &'static str> {
-    let (tx1, rx1) = tokio::sync::mpsc::channel(HTTP_TEE_BRANCH_CAPACITY);
-    let (tx2, rx2) = tokio::sync::mpsc::channel(HTTP_TEE_BRANCH_CAPACITY);
-    let Some(id1) = service.register_source(HttpStreamSource::Receiver(rx1)) else {
+    prepare_http_stream_tee_owned(service, source, None)
+}
+
+pub(crate) fn prepare_http_stream_tee_owned(
+    service: &Arc<HttpStreamService>,
+    mut source: HttpTransferredStream,
+    owner: Option<Arc<BufferCounters>>,
+) -> Result<((u64, u64), HttpTeePump), &'static str> {
+    let (tx1, rx1) = http_buffer_channel(HTTP_TEE_BRANCH_CAPACITY, owner.clone());
+    let (tx2, rx2) = http_buffer_channel(HTTP_TEE_BRANCH_CAPACITY, owner);
+    let Some(id1) = service.register_source(rx1.into()) else {
         return Err(HTTP_STREAM_REGISTRATION_CLOSED);
     };
-    let Some(id2) = service.register_source(HttpStreamSource::Receiver(rx2)) else {
+    let Some(id2) = service.register_source(rx2.into()) else {
         service.cancel_source(id1);
         return Err(HTTP_STREAM_REGISTRATION_CLOSED);
     };
@@ -2102,4 +2232,70 @@ pub(crate) fn prepare_http_stream_tee(
 pub fn register_body_stream(stream: HttpChunkStream) -> Result<u64, String> {
     register_http_stream(HttpStreamSource::Stream(stream))
         .ok_or_else(|| HTTP_STREAM_REGISTRATION_CLOSED.to_string())
+}
+
+#[cfg(test)]
+mod monitor_buffer_tests {
+    use super::*;
+    use crate::monitor::BufferRegistry;
+
+    #[tokio::test]
+    async fn stream_capacity_survives_queueing_and_returns_on_read_or_cancellation() {
+        let registry = Arc::new(BufferRegistry::default());
+        let owner = registry.owner("Counter:a");
+        let other = registry.owner("Counter:b");
+        let (tx, mut rx) = http_buffer_channel(1, Some(owner.clone()));
+        let writer = HttpStreamWriter::Buffered(tx);
+        let mut bytes = Vec::with_capacity(4096);
+        bytes.push(1);
+        writer.send(Ok(bytes)).await.unwrap();
+        assert_eq!(owner.snapshot().http_stream_bytes, 4096);
+        assert_eq!(other.snapshot().total_bytes(), 0);
+
+        let mut blocked = Box::pin(writer.send(Ok(vec![2; 512])));
+        assert!(futures_util::poll!(blocked.as_mut()).is_pending());
+        assert_eq!(owner.snapshot().http_stream_bytes, 4608);
+        drop(blocked);
+        assert_eq!(owner.snapshot().http_stream_bytes, 4096);
+
+        assert_eq!(
+            rx.receiver.recv().await.unwrap().into_inner().unwrap(),
+            vec![1]
+        );
+        assert_eq!(owner.snapshot().http_stream_bytes, 0);
+        writer.send(Ok(vec![3; 1024])).await.unwrap();
+        drop(rx);
+        assert_eq!(owner.snapshot().http_stream_bytes, 0);
+        assert!(writer.send(Ok(vec![4; 2048])).await.is_err());
+        assert_eq!(owner.snapshot().http_stream_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn tee_counts_both_copies_and_cleans_up_backpressured_branches() {
+        let registry = Arc::new(BufferRegistry::default());
+        let owner = registry.owner("Counter:a");
+        let (tx1, rx1) = http_buffer_channel(1, Some(owner.clone()));
+        let (tx2, rx2) = http_buffer_channel(1, Some(owner.clone()));
+        let termination = HttpStreamTermination::new();
+        assert_eq!(
+            fan_out_http_tee_item(&tx1, &tx2, Ok(vec![0; 100]), &termination).await,
+            Some((true, true))
+        );
+        assert_eq!(owner.snapshot().http_stream_bytes, 200);
+        let mut pending = Box::pin(fan_out_http_tee_item(
+            &tx1,
+            &tx2,
+            Ok(vec![0; 300]),
+            &termination,
+        ));
+        assert!(futures_util::poll!(pending.as_mut()).is_pending());
+        assert_eq!(owner.snapshot().http_stream_bytes, 800);
+        termination.commit(HttpStreamTerminationReason::Cancelled);
+        assert_eq!(pending.await, None);
+        assert_eq!(owner.snapshot().http_stream_bytes, 200);
+        drop(rx1);
+        assert_eq!(owner.snapshot().http_stream_bytes, 100);
+        drop(rx2);
+        assert_eq!(owner.snapshot().http_stream_bytes, 0);
+    }
 }

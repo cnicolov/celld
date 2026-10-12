@@ -4,6 +4,7 @@ These small Wrangler projects demonstrate the Workers platform that `celld`
 supports, one service or API at a time:
 
 - `hello/` — a stateless Worker `fetch` handler
+- `effect/` — Effect spans and structured logs through the native isolate bridge
 - `webapi/` — common Web Platform APIs
 - `static-assets/` — an asset-only website with headers and redirects
 - `counter/` — a SQLite-backed Durable Object
