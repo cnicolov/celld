@@ -25,6 +25,84 @@ async fn lease(bucket: &Bucket, node: &str, generation: &str, log: serde_json::V
 
 struct UnavailablePeer;
 
+#[test]
+#[allow(clippy::disallowed_methods)] // Isolate the pre-fix non-unwinding null-pointer abort.
+fn paged_hydrator_retirement_during_a_step_is_an_error_not_a_null_dereference() {
+    const CHILD: &str = "CELLD_TEST_HYDRATOR_RETIREMENT";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "node_log::recovery_tests::paged_hydrator_retirement_during_a_step_is_an_error_not_a_null_dereference", "--nocapture"])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "hydrator retirement aborted its process: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    struct RetiringReader {
+        name: String,
+        pages: Vec<Vec<u8>>,
+        armed: std::sync::atomic::AtomicBool,
+    }
+    impl celld_ltx::paged_vfs::PageReader for RetiringReader {
+        fn page_size(&self) -> u32 {
+            4096
+        }
+        fn commit(&self) -> u32 {
+            self.pages.len() as u32
+        }
+        fn read_run(&self, pgno: u32) -> celld_ltx::error::Result<Vec<(u32, Vec<u8>)>> {
+            Ok(self
+                .pages
+                .get(pgno as usize - 1)
+                .map(|page| vec![(pgno, page.clone())])
+                .unwrap_or_default())
+        }
+        fn faults(&self) -> u64 {
+            // Retire after the step's initial registry lookup, before its next
+            // page iteration. The open connection still pins the registration.
+            if self.armed.swap(false, Ordering::SeqCst) {
+                celld_ltx::paged_vfs::unregister_paged_vfs(&self.name).unwrap();
+            }
+            0
+        }
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("source.sqlite");
+    {
+        let connection = rusqlite::Connection::open(&source).unwrap();
+        connection
+            .execute_batch("PRAGMA page_size=4096; CREATE TABLE data (payload BLOB)")
+            .unwrap();
+        connection
+            .execute("INSERT INTO data VALUES (?1)", [vec![42; 16384]])
+            .unwrap();
+    }
+    let name = celld_ltx::paged_vfs::next_registration_name();
+    let reader = Arc::new(RetiringReader {
+        name: name.clone(),
+        pages: std::fs::read(source)
+            .unwrap()
+            .chunks(4096)
+            .map(<[u8]>::to_vec)
+            .collect(),
+        armed: std::sync::atomic::AtomicBool::new(false),
+    });
+    let path = directory.path().join("paged.sqlite");
+    std::fs::File::create(&path).unwrap();
+    celld_ltx::paged_vfs::register_paged_vfs(&name, None, &path, reader.clone()).unwrap();
+    let mut hydrator = celld_ltx::paged_vfs::Hydrator::open(&name, &path).unwrap();
+    assert!(hydrator.step(1).unwrap().hydrated > 0);
+    reader.armed.store(true, Ordering::SeqCst);
+    let error = hydrator.step(1).unwrap_err();
+    assert!(error.to_string().contains("vfs is gone"), "{error}");
+    drop(hydrator);
+    celld_ltx::paged_vfs::unregister_paged_vfs(&name).unwrap();
+}
+
 fn sqlite_entries(root: &Path, cell: &str) -> anyhow::Result<Vec<Entry>> {
     let path = root.join("producer.sqlite");
     let mut capture = celld_ltx::Db::open(&path)?;
@@ -136,6 +214,18 @@ fn hot_recovery_certifies_only_the_checkpointed_cell_and_promotes_after_the_clai
                 .prepare_hot_recovery("Counter:hot", "leader")
                 .await?
         );
+        assert!(manager
+            .ltx
+            .has_hot_promotion("Counter:hot", "leader/old", 1, 1));
+        assert!(!manager
+            .ltx
+            .has_hot_promotion("Counter:hot", "leader/new", 1, 1));
+        assert!(!manager
+            .ltx
+            .has_hot_promotion("Counter:hot", "leader/old", 2, 1));
+        assert!(!manager
+            .ltx
+            .has_hot_promotion("Counter:hot", "leader/old", 1, 2));
         assert_eq!(
             read_record(&bucket, "leader").await?.unwrap().record.state,
             LogState::Recovering,
@@ -192,6 +282,112 @@ fn hot_recovery_certifies_only_the_checkpointed_cell_and_promotes_after_the_clai
         );
         manager.task_stop.request_stop();
         manager.child_tasks.join().await;
+        Ok(())
+    });
+}
+
+#[test]
+fn hot_preparation_serializes_retries_and_defers_the_eager_session_sweep() {
+    run(async {
+        let directory = tempfile::tempdir()?;
+        let bucket = Arc::new(Bucket::open_dev(&directory.path().join("bucket.sqlite"))?);
+        let follower = Arc::new(FollowerStore::new(
+            directory.path(),
+            Some(bucket.clone()),
+            "recoverer",
+        ));
+        let transport = Arc::new(DiskPeer {
+            follower: follower.clone(),
+            cursors: Mutex::new(Vec::new()),
+            failed_once: std::sync::atomic::AtomicBool::new(true),
+        });
+        let manager = Arc::new(manager_for(
+            directory.path(),
+            bucket.clone(),
+            transport.clone(),
+        )?);
+        manager.enable_hot_recovery(follower.clone(), directory.path(), 4 * 1024 * 1024, 4)?;
+        lease(&bucket, "recoverer", "generation", serde_json::Value::Null).await;
+        lease(
+            &bucket,
+            "leader",
+            "old",
+            serde_json::json!({
+                "epoch": 1, "ensemble": ["recoverer"], "tiered": 0, "state": "open", "active": true,
+            }),
+        )
+        .await;
+        bucket
+            .put(
+                "cells/Counter:slow-hot/own.json",
+                serde_json::to_vec(&serde_json::json!({"node": "leader", "epoch": 1}))?,
+            )
+            .await?;
+        follower.persist(
+            "leader/old",
+            FollowerState {
+                fragment_epoch: 1,
+                ..Default::default()
+            },
+        )?;
+        assert!(
+            follower
+                .append(AppendReq {
+                    leader: "leader/old".into(),
+                    epoch: 1,
+                    truncate_to: 0,
+                    entries: sqlite_entries(directory.path(), "Counter:slow-hot")?,
+                })
+                .await
+                .ok
+        );
+        wait_hot(&follower).await?;
+        let pause = Arc::new(hot_recovery::HotPreparationPause::default());
+        *manager.hot_preparation_pause.lock().unwrap() = Some(pause.clone());
+        let initial_manager = manager.clone();
+        let initial = crate::asyncrt::spawn(async move {
+            initial_manager
+                .ensure_cell_recovered("Counter:slow-hot", "leader")
+                .await
+        });
+        crate::asyncrt::timeout(std::time::Duration::from_secs(5), pause.entered.notified())
+            .await?;
+        // Simulate a core operation-deadline retry while the first preparation
+        // still validates its canonical prefix, and a concurrent maintenance tick.
+        let retry_manager = manager.clone();
+        let mut retry = crate::asyncrt::spawn(async move {
+            retry_manager
+                .ensure_cell_recovered("Counter:slow-hot", "leader")
+                .await
+        });
+        let early =
+            crate::asyncrt::timeout(std::time::Duration::from_millis(100), &mut retry).await;
+        let sweep = manager.recover_as("leader/old", RecoverMode::Sweep).await;
+        let while_preparing = read_record(&bucket, "leader").await?.unwrap().record.state;
+        let peer_pages = transport.cursors.lock().unwrap().len();
+        pause.resume.notify_one();
+        initial.await??;
+        let waited = early.is_err();
+        match early {
+            Ok(result) => result??,
+            Err(_) => retry.await??,
+        }
+        sweep?;
+        manager.task_stop.request_stop();
+        manager.child_tasks.join().await;
+        assert_eq!(
+            while_preparing,
+            LogState::Recovering,
+            "cold recovery sealed the session underneath a pending hot certificate"
+        );
+        assert!(waited, "a retry bypassed the still-running hot preparation");
+        assert_eq!(
+            peer_pages, 0,
+            "eager recovery fetched a cold tail during hot preparation"
+        );
+        let promotion = manager.ltx.hot_promotions_for_test("Counter:slow-hot");
+        assert_eq!(promotion.txid, 2);
+        promotion.verify()?;
         Ok(())
     });
 }

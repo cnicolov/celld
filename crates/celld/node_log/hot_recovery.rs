@@ -2,6 +2,13 @@
 
 use super::*;
 
+#[cfg(test)]
+#[derive(Default)]
+pub(super) struct HotPreparationPause {
+    pub entered: tokio::sync::Notify,
+    pub resume: tokio::sync::Notify,
+}
+
 impl NodeLogManager {
     pub fn enable_hot_recovery(
         &self,
@@ -37,7 +44,7 @@ impl NodeLogManager {
                             prefix = ltx.hot_checkpoint_position(&job.cell, job.epoch) => prefix,
                         };
                         if !matches!(prefix, Ok(end) if end >= header.min_txid.0 - 1) {
-                            warn!(cell = job.cell, epoch = job.epoch, "standby checkpoint withheld: canonical baseline is incomplete");
+                            warn!(cell = job.cell, epoch = job.epoch, required_txid = header.min_txid.0 - 1, ?prefix, "standby checkpoint withheld: canonical baseline is incomplete");
                             hot.failed(&job);
                             continue;
                         }
@@ -110,16 +117,22 @@ impl NodeLogManager {
         let Some(follower) = follower else {
             return Ok(false);
         };
+        let Some(folded) = read_record(&self.bucket, prior).await? else {
+            return Ok(false);
+        };
+        let session = format!("{prior}/{}", folded.wire.generation);
+        // Slow checksum/prefix validation can outlast a core operation deadline.
+        // Its retry and the eager whole-session sweep must not start a cold
+        // activation underneath this still-running hot preparation.
+        let recovery_lock = self.recovery_lock(&session);
+        let _single_flight = recovery_lock.lock().await;
+        let Some(mut folded) = read_record(&self.bucket, &session).await? else {
+            return Ok(false);
+        };
         let Some(owner) = self.ownership.read_owner(cell).await? else {
             return Ok(false);
         };
         if owner.node.as_deref() != Some(prior) {
-            return Ok(false);
-        }
-        let Some(mut folded) = read_record(&self.bucket, prior).await? else {
-            return Ok(false);
-        };
-        if folded.record.state == LogState::Sealed {
             return Ok(false);
         }
         if folded.wire.expires_ms > crate::ownership_store::now_ms()
@@ -127,8 +140,16 @@ impl NodeLogManager {
         {
             return Ok(false);
         }
-        let session = format!("{prior}/{}", folded.wire.generation);
         let source_epoch = folded.record.epoch;
+        if self
+            .ltx
+            .has_hot_promotion(cell, &session, source_epoch, owner.epoch)
+        {
+            return Ok(true);
+        }
+        if folded.record.state == LogState::Sealed {
+            return Ok(false);
+        }
         // Establish the same expired-session fence used by cold recovery.
         // The record remains Recovering until its entire session is drained.
         if folded.record.state == LogState::Open {
@@ -163,6 +184,13 @@ impl NodeLogManager {
         else {
             return Ok(false);
         };
+        #[cfg(test)]
+        let pause = self.hot_preparation_pause.lock().unwrap().take();
+        #[cfg(test)]
+        if let Some(pause) = pause {
+            pause.entered.notify_one();
+            pause.resume.notified().await;
+        }
         // Bucket-only writes can outrun a follower. A current canonical prefix
         // above the image makes it stale, never silently eligible.
         let covered = self.ltx.hot_checkpoint_position(cell, owner.epoch).await?;

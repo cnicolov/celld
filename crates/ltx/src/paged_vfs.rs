@@ -555,17 +555,25 @@ pub fn hydration(name: &str) -> Option<Hydration> {
             return None;
         }
         let app = &*((*vfs).pAppData as *mut VfsAppData);
-        let commit = app.reader.commit();
-        let lock = lock_pgno(app.reader.page_size());
-        let hydrated = app.hydrated.lock().unwrap();
-        Some(Hydration {
-            hydrated: (1..=commit)
-                .filter(|p| *p != lock && hydrated.contains(p))
-                .count() as u32,
-            total: commit - u32::from(lock <= commit),
-            faults: app.reader.faults(),
-        })
+        hydration_from_app(app)
     }
+}
+
+fn hydration_from_app(app: &VfsAppData) -> Option<Hydration> {
+    if app.retired.load(Ordering::Acquire) {
+        return None;
+    }
+    let commit = app.reader.commit();
+    let lock = lock_pgno(app.reader.page_size());
+    let hydrated = app.hydrated.lock().unwrap();
+    let count = Hydration {
+        hydrated: (1..=commit)
+            .filter(|p| *p != lock && hydrated.contains(p))
+            .count() as u32,
+        total: commit - u32::from(lock <= commit),
+        faults: app.reader.faults(),
+    };
+    (!app.retired.load(Ordering::Acquire)).then_some(count)
 }
 
 /// Faults the rest of the cut in, a run at a time, through the VFS's own
@@ -575,7 +583,6 @@ pub fn hydration(name: &str) -> Option<Hydration> {
 /// hydrated cell reads only its local file, and its faults are inert.
 pub struct Hydrator {
     conn: rusqlite::Connection,
-    name: String,
     cursor: u32,
 }
 
@@ -587,29 +594,13 @@ impl Hydrator {
             name,
         )
         .map_err(|error| crate::error::Error::Other(format!("hydrator open: {error}").into()))?;
-        Ok(Self {
-            conn,
-            name: name.to_string(),
-            cursor: 1,
-        })
+        Ok(Self { conn, cursor: 1 })
     }
 
     /// Faults in the next hole and the holes after it until at least `pages`
     /// pages arrived (a fault brings a run, so one read can bring many) or
     /// the cut is complete; returns the count afterwards.
     pub fn step(&mut self, pages: u32) -> crate::error::Result<Hydration> {
-        let cname =
-            CString::new(self.name.as_str()).map_err(|_| crate::error::Error::LTXCorrupted)?;
-        let (page_size, commit, lock) = unsafe {
-            let vfs = ffi::sqlite3_vfs_find(cname.as_ptr());
-            if vfs.is_null() {
-                return Err(crate::error::Error::Other("hydrator: vfs is gone".into()));
-            }
-            let app = &*((*vfs).pAppData as *mut VfsAppData);
-            let page_size = app.reader.page_size();
-            let commit = app.reader.commit();
-            (page_size, commit, lock_pgno(page_size))
-        };
         let mut file: *mut ffi::sqlite3_file = std::ptr::null_mut();
         // SAFETY: `conn` is open, and FILE_POINTER hands out its main file.
         let rc = unsafe {
@@ -623,21 +614,44 @@ impl Hydrator {
         if rc != ffi::SQLITE_OK || file.is_null() {
             return Err(crate::error::Error::Other("hydrator: no main file".into()));
         }
+        // SAFETY: this exclusively borrowed hydrator keeps its connection and
+        // main file open throughout the step. Our open-file count pins the VFS
+        // allocation even if it is concurrently unregistered. A fresh lookup
+        // by name does not: it can disappear between page iterations.
+        let app = unsafe {
+            if (*file).pMethods != &PAGED_IO_METHODS {
+                return Err(crate::error::Error::Other(
+                    "hydrator: not a paged main file".into(),
+                ));
+            }
+            let state = &*(*(file as *mut PagedFile)).state;
+            if state.reader.is_none() {
+                return Err(crate::error::Error::Other(
+                    "hydrator: not the registered database".into(),
+                ));
+            }
+            &*((*state.vfs).pAppData as *mut VfsAppData)
+        };
+        let page_size = app.reader.page_size();
+        let commit = app.reader.commit();
+        let lock = lock_pgno(page_size);
         let mut page = vec![0u8; page_size as usize];
         let gone = || crate::error::Error::Other("hydrator: vfs is gone".into());
-        let start = hydration(&self.name).ok_or_else(gone)?.hydrated;
+        let start = hydration_from_app(app).ok_or_else(gone)?.hydrated;
         // The count is recomputed only after a read that faulted: a page the
         // file already holds costs one set lookup, never a walk of the cut,
         // or a whale's step would be quadratic in its pages (the fleet's fill
         // made no progress in ten minutes).
         while self.cursor <= commit {
+            if app.retired.load(Ordering::Acquire) {
+                return Err(gone());
+            }
             let pgno = self.cursor;
             self.cursor += 1;
             if pgno == lock {
                 continue;
             }
-            let held = unsafe {
-                let app = &*((*ffi::sqlite3_vfs_find(cname.as_ptr())).pAppData as *mut VfsAppData);
+            let held = {
                 let hydrated = app.hydrated.lock().unwrap();
                 hydrated.contains(&pgno)
             };
@@ -659,11 +673,16 @@ impl Hydrator {
                     format!("hydrate page {pgno}: sqlite rc {rc}").into(),
                 ));
             }
-            if hydration(&self.name).ok_or_else(gone)?.hydrated - start >= pages {
+            if hydration_from_app(app)
+                .ok_or_else(gone)?
+                .hydrated
+                .saturating_sub(start)
+                >= pages
+            {
                 break;
             }
         }
-        hydration(&self.name).ok_or_else(gone)
+        hydration_from_app(app).ok_or_else(gone)
     }
 }
 

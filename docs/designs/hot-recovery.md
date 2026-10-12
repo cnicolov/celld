@@ -18,8 +18,21 @@ starts only after promotion. This is separate from the payload/K2 proposal.
    A delta is never published past a missing canonical baseline: the existing
    GC watermarks must not advance over a hole, even after cache eviction.
 3. If a follower joins after the initial snapshot, the worker seeds its image
-   from the canonical epoch chain using bounded page runs. Missing/gapped bases
-   are not eligible. An in-progress seed must fit the image's disk reservation.
+    from the canonical epoch chain using bounded page runs. Missing/gapped bases
+    are not eligible. An in-progress seed must fit the image's disk reservation.
+    Seeding does not wait for a quiet writer: appends received during download
+    remain in the bounded checkpoint queue and are replayed with the normal LTX
+    gap/checksum checks before the image becomes usable. Replayed commits are
+    not checkpoint-covered until their bucket publications succeed. The replay
+    also checks peak image size, including growth followed by truncation.
+    In-flight jobs are tied to an image incarnation, so a seed from a replaced
+     fragment cannot overwrite or discard its successor cache.
+     The seed's whole-file checksum scan runs outside the cache mutex so cache
+     status and follower append observations remain responsive during multi-GiB
+     validation. Installation reacquires the lock and rechecks the image
+     incarnation and bounded queued tail before applying it. A fragment change
+     during the scan fences its result just like one during download; scan
+     completion grants no coverage to commits not yet published to the bucket.
 4. For an expired owner, the existing `RecoverNodeLog` interlock can prepare a
    **cell-scoped** certificate instead of waiting for the entire dead session.
    It CAS-fences the session, seals the local follower fragment, checks the
@@ -56,6 +69,14 @@ For the exact `(owner generation, log fragment epoch, cell, cell epoch)`:
 This proves only this cell's baseline. It never changes `Recovering` to
 `Sealed` and never authorizes session-log GC. Normal epoch fencing and the
 serial actor's ownership/lease checks still govern every write.
+
+Hot preparation uses the same process-local session single-flight lock as cold
+recovery. A multi-GiB checksum/prefix check can outlast a core operation deadline;
+its retry waits and reuses only a still-live certificate for the same session,
+log fragment, and cell epoch. The eager session sweep skips an in-flight hot
+preparation, avoiding a cold activation that consumes the promotion before the
+certificate is installed. Certificate expiry and all lease/CAS proof checks
+remain unchanged; this serializes local work, not cross-node ownership.
 
 ## Bounds and fallback
 
@@ -94,12 +115,95 @@ The internal operator listener exposes `GET /hot-recovery` with image TXIDs,
 checkpoint coverage, preparation count, queue bytes, and readiness. Readiness
 is advisory; the expiry, fence, range, bucket, and ownership checks still run
 at promotion. Events are `hot_recovery_certified` and `hot_recovery_promoted`.
+Image materialization and checkpoint coverage are separate: continuous writes
+can outrun the serialized checkpoint publisher even though replication and the
+private SQLite image keep up. An uncovered image is not eligible for hot
+promotion; ordinary recovery remains the fallback.
+Even `ready=true` certifies only the commits observed by that cache. Bucket-only
+acknowledgements during degraded replication can advance the owner beyond it;
+the canonical-prefix equality check rejects that stale image at promotion.
+The eager-restore debug qualification also exposed repeated log rotations when
+full-snapshot materialization outlasted the append/stall envelope. Moving that
+advisory work off the acknowledgement path would require a bounded, ordered
+worker with preserved seal/coverage proofs; it is not fixed or bypassed here.
 
 Run the real three-process fault suite with:
 
 ```sh
 cargo build -p celld --bin celld
 python3 scripts/recovery-import/run.py --mib 600 --hot-recovery
+```
+
+For a RustFS-backed multi-GiB owner-crash test, first complete the large
+[follower/rejoin workload](../placement.md#follower-disappearance-and-rejoin-during-continuous-writes),
+then reuse its **stopped, passing test-owned** dataset instead of allocating
+another full copy:
+
+```sh
+python3 scripts/hot-owner-failover-smoke.py \
+  --source-state /path/to/celld-hot-follower-rejoin-ARTIFACTS \
+  --endpoint http://127.0.0.1:19000 --standby-mb 8192 --timeout 900
+```
+
+This starts fresh processes on those same recovery disks, so old process-local
+cache certificates cannot be reused. It warms two full-size images from real
+new commits, then runs two **owner SIGKILL** cases. The checkpointed case stops
+client writes and drains checkpoint coverage before the crash. It compares
+standby TXIDs to the owner's captured local LTX position and checks the last
+acknowledged row in both quiet images; sparse new marker commits may be needed
+to refresh followers after a fragment repair. It must emit
+`hot_recovery_certified` and `hot_recovery_promoted` before the first independently
+verified recovered read, with zero cold peer-tail requests or response bytes
+before that read. The continuous case keeps unique writes going through a surviving ingress
+and labels the observed recovery path as hot or cold, rather than mistaking safe
+fallback for a hot-promotion pass.
+
+After each crash, every original preload digest and acknowledged later write
+is verified through both survivors and again through the returning old owner.
+The old owner must not change the successor's ownership fence. Resource phases,
+first-read errors/time, hot events, sampled owner epochs, and peer-tail counters
+are preserved in the new report. Verification groups eight original 1 MiB
+receipts into bounded 8 MiB responses; each original receipt is still checked.
+The test redeploys only its own fixture to permit that read size. Its peer proxy
+forces one ordinary HTTP request per connection so keep-alive reuse cannot hide
+a later tail request; cell-RPC upgrade handshakes remain unchanged. These
+transport settings and local debug timings are not production benchmarks.
+If retrying a completed reuse, pass each previous run with `--previous-state`
+so all earlier acknowledgement receipts remain checked and every attempted ID,
+including ambiguous failures, remains reserved. `--paged-min-mib` is an explicit
+test-path override recorded in the report; omit it for the default threshold.
+Source and execution binaries must match by default. `--binary-change-reason`
+explicitly permits a rebuilt binary and records both hashes and the reason;
+all nodes still run one binary, so this does not test a mixed-version rollout.
+
+Owner verification uses a 120-second explicit read deadline for both preload
+and acknowledged tail, and records range-level progress/failures. Workload write
+deadlines are unchanged. `--verification-only` can audit all receipts from
+stopped prior attempts without another workload write or fault; it is recorded
+as **post-restart verification**, never as a replacement owner-crash result.
+The harness launches every fleet node before waiting for Worker readiness:
+predecessor recovery can require another restarting node's original witness
+disk. Sequential readiness waits would prevent that witness from ever starting.
+Cleanup return codes are part of the final report and must be zero, so a
+self-fence, shutdown abort, or forced kill is not hidden behind successful
+digest events. The sampler times its existing bucket-owner read independently
+of node lease effects, without extra requests, to help distinguish backend
+latency from in-process delay. The paged hydrator's open file pins
+its registration through each step, allowing concurrent unregister to cancel
+that background step safely rather than dereferencing a vanished name lookup.
+
+The recorded 4 GiB checkpointed fault passed genuine hot promotion and full
+digest/fence checks. Its busy fault recovered cold, but in-run verification
+timed out before the second returning-owner fence. A separate post-restart audit
+subsequently verified all 279,214 known acknowledged rows through three ingresses
+and exited cleanly with the unchanged 4-second TTL. That audit does not replace
+the incomplete busy-fault result or resolve the earlier lease-contention failure;
+its cold full-data read still took about 32 minutes. See
+[testing results](../testing.md) for reports, timings, resource costs, and the
+remaining limits.
+
+```sh
+python3 scripts/test-hot-owner-failover-smoke.py
 ```
 
 The hot owner-kill case requires warm followers before the fault, promotion
