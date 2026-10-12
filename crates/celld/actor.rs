@@ -187,6 +187,7 @@ impl<V> TimerSlots<V> {
 }
 
 pub struct MemoryOwnership {
+    placement_pool: celld_logic::placement::Pool,
     node: String,
     owners: BTreeMap<String, OwnerRecord>,
     leases: BTreeMap<String, NodeLeaseRecord>,
@@ -200,6 +201,51 @@ pub enum Ownership {
 }
 
 impl Ownership {
+    pub async fn create_cell(
+        &self,
+        cell: &str,
+        pool: celld_logic::placement::Pool,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            celld_logic::cell::valid_cell_scope(cell),
+            "invalid cell scope"
+        );
+        match self {
+            Self::Bucket(bucket) => bucket.create_cell(cell, pool).await,
+            Self::Memory(memory) => {
+                let mut memory = memory.lock().await;
+                if let Some(owner) = memory.owners.get(cell) {
+                    anyhow::ensure!(
+                        owner.placement_pool == pool,
+                        "cell placement is immutable: existing pool {}, requested {}",
+                        owner.placement_pool,
+                        pool
+                    );
+                } else {
+                    let etag = format!("e{}", memory.next_etag);
+                    memory.next_etag += 1;
+                    memory.owners.insert(
+                        cell.into(),
+                        OwnerRecord {
+                            placement_pool: pool,
+                            node: None,
+                            epoch: 0,
+                            etag,
+                        },
+                    );
+                }
+                Ok(())
+            }
+        }
+    }
+
+    async fn placement_pool(&self) -> celld_logic::placement::Pool {
+        match self {
+            Self::Bucket(bucket) => bucket.placement_pool(),
+            Self::Memory(memory) => memory.lock().await.placement_pool,
+        }
+    }
+
     pub(crate) async fn read_owner(&self, cell: &str) -> Result<Option<OwnerRecord>, Failure> {
         match self {
             Self::Memory(memory) => Ok(memory.lock().await.owners.get(cell).cloned()),
@@ -210,7 +256,10 @@ impl Ownership {
         }
     }
 
-    async fn read_node_lease(&self, owner: &str) -> Result<Option<NodeLeaseRecord>, Failure> {
+    pub(crate) async fn read_node_lease(
+        &self,
+        owner: &str,
+    ) -> Result<Option<NodeLeaseRecord>, Failure> {
         match self {
             Self::Memory(memory) => Ok(memory.lock().await.leases.get(owner).cloned()),
             Self::Bucket(bucket) => bucket.read_node_lease(owner).await.map_err(|error| {
@@ -263,19 +312,23 @@ impl Ownership {
             Self::Memory(memory) => {
                 let mut memory = memory.lock().await;
                 let allowed = match guard {
-                    CasGuard::Absent => !memory.owners.contains_key(cell),
-                    CasGuard::Match(expected) => memory
-                        .owners
-                        .get(cell)
-                        .is_some_and(|owner| owner.etag == expected),
+                    CasGuard::Absent => {
+                        !memory.owners.contains_key(cell)
+                            && memory.placement_pool == celld_logic::placement::Pool::DEFAULT
+                    }
+                    CasGuard::Match(expected) => memory.owners.get(cell).is_some_and(|owner| {
+                        owner.etag == expected && owner.placement_pool == memory.placement_pool
+                    }),
                 };
                 if allowed {
                     let etag = format!("e{}", memory.next_etag);
                     memory.next_etag += 1;
                     let node = memory.node.clone();
+                    let placement_pool = memory.placement_pool;
                     memory.owners.insert(
                         cell.into(),
                         OwnerRecord {
+                            placement_pool,
                             node: Some(node),
                             epoch,
                             etag,
@@ -307,11 +360,17 @@ impl Ownership {
                     owner.node.as_deref() == Some(node.as_str()) && owner.epoch == epoch
                 });
                 if releasable {
+                    let placement_pool = memory
+                        .owners
+                        .get(cell)
+                        .expect("releasable owner")
+                        .placement_pool;
                     let etag = format!("e{}", memory.next_etag);
                     memory.next_etag += 1;
                     memory.owners.insert(
                         cell.into(),
                         OwnerRecord {
+                            placement_pool,
                             node: None,
                             epoch,
                             etag,
@@ -2048,7 +2107,13 @@ async fn handoff_candidates(
         directory.peers = ownership.read_capacity_peers().await?;
         directory.sampled_at_mono_ms = Some(now_mono_ms);
     }
-    let peers = directory.peers.clone();
+    let pool = ownership.placement_pool().await;
+    let peers = directory
+        .peers
+        .iter()
+        .filter(|peer| peer.placement_pool == pool)
+        .cloned()
+        .collect();
     let current_ms = now_ms();
     let mut ranked = rank_handoff_candidates(peers, source, cell, current_ms);
     // Several cells share this directory between refreshes. Emit one peer
@@ -2440,6 +2505,7 @@ impl Actor {
             ownership
         } else {
             Ownership::Memory(Arc::new(Mutex::new(MemoryOwnership {
+                placement_pool: crate::env_vars::placement_pool()?,
                 node: node.clone(),
                 owners: BTreeMap::new(),
                 leases: BTreeMap::new(),
@@ -2481,6 +2547,7 @@ impl Actor {
             state: ActorState::from(State::new(
                 node,
                 Config {
+                    placement_pool: crate::env_vars::placement_pool()?,
                     max_resident: limits.resident,
                     max_activations: limits.activations,
                     // Each eviction proves durability, so bound background bucket I/O.
@@ -4339,6 +4406,7 @@ fn request_error_phase(error: RequestError) -> &'static str {
         RequestError::NodeUnavailable | RequestError::NodeFenced => "node_authority",
         RequestError::ResolveFailed | RequestError::PeerIncompatible => "ownership_lookup",
         RequestError::CapacityExhausted => "capacity_wait",
+        RequestError::PlacementUnavailable => "placement_unavailable",
         RequestError::AcquireFailed => "ownership_acquire",
         RequestError::RestoreFailed => "restore",
         RequestError::RuntimeFailed => "isolate_startup",

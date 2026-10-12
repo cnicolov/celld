@@ -70,6 +70,8 @@ impl PresenceSnapshot {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Config {
+    /// Every cell owned by this node and its node-session replicas share this pool.
+    pub placement_pool: crate::placement::Pool,
     /// Resident cells plus activation reservations may never exceed this.
     pub max_resident: usize,
     /// Complete nonresident routes which may be in flight at once.
@@ -163,6 +165,8 @@ pub struct Config {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OwnerRecord {
+    /// Immutable through ownership CAS/release; legacy records belong to default.
+    pub placement_pool: crate::placement::Pool,
     /// `None` is a deliberately released, fenced record. Epochs never reset.
     pub node: Option<NodeId>,
     pub epoch: Epoch,
@@ -175,6 +179,7 @@ pub struct OwnerRecord {
 /// not the storage adapter, decides whether it is live and routable.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NodeLeaseRecord {
+    pub placement_pool: crate::placement::Pool,
     pub node: NodeId,
     pub addr: String,
     pub expires_ms: u64,
@@ -198,6 +203,9 @@ pub struct NodeLeaseRecord {
 /// must still atomically admit the handoff before it acquires ownership.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CapacityPeer {
+    pub placement_pool: crate::placement::Pool,
+    /// Advertised capability, not a per-cell promotion certificate.
+    pub hot_recovery: bool,
     pub node: NodeId,
     pub addr: String,
     pub expires_ms: u64,
@@ -921,6 +929,8 @@ pub enum RequestError {
     NodeFenced,
     PeerIncompatible,
     CapacityExhausted,
+    /// No compatible placement pool can own this cell. Never falls back locally.
+    PlacementUnavailable,
     /// A local write ran but its durability could not be proven, so the
     /// response must fail rather than falsely acknowledge the write.
     DurabilityUnproven,

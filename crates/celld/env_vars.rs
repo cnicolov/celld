@@ -10,6 +10,18 @@ use anyhow::{anyhow, bail};
 
 pub const DEFAULT_SHUTDOWN_TOTAL_MS: u64 = 40_000;
 
+pub fn placement_pool() -> anyhow::Result<celld_logic::placement::Pool> {
+    Ok(optional("CELLD_PLACEMENT_POOL")?.unwrap_or_default())
+}
+
+pub fn hot_recovery() -> anyhow::Result<bool> {
+    match value("CELLD_HOT_RECOVERY")?.as_deref().unwrap_or("0") {
+        "0" => Ok(false),
+        "1" => Ok(true),
+        _ => bail!("CELLD_HOT_RECOVERY must be 0 or 1"),
+    }
+}
+
 /// Shared by deployment assembly, managed deployment validation and serving
 /// nodes. Operators must configure the same policy on all three paths.
 pub fn max_asset_file_bytes() -> anyhow::Result<u64> {
@@ -293,6 +305,8 @@ pub fn validate() -> anyhow::Result<()> {
         .unwrap_or(4);
     let maximum = positive_or::<usize>("CELLD_MAX_STATELESS_ISOLATES", cores)?;
     stateless_pool_minimum(maximum)?;
+    placement_pool()?;
+    hot_recovery()?;
     shutdown_timing()?;
 
     positive::<usize>("CELLD_MAX_DYNAMIC_WORKER_CODE_BYTES")?;

@@ -8,6 +8,51 @@ use std::path::Path;
 
 const IDENTITY_FILE: &str = "node-id";
 
+/// A recovery disk cannot silently change hardware/placement identity. Legacy
+/// disks belong to default; adding a named pool requires a new node/data dir.
+#[allow(clippy::disallowed_methods)] // Atomic no-clobber host startup primitive.
+pub fn validate_placement_pool(
+    data_dir: &Path,
+    pool: celld_logic::placement::Pool,
+) -> anyhow::Result<()> {
+    let filesystem = crate::asyncrt::fs();
+    let path = data_dir.join("placement-pool");
+    let read = || -> anyhow::Result<Option<celld_logic::placement::Pool>> {
+        match filesystem.read(&path) {
+            Ok(bytes) => Ok(Some(
+                std::str::from_utf8(&bytes)?
+                    .trim_end_matches('\n')
+                    .parse()
+                    .map_err(anyhow::Error::msg)?,
+            )),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error).context("read persisted placement pool"),
+        }
+    };
+    if let Some(stored) = read()? {
+        anyhow::ensure!(stored == pool, "CELLD_PLACEMENT_POOL does not match this recovery disk's pool ({stored}); use a new node/data directory");
+        return Ok(());
+    }
+    if pool != celld_logic::placement::Pool::DEFAULT && read_identity(data_dir, None)?.is_some() {
+        anyhow::bail!("legacy recovery disks belong to the default pool; use a new node/data directory for {pool}");
+    }
+    filesystem.create_dir_all(data_dir)?;
+    let mut temporary = tempfile::NamedTempFile::new_in(data_dir)?;
+    writeln!(temporary, "{pool}")?;
+    temporary.as_file().sync_all()?;
+    match temporary.persist_noclobber(&path) {
+        Ok(_) => {}
+        Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error.error).context("publish placement pool"),
+    }
+    filesystem.sync_all(data_dir)?;
+    anyhow::ensure!(
+        read()? == Some(pool),
+        "placement pool changed during startup"
+    );
+    Ok(())
+}
+
 fn read_identity(data_dir: &Path, explicit: Option<&str>) -> anyhow::Result<Option<String>> {
     let bytes = match crate::asyncrt::fs().read(&data_dir.join(IDENTITY_FILE)) {
         Ok(bytes) => bytes,

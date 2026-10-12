@@ -680,6 +680,7 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
         .is_some_and(|flags| flags.iter().any(|flag| flag.as_str() == Some("sqlite_vec")));
     let uses_d1 = project.do_classes.iter().any(|class| class == D1_CLASS);
     let python_runtime = project.python.is_some();
+    let has_cells = !project.do_classes.is_empty();
     let manifest = Manifest {
         schema_version: if asset_reference.is_some() { 2 } else { 1 },
         version: version.clone(),
@@ -706,6 +707,9 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
         // partially deserializing the manifest and failing at worker load.
         required_features: {
             let mut features = Vec::new();
+            if has_cells {
+                features.push(crate::protocol::FEATURE_CELL_PLACEMENT_V1.to_string());
+            }
             if built_assets.is_some() {
                 features.push(FEATURE_ASSETS_V1.to_string());
             }
