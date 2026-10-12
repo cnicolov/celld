@@ -8334,7 +8334,7 @@ const __wfTimeout = (promise, ms, name, attempt) =>
 // cannot suppress a retry or forge one by returning a marked exception.
 const __wfTrackStorageFailures = (storage, driver) => {
   const tracked = Object.create(storage);
-  for (const name of ["get", "put", "transactionSync"]) {
+  for (const name of ["get", "put", "transactionSync", "sync"]) {
     Object.defineProperty(tracked, name, {
       value(...args) {
         try {
@@ -8355,6 +8355,253 @@ const __wfTrackStorageFailures = (storage, driver) => {
     });
   }
   return tracked;
+};
+
+// History is instance-owned, rather than generation-owned: an explicit restart
+// keeps cursors monotonic, while deleting/expiring an instance deletes its history.
+const __WF_HISTORY_PREFIX = "__wf.history.event.";
+const __WF_HISTORY_POLL_MS = 25000;
+const __WF_TELEMETRY_PREFIX = "__wf.telemetry.pending.";
+const __wfTraceNew = (parent) => {
+  const json = __workflow_trace_new(parent === undefined ? undefined : JSON.stringify(parent));
+  return json === undefined ? undefined : JSON.parse(json);
+};
+const __wfWithTrace = (trace, callback) => trace === undefined
+  ? callback() : __workflow_trace_enter(JSON.stringify(trace), callback);
+const __wfTelemetryRoot = (previous) => {
+  const trace = __wfTraceNew(previous?.trace);
+  if (trace === undefined) return undefined;
+  // Explicit restarts are sibling executions within the admitted trace.
+  if (previous !== undefined) trace.parent_span_id = previous.trace.parent_span_id;
+  return { trace, start_ms: Date.now() };
+};
+const __wfTelemetryStepKey = (meta, key) =>
+  __wfLedgerPrefix(meta.generation) + "telemetry.step." +
+  key.slice((__wfLedgerPrefix(meta.generation) + "step.").length);
+const __wfTelemetryQueue = (kv, eventId, spans) => {
+  if (spans.length === 0) return;
+  const key = __WF_TELEMETRY_PREFIX + String(eventId).padStart(16, "0");
+  kv.put(key, [...(kv.get(key) ?? []), ...spans]);
+};
+// Span identity and open intervals are checkpoint data; finished descriptions
+// are staged in the same transaction as native history. Export is a best-effort
+// diagnostic projection, and never runs before that commit's durability proof.
+const __wfTelemetryStage = (kv, meta, event, key) => {
+  if (!meta.telemetry?.trace.sampled) return;
+  const spans = [];
+  const common = {
+    "celld.workflow.name": meta.workflowName,
+    "celld.workflow.instance_id": meta.instanceId,
+    "celld.workflow.generation": meta.generation,
+    "celld.workflow.history_epoch": meta.historyEpoch,
+  };
+  const begin = (name, parent, attributes = {}) => {
+    const trace = __wfTraceNew(parent);
+    return trace === undefined ? undefined : {
+      trace, name, start_ms: event.timestamp,
+      attributes: { ...common, ...attributes, "celld.workflow.start_event_id": event.eventId },
+    };
+  };
+  const finish = (span, outcome, error, attributes = {}) => {
+    if (span === undefined) return;
+    spans.push({ ...span, end_ms: event.timestamp,
+      attributes: { ...span.attributes, ...attributes,
+        ...(error?.name === undefined ? {} : { "error.type": String(error.name) }),
+        "celld.workflow.event_id": event.eventId, "celld.workflow.outcome": outcome },
+      ...(error === undefined ? {} : { error: String(error.message ?? error) }),
+    });
+  };
+  const interrupted = (state, outcome) => {
+    const error = { message: `Workflow ${outcome} before this interval settled` };
+    finish(state.attempt, outcome, error, { "celld.workflow.interrupted": true });
+    finish(state.retry, outcome, error);
+    finish(state.span, outcome, error);
+    delete state.attempt;
+    delete state.retry;
+    delete state.span;
+  };
+  const prefix = __wfLedgerPrefix(meta.generation);
+  const pauseKey = prefix + "telemetry.pause";
+  if (event.type.startsWith("workflow_")) {
+    const transition = begin("workflow.transition", meta.telemetry.trace, {
+      "celld.workflow.event_type": event.type,
+    });
+    finish(transition, event.type.slice("workflow_".length), event.error);
+    if (event.type === "workflow_paused") {
+      kv.put(pauseKey, begin("workflow.pause", meta.telemetry.trace));
+    } else if (["workflow_queued", "workflow_running", "workflow_completed",
+      "workflow_errored", "workflow_terminated", "workflow_restarted"].includes(event.type)) {
+      finish(kv.get(pauseKey), ["workflow_queued", "workflow_running"].includes(event.type)
+        ? "resumed" : event.type.slice("workflow_".length));
+      kv.delete(pauseKey);
+    }
+    if (["workflow_completed", "workflow_errored", "workflow_terminated",
+      "workflow_restarted"].includes(event.type) && !kv.get(prefix + "telemetry.closed")) {
+      const outcome = event.type.slice("workflow_".length);
+      for (const [stateKey, state] of kv.list({ prefix: prefix + "telemetry.step." })) {
+        if (state.attempt === undefined && state.retry === undefined && state.span === undefined) continue;
+        interrupted(state, outcome);
+        kv.put(stateKey, state);
+      }
+      finish({ ...meta.telemetry, name: "workflow", attributes: {
+        ...common, "celld.workflow.start_event_id": meta.historyStart + 1,
+      } }, outcome,
+        event.error ?? (outcome === "terminated" ? { message: "Workflow terminated" } : undefined));
+      kv.put(prefix + "telemetry.closed", true);
+    }
+  } else if (key !== undefined) {
+    const stateKey = __wfTelemetryStepKey(meta, key);
+    const suffix = key.slice((prefix + "step.").length);
+    const stepAttributes = {
+      "celld.workflow.step_name": event.stepName,
+      "celld.workflow.step_count": Number(suffix.slice(0, suffix.indexOf("."))),
+    };
+    const state = kv.get(stateKey) ?? { executions: 0 };
+    switch (event.type) {
+      case "step_started":
+        state.span = begin("workflow.step", meta.telemetry.trace, {
+          ...stepAttributes,
+          "celld.workflow.retry_limit": event.config.retries.limit,
+          "celld.workflow.retry_delay": event.config.retries.delay,
+          "celld.workflow.retry_backoff": event.config.retries.backoff ?? "constant",
+          "celld.workflow.timeout": event.config.timeout,
+        });
+        break;
+      case "attempt_started":
+        // A repeated start within one native attempt slot is physical recovery,
+        // not a fabricated attempt_errored or a newly numbered native retry.
+        finish(state.attempt, "interrupted", { message: "Callback re-entered after recovery" }, {
+          "celld.workflow.interrupted": true,
+          "celld.workflow.end_observed_at_recovery": true,
+        });
+        finish(state.retry, "elapsed");
+        delete state.retry;
+        state.executions++;
+        state.attempt = begin("workflow.attempt", state.span?.trace ?? meta.telemetry.trace, {
+          ...stepAttributes, "celld.workflow.attempt": event.attempt,
+          "celld.workflow.callback_execution": state.executions,
+        });
+        break;
+      case "attempt_completed":
+      case "attempt_errored":
+        finish(state.attempt, event.type === "attempt_completed" ? "completed" : "errored",
+          event.error, event.error === undefined ? {} : { "error.type": event.error.name });
+        delete state.attempt;
+        state.error = event.error;
+        if (event.retryDelayMs !== undefined) {
+          state.retry = begin("workflow.retry_delay", state.span?.trace ?? meta.telemetry.trace, {
+            ...stepAttributes, "celld.workflow.attempt": event.attempt,
+            "celld.workflow.retry_delay_ms": event.retryDelayMs,
+          });
+        }
+        break;
+      case "step_completed":
+      case "step_errored":
+        finish(state.span, event.type === "step_completed" ? "completed" : "errored",
+          event.type === "step_completed" ? undefined : kv.get(key)?.error ?? state.error);
+        delete state.span;
+        break;
+      case "sleep_started":
+        state.span = begin("workflow.sleep", meta.telemetry.trace, {
+          ...stepAttributes, "celld.workflow.sleep_duration_ms": event.durationMs,
+        });
+        break;
+      case "wait_started":
+        state.span = begin("workflow.wait", meta.telemetry.trace, {
+          ...stepAttributes, "celld.workflow.event_type": event.eventType,
+          "celld.workflow.wait_timeout_ms": kv.get(key)?.deadline - event.timestamp,
+        });
+        break;
+      case "sleep_completed":
+      case "wait_completed":
+      case "wait_timed_out":
+        finish(state.span, event.type === "wait_timed_out" ? "timed_out" : "completed",
+          event.type === "wait_timed_out" ? kv.get(key)?.error ?? { message: "Workflow event wait timed out" } : undefined);
+        delete state.span;
+        break;
+    }
+    kv.put(stateKey, state);
+  }
+  __wfTelemetryQueue(kv, event.eventId, spans);
+};
+const __WF_HISTORY_TYPES = new Set([
+  "workflow_queued", "workflow_started", "workflow_running", "workflow_paused",
+  "workflow_waiting_for_pause", "workflow_waiting", "workflow_completed",
+  "workflow_errored", "workflow_terminated", "step_started", "step_completed",
+  "step_errored", "attempt_started", "attempt_completed", "attempt_errored",
+  "sleep_started", "sleep_completed", "wait_started", "wait_completed",
+  "wait_timed_out",
+  "rollback_started", "rollback_step_started", "rollback_step_completed",
+  "rollback_step_errored", "rollback_attempt_started", "rollback_attempt_completed",
+  "rollback_attempt_errored", "rollback_completed", "rollback_errored",
+]);
+const __wfHistoryKey = (id) =>
+  __WF_HISTORY_PREFIX + String(id).padStart(16, "0");
+const __wfHistoryAppend = (kv, meta, events, stepKey) => {
+  // Old instances may still execute, but cannot manufacture a missing history.
+  if (meta.historyEpoch === undefined) return;
+  let sequence = kv.get("__wf.history.sequence") ?? 0;
+  for (const event of events) {
+    if (!Number.isSafeInteger(++sequence)) throw __wfError("history cursor exhausted");
+    const recorded = {
+      ...event, instanceId: meta.instanceId, eventId: sequence, timestamp: Date.now(),
+    };
+    kv.put(__wfHistoryKey(sequence), recorded);
+    __wfTelemetryStage(kv, meta, recorded, stepKey);
+  }
+  kv.put("__wf.history.sequence", sequence);
+};
+const __wfSubscribeOptions = (options = {}) => {
+  if (!__wfOwnObject(options) ||
+      __wfUnknownKey(options, ["cursor", "filter"]) !== undefined) {
+    throw __wfError("subscribe() needs options with only cursor and filter");
+  }
+  const { cursor, filter } = options;
+  if (cursor !== undefined && (!Number.isSafeInteger(cursor) || cursor < 0)) {
+    throw __wfError("subscribe() cursor must be a non-negative safe integer");
+  }
+  if (filter !== undefined && (!Array.isArray(filter) ||
+      filter.some((type) => !__WF_HISTORY_TYPES.has(type)))) {
+    throw __wfError("subscribe() filter must be an array of Workflow event types");
+  }
+  return { cursor, filter: filter === undefined ? undefined : [...new Set(filter)] };
+};
+const __wfHistoryTerminal = (type) =>
+  type === "workflow_completed" || type === "workflow_errored" ||
+  type === "workflow_terminated";
+const __wfHistoryStatus = (kv, meta, previous) => {
+  const events = [];
+  if (meta.status === "running" && !meta.historyStarted) {
+    meta.historyStarted = true;
+    events.push({ type: "workflow_started", params: meta.params });
+  }
+  if (meta.status !== previous) {
+    const type = {
+      queued: "workflow_queued", running: "workflow_running",
+      waiting: "workflow_waiting", paused: "workflow_paused",
+      waitingForPause: "workflow_waiting_for_pause", complete: "workflow_completed",
+      errored: "workflow_errored", terminated: "workflow_terminated",
+    }[meta.status];
+    events.push({ type,
+      ...(meta.status === "complete" ? { output: meta.output } : {}),
+      ...(meta.status === "errored" ? { error: meta.error } : {}),
+    });
+  }
+  __wfHistoryAppend(kv, meta, events);
+};
+// The record and its evidence form one SQLite commit. A callback from a replaced
+// generation, or one that loses to terminate(), may not append late evidence.
+const __wfStepCommit = (driver, key, value, events) => {
+  const committed = driver.storage.transactionSync(() => {
+    const meta = driver.storage.kv.get("__wf.meta");
+    if (meta === undefined || meta.generation !== driver.generation ||
+        __wfTerminal(meta.status)) return false;
+    driver.storage.kv.put(key, value);
+    __wfHistoryAppend(driver.storage.kv, meta, events, key);
+    return true;
+  });
+  if (committed) driver.historyChanged();
+  return committed;
 };
 
 // The WorkflowStep the driver hands to run(). Each method resolves its step
@@ -8493,14 +8740,25 @@ const __wfMakeStep = (driver) => {
         // Persist the history entry before the callback starts. A concurrent
         // selected restart can therefore name an in-flight occurrence, and
         // its new generation fences the callback's eventual old-ledger write.
-        await storage.put(key, {
+        const events = [];
+        if (record === undefined) events.push({
+          type: "step_started", stepName: name,
+          config: { retries: { ...contextRetries,
+            ...(typeof retries.delay === "function" ? { delay: "[dynamic]" } : {}) },
+            timeout },
+        });
+        events.push({ type: "attempt_started", stepName: name, attempt });
+        if (!__wfStepCommit(driver, key, {
           kind: "do",
           status: "running",
           attempt: attempt - 1,
           ordinal: historyOrdinal,
-        });
+        }, events)) return { pause: true };
+        await storage.sync();
         const value = await __wfTimeout(
-          __wfEnterStep(name, async () => callback(context)),
+          __wfWithTrace(driver.meta.telemetry?.trace.sampled
+            ? storage.kv.get(__wfTelemetryStepKey(driver.meta, key))?.attempt?.trace : undefined,
+            () => __wfEnterStep(name, async () => callback(context))),
           timeoutMs,
           name,
           attempt,
@@ -8508,14 +8766,18 @@ const __wfMakeStep = (driver) => {
         if (value !== undefined) {
           __wfCheckValue(value, `the return value of step ${JSON.stringify(name)}`);
         }
-        await storage.put(key, {
+        if (!__wfStepCommit(driver, key, {
           kind: "do",
           status: "completed",
           value,
           ordinal: historyOrdinal,
-        });
+        }, [
+          { type: "attempt_completed", stepName: name, attempt },
+          { type: "step_completed", stepName: name, output: value },
+        ])) return { pause: true };
         return { value };
       } catch (error) {
+        if (driver.storageFailure !== undefined) throw error;
         // NonRetryableError skips retries by contract; a value-cap or
         // serialization failure is marked permanent above because another
         // attempt returns the same value.
@@ -8524,12 +8786,16 @@ const __wfMakeStep = (driver) => {
             (error.name === "NonRetryableError" || error.__wfPermanent === true)) ||
           attempt > retries.limit;
         if (permanent) {
-          await storage.put(key, {
+          if (!__wfStepCommit(driver, key, {
             kind: "do",
             status: "failed",
             error: __wfErrorRecord(error),
             ordinal: historyOrdinal,
-          });
+          }, [
+            { type: "attempt_errored", stepName: name, attempt,
+              error: __wfErrorRecord(error) },
+            { type: "step_errored", stepName: name },
+          ])) return { pause: true };
           throw error;
         }
         // Upstream documents the backoff names, not the arithmetic; the
@@ -8537,13 +8803,23 @@ const __wfMakeStep = (driver) => {
         // `retries` is given without `backoff`, celld uses constant -- the
         // documented exponential default is the whole-config-omitted case.
         const dynamic = typeof retries.delay === "function";
-        const delay = dynamic
-          ? await __wfEnterStep(name, () => retries.delay({ ctx: context, error }))
-          : retries.delay;
-        const base = __wfDuration(
-          delay,
-          `the retry delay of step ${JSON.stringify(name)}`,
-        );
+        let base;
+        try {
+          const delay = dynamic
+            ? await __wfEnterStep(name, () => retries.delay({ ctx: context, error }))
+            : retries.delay;
+          base = __wfDuration(delay, `the retry delay of step ${JSON.stringify(name)}`);
+        } catch (policyError) {
+          if (!__wfStepCommit(driver, key, {
+            kind: "do", status: "failed", error: __wfErrorRecord(policyError),
+            ordinal: historyOrdinal,
+          }, [
+            { type: "attempt_errored", stepName: name, attempt,
+              error: __wfErrorRecord(error) },
+            { type: "step_errored", stepName: name },
+          ])) return { pause: true };
+          throw policyError;
+        }
         // A delay callback replaces the fixed base duration, not the backoff
         // policy. Skipping this factor makes a dynamic exponential or linear
         // policy retry earlier than the same policy with a fixed base.
@@ -8553,13 +8829,16 @@ const __wfMakeStep = (driver) => {
           ? attempt
           : 1;
         const nextAt = Date.now() + base * factor;
-        await storage.put(key, {
+        if (!__wfStepCommit(driver, key, {
           kind: "do",
           status: "retrying",
           attempt,
           nextAt,
           ordinal: historyOrdinal,
-        });
+        }, [{ type: "attempt_errored", stepName: name, attempt,
+          retryDelayMs: base * factor, error: __wfErrorRecord(error) }])) {
+          return { pause: true };
+        }
         return { block: nextAt, kind: "retry" };
       }
     });
@@ -8582,19 +8861,20 @@ const __wfMakeStep = (driver) => {
             "above the upstream limit of 365 days",
         );
       }
-      await storage.put(key, {
+      if (!__wfStepCommit(driver, key, {
         kind: "sleep",
         status: "sleeping",
         deadline: at,
         ordinal: historyOrdinal,
-      });
+      }, [{ type: "sleep_started", stepName: name,
+        durationMs: Math.max(0, at - Date.now()) }])) return { pause: true };
     }
     if (at <= Date.now()) {
-      await storage.put(key, {
+      if (!__wfStepCommit(driver, key, {
         kind: "sleep",
         status: "completed",
         ordinal: historyOrdinal,
-      });
+      }, [{ type: "sleep_completed", stepName: name }])) return { pause: true };
       return { value: undefined };
     }
     return { block: at, kind: "sleep" };
@@ -8662,7 +8942,9 @@ const __wfMakeStep = (driver) => {
             deadline: Date.now() + checked.timeoutMs,
             ordinal,
           };
-          await storage.put(key, record);
+          if (!__wfStepCommit(driver, key, record, [
+            { type: "wait_started", stepName: name, eventType: checked.type },
+          ])) return { pause: true };
         }
         // The deadline is checked before the buffer: an event that arrived
         // after the persisted deadline must time the step out, not succeed
@@ -8672,12 +8954,12 @@ const __wfMakeStep = (driver) => {
             `waitForEvent ${JSON.stringify(name)} timed out waiting for an event ` +
               `of type ${JSON.stringify(record.type)}`,
           );
-          await storage.put(key, {
+          if (!__wfStepCommit(driver, key, {
             kind: "event",
             status: "failed",
             error: __wfErrorRecord(error),
             ordinal: record.ordinal,
-          });
+          }, [{ type: "wait_timed_out", stepName: name }])) return { pause: true };
           throw error;
         }
         // Delivered events persist until a matching step consumes one, in
@@ -8685,6 +8967,9 @@ const __wfMakeStep = (driver) => {
         // arrival order -- so an event sent before the step is reached is
         // buffered, not lost.
         const consumed = storage.transactionSync(() => {
+          const meta = storage.kv.get("__wf.meta");
+          if (meta === undefined || meta.generation !== driver.generation ||
+              __wfTerminal(meta.status)) return { pause: true };
           const current = __wfKindCheck(storage.kv.get(key), "event", name);
           if (current !== undefined && current.status === "completed") {
             return { value: current.value };
@@ -8712,10 +8997,16 @@ const __wfMakeStep = (driver) => {
               value,
               ordinal: current.ordinal,
             });
+            __wfHistoryAppend(storage.kv, meta, [
+              { type: "wait_completed", stepName: name },
+            ], key);
             return { value };
           }
         });
-        if (consumed !== undefined) return consumed;
+        if (consumed !== undefined) {
+          driver.historyChanged();
+          return consumed;
+        }
         return { block: record.deadline, kind: "event" };
       });
     },
@@ -8762,6 +9053,144 @@ const __WorkflowCell = (() => {
   return class __WorkflowCell {
   constructor(state) {
     this._state = state;
+    this._historyWaiters = new Set();
+    this._historyReaders = new Map();
+    this._historyCancelled = new Map();
+  }
+  _historyChanged() {
+    for (const wake of this._historyWaiters) wake();
+    this._historyWaiters.clear();
+    if (this._telemetryEnabled === undefined) {
+      this._telemetryEnabled = !!this._state.storage.kv.get("__wf.meta")?.telemetry?.trace.sampled;
+    }
+    if (!this._telemetryEnabled) return;
+    this._telemetryRequested = true;
+    if (this._telemetryFlushing !== undefined) return;
+    const storage = this._state.storage;
+    const flush = (async () => {
+      do {
+        this._telemetryRequested = false;
+        while (true) {
+          const epoch = storage.kv.get("__wf.meta")?.historyEpoch;
+          const page = [...storage.kv.list({ prefix: __WF_TELEMETRY_PREFIX, limit: 32 })];
+          if (page.length === 0) break;
+          await storage.sync();
+          if (storage.kv.get("__wf.meta")?.historyEpoch !== epoch) return;
+          for (const [, spans] of page) {
+            for (const span of spans) __workflow_span(JSON.stringify(span));
+          }
+          storage.transactionSync(() => {
+            for (const [key] of page) storage.kv.delete(key);
+          });
+        }
+      } while (this._telemetryRequested);
+    })().catch(() => {
+      // Telemetry does not decide Workflow success. Staged descriptions survive
+      // for a later drive when proof or export preparation fails.
+      this._telemetryRequested = false;
+    }).finally(() => {
+      this._telemetryFlushing = undefined;
+      if (this._telemetryRequested) this._historyChanged();
+    });
+    this._telemetryFlushing = flush;
+    if (__wait_until_active()) __registerWaitUntil(flush);
+  }
+  async __wfSubscribe(options) {
+    const checked = __wfSubscribeOptions(options);
+    await this.__wfStatus();
+    const kv = this._state.storage.kv;
+    const meta = kv.get("__wf.meta");
+    if (meta === undefined) throw __wfError("instance does not exist");
+    if (meta.historyEpoch === undefined) {
+      throw __wfError("history unavailable for an instance created before subscribe support");
+    }
+    const cursor = checked.cursor ?? meta.historyStart;
+    if (cursor > (kv.get("__wf.history.sequence") ?? 0)) {
+      throw __wfError("subscribe() cursor is ahead of the retained history");
+    }
+    return { epoch: meta.historyEpoch, cursor };
+  }
+  __wfHistoryCancel(epoch, reader) {
+    if (typeof reader !== "string" || reader.length > 100 ||
+        !__WF_NAME_RE.test(reader)) throw __wfError("invalid subscription reader");
+    const meta = this._state.storage.kv.get("__wf.meta");
+    if (meta?.historyEpoch !== epoch) return;
+    const pending = this._historyReaders.get(reader);
+    if (pending !== undefined) {
+      pending.cancelled = true;
+      pending.wake();
+    } else if (!this._historyCancelled.has(reader)) {
+      // Routed cancellation can arrive before its read. Keep a short-lived
+      // tombstone; never retain a disconnected reader for the instance lifetime.
+      this._historyCancelled.set(reader, setTimeout(() => {
+        this._historyCancelled.delete(reader);
+      }, __WF_HISTORY_POLL_MS));
+    }
+  }
+  async __wfHistoryNext(options) {
+    const { cursor, filter } = __wfSubscribeOptions({
+      cursor: options.cursor, filter: options.filter,
+    });
+    if (typeof options.reader !== "string" || options.reader.length > 100 ||
+        !__WF_NAME_RE.test(options.reader)) throw __wfError("invalid subscription reader");
+    if (this._historyReaders.has(options.reader)) {
+      throw __wfError("subscription reader already has a pending read");
+    }
+    const storage = this._state.storage;
+    const read = () => {
+      const meta = storage.kv.get("__wf.meta");
+      if (meta === undefined || meta.historyEpoch !== options.epoch ||
+          (__wfTerminal(meta.status) && meta.expiresMs <= Date.now())) {
+        throw __wfError("subscription history expired or instance was deleted/replaced");
+      }
+      const highWater = storage.kv.get("__wf.history.sequence") ?? 0;
+      if (cursor > highWater) throw __wfError("subscription cursor is ahead of history");
+      let after = cursor;
+      // Drain the bounded iterator, keeping only the first match, rather than
+      // buffering up to 128 potentially 1-MiB outputs. No SQLite cursor may
+      // remain live across the await below (it interferes with checkpoints).
+      let result;
+      for (const [, event] of storage.kv.list({
+        prefix: __WF_HISTORY_PREFIX, startAfter: __wfHistoryKey(cursor),
+        limit: filter === undefined ? 1 : 128,
+      })) {
+        if (result !== undefined) continue;
+        after = event.eventId;
+        const done = __wfHistoryTerminal(event.type);
+        if (filter === undefined || filter.includes(event.type)) {
+          result = { cursor: after, done, value: event };
+        } else if (done) {
+          result = { cursor: after, done: true };
+        }
+      }
+      return result ?? { cursor: after, done: __wfTerminal(meta.status) && after === highWater };
+    };
+    // Register before reading: there is no catch-up/live race at an await.
+    let wake;
+    const changed = new Promise((resolve) => { wake = resolve; });
+    const pending = { wake, cancelled: this._historyCancelled.has(options.reader) };
+    clearTimeout(this._historyCancelled.get(options.reader));
+    this._historyCancelled.delete(options.reader);
+    this._historyReaders.set(options.reader, pending);
+    this._historyWaiters.add(wake);
+    const timer = setTimeout(wake, __WF_HISTORY_POLL_MS);
+    try {
+      if (pending.cancelled) return { cursor, done: true };
+      let result = read();
+      if (result.cursor === cursor && !result.done) {
+        await changed;
+        if (pending.cancelled) return { cursor, done: true };
+        result = read();
+      }
+      // A reader can see a local SQLite commit before its replicated output
+      // gate opens. No event leaves the cell until that commit is durable.
+      await storage.sync();
+      return result;
+    } finally {
+      clearTimeout(timer);
+      this._historyWaiters.delete(wake);
+      this._historyReaders.delete(options.reader);
+    }
   }
   async __wfCreate({
     workflowName,
@@ -8786,22 +9215,29 @@ const __WorkflowCell = (() => {
         );
       }
       const generation = crypto.randomUUID();
-      transaction.kv.put("__wf.meta", {
+      meta = {
         workflowName,
         instanceId,
         params,
         retention,
         ...(locationHint === undefined ? {} : { locationHint }),
         generation,
+        historyEpoch: crypto.randomUUID(),
+        historyStart: 0,
         createdMs: Date.now(),
         status: "queued",
-      });
+        telemetry: __wfTelemetryRoot(),
+      };
+      transaction.kv.put("__wf.meta", meta);
+      __wfHistoryAppend(transaction.kv, meta, [{ type: "workflow_queued" }]);
       // The metadata and alarm are one SQLite commit. A committed creation
       // therefore always has the wake that can start or recover its drive.
       transaction.setAlarm(Date.now());
       /*__CELLD_TEST_WORKFLOW_META_CREATED__*/
       return { id: instanceId, created: true };
     });
+    this._telemetryEnabled = undefined;
+    this._historyChanged();
     return result;
   }
   async __wfStatus() {
@@ -8843,6 +9279,7 @@ const __WorkflowCell = (() => {
       if (meta === undefined) throw __wfError("instance does not exist");
       if (__wfTerminal(meta.status) || meta.status === "paused" ||
           meta.status === "waitingForPause") return;
+      const previous = meta.status;
       if (meta.status === "running") {
         meta.status = "waitingForPause";
         // A drive lost after this commit must re-enter and finish the pause.
@@ -8852,16 +9289,20 @@ const __WorkflowCell = (() => {
         meta.pausedMs = Date.now();
         transaction.deleteAlarm();
       }
+      __wfHistoryStatus(transaction.kv, meta, previous);
       transaction.kv.put("__wf.meta", meta);
     });
+    this._historyChanged();
   }
   async __wfResume() {
     const storage = this._state.storage;
     transactionSync(storage, (transaction) => {
       const meta = transaction.kv.get("__wf.meta");
       if (meta === undefined) throw __wfError("instance does not exist");
+      const previous = meta.status;
       if (meta.status === "waitingForPause") {
         meta.status = "running";
+        __wfHistoryStatus(transaction.kv, meta, previous);
         transaction.kv.put("__wf.meta", meta);
         transaction.setAlarm(Date.now());
         return;
@@ -8883,9 +9324,11 @@ const __WorkflowCell = (() => {
       }
       delete meta.pausedMs;
       meta.status = "queued";
+      __wfHistoryStatus(transaction.kv, meta, previous);
       transaction.kv.put("__wf.meta", meta);
       transaction.setAlarm(Date.now());
     });
+    this._historyChanged();
   }
   async __wfRestart(options) {
     const checked = __wfRestartOptions(options);
@@ -8926,6 +9369,10 @@ const __WorkflowCell = (() => {
       }
       const generation = crypto.randomUUID();
       const newPrefix = __wfLedgerPrefix(generation);
+      __wfTelemetryStage(transaction.kv, meta, {
+        type: "workflow_restarted", timestamp: Date.now(),
+        eventId: (transaction.kv.get("__wf.history.sequence") ?? 0) + 1,
+      });
       if (targetOrdinal !== undefined) {
         for (const [key, record] of transaction.kv.list({ prefix: oldPrefix + "step." })) {
           if (Number.isInteger(record.ordinal) && record.ordinal < targetOrdinal) {
@@ -8937,13 +9384,21 @@ const __WorkflowCell = (() => {
         transaction.kv.delete(key);
       }
       meta.generation = generation;
+      meta.telemetry = __wfTelemetryRoot(meta.telemetry);
       meta.status = "queued";
+      meta.historyStarted = false;
+      meta.historyStart = transaction.kv.get("__wf.history.sequence") ?? 0;
+      __wfHistoryAppend(transaction.kv, meta, [{ type: "workflow_queued" }]);
       delete meta.pausedMs;
       delete meta.output;
       delete meta.error;
+      delete meta.endedMs;
+      delete meta.expiresMs;
       transaction.kv.put("__wf.meta", meta);
       transaction.setAlarm(Date.now());
     });
+    this._telemetryEnabled = undefined;
+    this._historyChanged();
   }
   async __wfTerminate() {
     const storage = this._state.storage;
@@ -8956,10 +9411,12 @@ const __WorkflowCell = (() => {
         );
       }
       meta.status = "terminated";
+      __wfHistoryAppend(transaction.kv, meta, [{ type: "workflow_terminated" }]);
       __wfFinishRetention(meta, transaction);
       transaction.kv.put("__wf.meta", meta);
       /*__CELLD_TEST_WORKFLOW_TERMINAL_ALARM_SET__*/
     });
+    this._historyChanged();
   }
   async __wfSendEvent(options) {
     const storage = this._state.storage;
@@ -9050,10 +9507,12 @@ const __WorkflowCell = (() => {
         if (current === undefined || current.generation !== meta.generation ||
             current.status !== "waitingForPause") return;
         current.status = "paused";
+        __wfHistoryAppend(transaction.kv, current, [{ type: "workflow_paused" }]);
         current.pausedMs = Date.now();
         transaction.kv.put("__wf.meta", current);
         transaction.deleteAlarm();
       });
+      this._historyChanged();
       return;
     }
     // The fired alarm stays armed while the drive runs. The engine consumes
@@ -9074,6 +9533,8 @@ const __WorkflowCell = (() => {
   }
   async _drive(meta) {
     const storage = this._state.storage;
+    this._telemetryEnabled = undefined;
+    this._historyChanged();
     // The drive owns `status`, `output`, and `error`; every other piece of
     // instance state belongs to the RPCs (sendEvent's sequence lives in its
     // own key for the same reason). The gate is open at every await, so a
@@ -9082,14 +9543,20 @@ const __WorkflowCell = (() => {
     // wins the race" true rather than asserted. Writing back the meta this
     // drive entered with would resurrect a terminated instance as "waiting"
     // and re-arm the alarm its terminate deleted.
-    const settle = (mutate) => transactionSync(storage, (transaction) => {
-      const current = transaction.kv.get("__wf.meta");
-      if (current === undefined || __wfTerminal(current.status) ||
-          current.generation !== meta.generation) return false;
-      mutate(current, transaction);
-      transaction.kv.put("__wf.meta", current);
-      return true;
-    });
+    const settle = (mutate) => {
+      const result = transactionSync(storage, (transaction) => {
+        const current = transaction.kv.get("__wf.meta");
+        if (current === undefined || __wfTerminal(current.status) ||
+            current.generation !== meta.generation) return false;
+        const previous = current.status;
+        mutate(current, transaction);
+        __wfHistoryStatus(transaction.kv, current, previous);
+        transaction.kv.put("__wf.meta", current);
+        return true;
+      });
+      if (result) this._historyChanged();
+      return result;
+    };
     const className = __cell.workflows[meta.workflowName];
     const cls = className === undefined ? undefined : __cf.exports[className];
     if (typeof cls !== "function" ||
@@ -9115,6 +9582,8 @@ const __WorkflowCell = (() => {
     const driver = {
       storage: undefined,
       storageFailure: undefined,
+      historyChanged: () => this._historyChanged(),
+      meta,
       generation: meta.generation,
       ledgerPrefix: __wfLedgerPrefix(meta.generation),
       counts: new Map(),
@@ -9210,7 +9679,8 @@ const __WorkflowCell = (() => {
       waitUntil: __registerWaitUntil,
       passThroughOnException() {},
     };
-    (async () => new cls(ctx, __cell.env).run(event, step))().then(
+    __wfWithTrace(meta.telemetry?.trace,
+      async () => new cls(ctx, __cell.env).run(event, step)).then(
       (value) => driver.finish({ kind: "complete", value }),
       (error) => driver.finish({ kind: "error", error }),
     );
@@ -9356,6 +9826,11 @@ class WorkflowInstance {
   }
   async status() {
     return await this._stub.__wfStatus();
+  }
+  async subscribe(options = {}) {
+    const checked = __wfSubscribeOptions(options);
+    const state = await this._stub.__wfSubscribe(checked);
+    return new WorkflowInstanceSubscription(this, state, checked.filter);
   }
   async terminate(options) {
     if (options && options.rollback) {
@@ -9561,6 +10036,69 @@ const __cf = __celld.__cf = {
   exports: {},
   get env() { return __cell.env; },
 };
+
+// Defined after the RPC base. The handle belongs to the subscribing caller;
+// ordinary routed RPCs perform reads, so it never depends on transporting a
+// same-isolate target from the Workflow cell to another node.
+class WorkflowInstanceSubscription extends __cf.RpcTarget {
+  constructor(instance, state, filter) {
+    super();
+    this._instance = instance;
+    this._epoch = state.epoch;
+    this._cursor = state.cursor;
+    this._filter = filter;
+    this._done = false;
+    this._pending = false;
+    this._reader = undefined;
+    this._disposeWake = undefined;
+  }
+  async next() {
+    if (this._done) return { done: true, value: undefined };
+    if (this._pending) throw __wfError("subscription already has a pending next()");
+    this._pending = true;
+    try {
+      while (!this._done) {
+        this._reader = crypto.randomUUID();
+        const disposed = new Promise((resolve) => { this._disposeWake = resolve; });
+        const result = await Promise.race([
+          this._instance._stub.__wfHistoryNext({
+            epoch: this._epoch, cursor: this._cursor, filter: this._filter,
+            reader: this._reader,
+          }),
+          disposed,
+        ]);
+        this._reader = undefined;
+        this._disposeWake = undefined;
+        if (this._done) break;
+        this._cursor = result.cursor;
+        if (result.done) this._done = true;
+        if (result.value !== undefined) return { done: false, value: result.value };
+      }
+      return { done: true, value: undefined };
+    } catch (error) {
+      if (this._done) return { done: true, value: undefined };
+      throw error;
+    } finally {
+      this._reader = undefined;
+      this._disposeWake = undefined;
+      this._pending = false;
+    }
+  }
+  [Symbol.dispose]() {
+    if (this._done && this._instance === undefined) return;
+    this._done = true;
+    this._disposeWake?.();
+    if (this._reader !== undefined) {
+      // AbortSignal RPC notifications are process-local today. An explicit
+      // routed cancellation works when the Workflow owner is another node.
+      const cancelled = this._instance._stub.__wfHistoryCancel(this._epoch, this._reader)
+        .catch(() => {});
+      if (__wait_until_active()) __registerWaitUntil(cancelled);
+    }
+    this._instance = undefined;
+    this._filter = undefined;
+  }
+}
 // Proxy standing in for unsupported node:*/cloudflare:* builtins. Property
 // walks stay inert -- real bundles reference these at module scope, and
 // evaluation must not crash on a builtin the fetch path never exercises --

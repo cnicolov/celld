@@ -338,6 +338,105 @@ pub struct Span {
     /// `Some(true)` for a parent extracted from a caller's traceparent,
     /// `Some(false)` for an in-process parent, `None` for a root.
     pub parent_remote: Option<bool>,
+    /// Scalar domain attributes, preserved by both OTLP and Parquet.
+    pub attributes: Vec<(String, AttributeValue)>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(untagged)]
+pub enum AttributeValue {
+    String(String),
+    Int(i64),
+    Bool(bool),
+    Float(f64),
+}
+
+/// Serializable context persisted in a Workflow's generation/checkpoints. It
+/// carries the original sampling decision across alarms, eviction and takeover.
+#[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
+pub(crate) struct WorkflowTrace {
+    pub trace_id: [u8; 16],
+    pub span_id: [u8; 8],
+    pub parent_span_id: Option<[u8; 8]>,
+    pub sampled: bool,
+}
+
+impl WorkflowTrace {
+    pub fn context(self) -> TraceContext {
+        TraceContext {
+            trace_id: self.trace_id,
+            span_id: self.span_id,
+            sampled: self.sampled,
+        }
+    }
+
+    pub fn new(parent: Option<TraceContext>) -> Option<Self> {
+        let context = match parent {
+            Some(parent) => child_of(&parent)?,
+            None => start_trace()?,
+        };
+        Some(Self {
+            trace_id: context.trace_id,
+            span_id: context.span_id,
+            parent_span_id: parent.map(|parent| parent.span_id),
+            sampled: context.sampled,
+        })
+    }
+}
+
+/// The native history transaction stages these descriptions. The JS adapter
+/// exports them only after storage.sync proves that transaction durable.
+#[derive(serde::Deserialize)]
+pub(crate) struct WorkflowSpan {
+    pub trace: WorkflowTrace,
+    pub name: String,
+    pub start_ms: i64,
+    pub end_ms: i64,
+    pub attributes: std::collections::BTreeMap<String, AttributeValue>,
+    pub error: Option<String>,
+}
+
+pub(crate) fn record_workflow_span(value: WorkflowSpan) {
+    if !active() || !value.trace.sampled {
+        return;
+    }
+    let name = match value.name.as_str() {
+        "workflow" => "workflow",
+        "workflow.step" => "workflow.step",
+        "workflow.attempt" => "workflow.attempt",
+        "workflow.retry_delay" => "workflow.retry_delay",
+        "workflow.sleep" => "workflow.sleep",
+        "workflow.wait" => "workflow.wait",
+        "workflow.pause" => "workflow.pause",
+        "workflow.transition" => "workflow.transition",
+        _ => return,
+    };
+    let Some(ids) = value.trace.context().recording_ids() else {
+        return;
+    };
+    let mut span = Span::new(ids, name, KIND_INTERNAL);
+    span.parent_span_id = value.trace.parent_span_id;
+    span.start_unix_us = value.start_ms.saturating_mul(1_000);
+    span.duration_us = value
+        .end_ms
+        .saturating_sub(value.start_ms)
+        .max(0)
+        .saturating_mul(1_000);
+    span.ok = value.error.is_none();
+    span.error = value.error.map(cap_error);
+    span.attributes = value
+        .attributes
+        .into_iter()
+        .take(64)
+        .map(|(key, value)| {
+            let value = match value {
+                AttributeValue::String(value) => AttributeValue::String(cap_error(value)),
+                other => other,
+            };
+            (cap_error(key), value)
+        })
+        .collect();
+    record(span);
 }
 
 /// One captured console line, correlated to the trace whose turn (or
@@ -413,6 +512,7 @@ impl Span {
             url: None,
             http_status: None,
             parent_remote: None,
+            attributes: Vec::new(),
         }
     }
 }
@@ -435,6 +535,17 @@ impl Event {
                     + LEN(&span.request_id)
                     + LEN(&span.cell)
                     + LEN(&span.url)
+                    + span
+                        .attributes
+                        .iter()
+                        .map(|(key, value)| {
+                            key.len()
+                                + match value {
+                                    AttributeValue::String(value) => value.len(),
+                                    _ => 8,
+                                }
+                        })
+                        .sum::<usize>()
             }
             Event::Log(log) => 40 + log.body.len(),
         }
@@ -1110,6 +1221,7 @@ message celld_span {
   optional binary url (STRING);
   optional int32 http_status (INTEGER(16,false));
   optional boolean parent_remote;
+  optional binary attributes_json (STRING);
 }";
 
 /// The logs signal: one row per captured console line, joined to traces
@@ -1200,6 +1312,12 @@ pub fn encode_spans(spans: &[Span], node: &str, region: &str) -> anyhow::Result<
     column!(ByteArrayType, opt each.clone().map(|s| s.url.as_deref().map(text)).collect::<Vec<_>>());
     column!(Int32Type, opt each.clone().map(|s| s.http_status.map(|v| v as i32)).collect::<Vec<_>>());
     column!(BoolType, opt each.clone().map(|s| s.parent_remote).collect::<Vec<_>>());
+    column!(ByteArrayType, opt each.clone().map(|s| {
+        if s.attributes.is_empty() { return None; }
+        let attributes: std::collections::BTreeMap<_, _> = s.attributes.iter()
+            .map(|(key, value)| (key.as_str(), value)).collect();
+        Some(text(&serde_json::to_string(&attributes).expect("scalar attributes")))
+    }).collect::<Vec<_>>());
 
     group.close()?;
     Ok(writer.into_inner()?)
@@ -1261,4 +1379,70 @@ pub fn encode_logs(logs: &[Log], node: &str, region: &str) -> anyhow::Result<Vec
 
     group.close()?;
     Ok(writer.into_inner()?)
+}
+
+#[cfg(test)]
+mod workflow_telemetry_tests {
+    use super::*;
+    use parquet::file::reader::{FileReader, SerializedFileReader};
+    use parquet::record::RowAccessor;
+
+    #[test]
+    fn parquet_preserves_typed_workflow_attributes_and_null_for_runtime_spans() {
+        let runtime = Span::new(
+            TraceIds {
+                trace_id: [1; 16],
+                span_id: [2; 8],
+            },
+            "celld.rpc",
+            KIND_INTERNAL,
+        );
+        let mut workflow = Span::new(
+            TraceIds {
+                trace_id: [1; 16],
+                span_id: [3; 8],
+            },
+            "workflow.attempt",
+            KIND_INTERNAL,
+        );
+        workflow.parent_span_id = Some([2; 8]);
+        workflow.attributes = vec![
+            (
+                "celld.workflow.instance_id".into(),
+                AttributeValue::String("quote-214".into()),
+            ),
+            ("celld.workflow.attempt".into(), AttributeValue::Int(3)),
+            (
+                "celld.workflow.interrupted".into(),
+                AttributeValue::Bool(true),
+            ),
+            (
+                "celld.workflow.retry_delay_ms".into(),
+                AttributeValue::Float(30.5),
+            ),
+        ];
+        let bytes = encode_spans(&[runtime, workflow], "node-a", "local").unwrap();
+        let reader = SerializedFileReader::new(bytes::Bytes::from(bytes)).unwrap();
+        let mut rows = reader.get_row_iter(None).unwrap();
+        let runtime = rows.next().unwrap().unwrap();
+        let workflow = rows.next().unwrap().unwrap();
+        let column = runtime
+            .get_column_iter()
+            .position(|(name, _)| name == "attributes_json")
+            .unwrap();
+        assert!(matches!(
+            runtime.get_column_iter().nth(column).unwrap().1,
+            parquet::record::Field::Null
+        ));
+        let attributes: serde_json::Value =
+            serde_json::from_str(workflow.get_string(column).unwrap()).unwrap();
+        assert_eq!(
+            attributes,
+            serde_json::json!({
+                "celld.workflow.instance_id": "quote-214", "celld.workflow.attempt": 3,
+                "celld.workflow.interrupted": true, "celld.workflow.retry_delay_ms": 30.5,
+            })
+        );
+        assert_eq!(workflow.get_string(4).unwrap(), &hex(&[2; 8]));
+    }
 }

@@ -43,20 +43,20 @@ they get the same lease, the same replication, and the same failover as a
 Durable Object. R2 bindings read, write, and list objects directly in the
 fleet bucket. Each row links to a project that deploys as-is:
 
-| service | example |
-| --- | --- |
-| Workers: fetch handlers, service bindings, JS RPC, Node.js compat | [`hello`](examples/hello) |
-| Durable Objects: SQLite storage, alarms, hibernating WebSockets | [`counter`](examples/counter) |
-| KV: list, metadata, expiration, bulk import | [`kv`](examples/kv) |
-| Queues: producers, batching consumers, retries, dead letters | [`queues`](examples/queues) |
-| D1: SQL databases, batches, migrations | [`d1`](examples/d1) |
-| R2: reads, writes, lists, multipart uploads | [`r2`](examples/r2) |
-| Workflows: durable steps, sleeps, events, pause and restart | [`workflow`](examples/workflow) |
-| Cron Triggers: one run for each occurrence across the fleet | [`cron`](examples/cron) |
-| Static assets: asset-only or with a Worker, `_headers`, `_redirects` | [`static-assets`](examples/static-assets) |
-| Dynamic Workers: runtime-loaded code and Tail Worker observability | [`dynamic-worker-tails`](examples/dynamic-worker-tails) |
-| Containers (experimental): a Durable Object that supervises a container, `@cloudflare/containers` | [`container`](examples/container) |
-| Sandboxes: the Cloudflare Sandbox SDK, `@cloudflare/sandbox`, on a container per sandbox | [`sandbox`](examples/sandbox) |
+| service                                                                                           | example                                                 |
+| ------------------------------------------------------------------------------------------------- | ------------------------------------------------------- |
+| Workers: fetch handlers, service bindings, JS RPC, Node.js compat                                 | [`hello`](examples/hello)                               |
+| Durable Objects: SQLite storage, alarms, hibernating WebSockets                                   | [`counter`](examples/counter)                           |
+| KV: list, metadata, expiration, bulk import                                                       | [`kv`](examples/kv)                                     |
+| Queues: producers, batching consumers, retries, dead letters                                      | [`queues`](examples/queues)                             |
+| D1: SQL databases, batches, migrations                                                            | [`d1`](examples/d1)                                     |
+| R2: reads, writes, lists, multipart uploads                                                       | [`r2`](examples/r2)                                     |
+| Workflows: durable steps, sleeps, events, pause and restart                                       | [`workflow`](examples/workflow)                         |
+| Cron Triggers: one run for each occurrence across the fleet                                       | [`cron`](examples/cron)                                 |
+| Static assets: asset-only or with a Worker, `_headers`, `_redirects`                              | [`static-assets`](examples/static-assets)               |
+| Dynamic Workers: runtime-loaded code and Tail Worker observability                                | [`dynamic-worker-tails`](examples/dynamic-worker-tails) |
+| Containers (experimental): a Durable Object that supervises a container, `@cloudflare/containers` | [`container`](examples/container)                       |
+| Sandboxes: the Cloudflare Sandbox SDK, `@cloudflare/sandbox`, on a container per sandbox          | [`sandbox`](examples/sandbox)                           |
 
 A product that needs the Cloudflare network, a GPU, or a browser farm is out
 of scope. The [Cloudflare compatibility](docs/cloudflare-compat.md) page
@@ -378,6 +378,19 @@ isolate serves again when the use falls under 75% of the limit. An idle
 isolate holds a dead heap until something allocates, so celld forces a
 collection when a measurement is above that share. A restart of the process
 is not necessary.
+
+Idle eviction retires a cell's detached native I/O at the residency boundary.
+An old instance's timers and promise resolvers cannot continue after reactivation
+while a neighboring cell keeps the shared isolate alive. A reply whose durable
+output gate is already pending may still finish; other cells keep their work.
+
+Application health also observes isolate execution progress. A continuously
+executing turn lasting thirty seconds makes `/.well-known/celld/health` return
+503, even when ownership and replication readiness remain healthy. This signal
+is sampled without acquiring the Worker/V8 lock held by a stalled turn. `/state`
+reports `max_active_turn_ms` in each pool census. Waiting on timers, sockets,
+subrequests, or durable reply gates does not spend the execution-progress budget.
+Health observation itself does not interrupt operations or change ownership.
 
 ## Contributions
 

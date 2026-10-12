@@ -98,6 +98,114 @@ queue waits, so many questions a metric answers have an answer in the
 traces, and a metrics signal can come later without a change to the
 trace schema.
 
+## Workflow timelines
+
+When telemetry is enabled at instance creation, celld persists the admitted trace
+identity and sampling decision with the Workflow. Native checkpoints retain open
+span identities and start times, so later alarms, eviction, crash recovery and
+explicit restart do not split the detailed execution timeline into unrelated traces.
+
+| Span | Interval / evidence |
+| --- | --- |
+| `workflow` | One execution generation, from queue admission to its terminal outcome; includes parked time |
+| `workflow.step` | One `step.do` occurrence, including its retry delays |
+| `workflow.attempt` | One physical callback execution; native timeout and result-validation failures set ERROR status |
+| `workflow.retry_delay` | Observed interval between an attempt failure and the next attempt start, with the configured delay in an attribute |
+| `workflow.sleep` | A durable sleep or sleepUntil interval |
+| `workflow.wait` | An event wait; a native wait timeout sets ERROR status |
+| `workflow.pause` | The interval from observed pause to resume or termination |
+| `workflow.transition` | An instantaneous lifecycle observation, including queued, running, waiting, paused and terminal transitions |
+
+Step spans are children of the Workflow execution; attempt and retry-delay spans
+are children of their Step. Sleep, wait and pause spans are children of the execution.
+Span names are stable; identifiers and user-authored Step names are scalar attributes:
+
+```text
+celld.workflow.name
+celld.workflow.instance_id
+celld.workflow.generation
+celld.workflow.history_epoch
+celld.workflow.step_name
+celld.workflow.step_count
+celld.workflow.attempt
+celld.workflow.callback_execution
+celld.workflow.start_event_id
+celld.workflow.event_id
+celld.workflow.outcome
+```
+
+Additional attributes describe retry policy/delay, timeout, sleep duration and event
+type. Exported spans do not include Workflow parameters or Step output values.
+Fractional millisecond policies remain numeric OTLP double attributes.
+Their scalar attributes are OTLP span attributes and are stored in the Parquet
+`attributes_json` column. When querying files written before this column existed,
+use `union_by_name = true`.
+
+The callback's trace context survives awaits and concurrent branches without changing
+its ALS frame or native I/O ownership. Console logs and outbound fetch spans therefore
+join the exact physical attempt. Durable Object RPCs propagate that parent locally
+and through the peer tunnel's W3C `traceparent` header. Generic runtime alarm spans
+remain operational spans; the persisted Workflow tree supplies the cross-alarm
+execution timeline.
+
+After a process interruption, another `attempt_started` can have the same native
+attempt number. Telemetry gives that callback a new physical span and increments
+`callback_execution`. The previous span is marked interrupted, with
+`end_observed_at_recovery=true`: its end is the recovery observation, not an invented
+precise crash timestamp. Explicit restart closes any open prior-generation spans and
+creates a sibling execution span in the same trace. Completed copied checkpoints do
+not execute or emit new completion spans.
+
+Attempt spans end at the native settlement observation. A timeout settles the
+attempt but does not cancel its callback; any later callback activity retains that
+physical attempt's context. A Step's final error can differ from its attempt error
+when computing the retry policy itself fails; each span records its own failure.
+
+Finished span descriptions are staged in the same SQLite transaction as native
+history and ledger settlement. The adapter waits for `storage.sync()` before sending
+them to the existing telemetry pipeline. The bounded exporter remains best effort:
+sampling, saturation or a process dying before a buffered batch is exported can
+lose spans. A replay of a staged description retains its trace/span identity, but
+OTLP delivery is not an exactly-once audit. Use `WorkflowInstance.subscribe()` for
+the authoritative retained native event history. Ordinary finished spans become
+visible when their interval settles; lifecycle observations can arrive sooner.
+
+### Inspect locally with motel
+
+Build celld, then start the local collector and deterministic Workflow demo:
+
+```sh
+cargo build -p celld --profile lab
+node scripts/workflow-motel.mjs
+```
+
+The launcher runs `motel daemon`, discovers its collector URL, and starts celld on
+port 9889 with `CELLD_OTEL` set to that base URL, service `celld-workflows`, all traces
+sampled, and a one-second flush. Optional arguments select another project and port;
+`CELLD_BINARY`, `CELLD_OTEL`, and the standard telemetry variables override defaults.
+
+```sh
+curl 'http://127.0.0.1:9889/create?id=timeline-1&mode=retry'
+curl 'http://127.0.0.1:9889/events?id=timeline-1'
+motel search-spans celld-workflows workflow attr.celld.workflow.instance_id=timeline-1
+```
+
+The demo also accepts modes `timeout`, `sleep`, `wait`, `wait-timeout`, `parallel`,
+`parallel-fetch` and `crash`. For a review wait, send `/signal?id=ID` to approve it.
+For repeat runs, use fresh IDs or `/restart?id=ID`.
+
+Verify the actual OTLP export and runtime behavior against motel:
+
+```sh
+motel daemon
+CELLD_SUBSCRIBE_OTEL=http://127.0.0.1:27686 node tests/workflow-subscribe/run.mjs
+```
+
+Use the base URL reported by `motel endpoints` if your collector uses another port.
+The suite queries received spans for hierarchy, timeouts, wait/pause intervals,
+repeated occurrences, restart/recovery identity, W3C propagation and async console
+correlation. It uses its own temporary project, port and service name.
+
 ## Query the bucket with DuckDB
 
 ```sql

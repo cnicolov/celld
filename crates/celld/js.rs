@@ -3287,6 +3287,9 @@ pub struct InFlight {
     /// native operation alive. Workerd does not require `waitUntil` for this
     /// I/O, so dropping these operations loses detached timers and subrequests.
     completed_cell_event: bool,
+    /// The old residency's release has been observed by this event's driver.
+    /// Reply gates may still finish after its JavaScript work is retired.
+    cell_release_observed: bool,
     /// Ops this request is waiting on, so a completion can be attributed to
     /// the request whose context must be current while its continuation runs.
     ops: std::collections::HashSet<u64>,
@@ -3740,6 +3743,34 @@ impl InFlight {
             || self.completed_cell_event
             || !self.io_context_ops.is_empty()
             || self.keeps_native_ops_after_disconnect()
+    }
+
+    pub(crate) fn has_unobserved_cell_release(&self) -> bool {
+        !self.cell_release_observed && self.context.cell_released.load(Ordering::Acquire)
+    }
+
+    /// A cell release ends its detached work, not a durable reply gate. No
+    /// JavaScript turn may resume this generation against a later residency.
+    pub(crate) fn retire_released_cell(&mut self) {
+        self.cell_release_observed = true;
+        self.completed_cell_event = false;
+        self.background = None;
+        self.io_context_ops.clear();
+        self.context.seal_wait_until();
+        self.fail(anyhow!("Durable Object residency was released"));
+    }
+
+    /// Recheck after acquiring the isolate: release can win the race between
+    /// an operation completing and its driver obtaining the next turn.
+    fn retire_if_cell_released(&mut self) -> bool {
+        if !self.context.cell_released.load(Ordering::Acquire) {
+            return false;
+        }
+        if !self.cell_release_observed {
+            self.retire_released_cell();
+        }
+        self.abandon();
+        true
     }
 
     /// Whether work that survives a normal client disconnect still needs
@@ -4257,6 +4288,9 @@ impl Worker {
             return Vec::new();
         };
         let (mut locker, _cells) = inner.lock();
+        if entry.retire_if_cell_released() {
+            return Vec::new();
+        }
         v8::scope!(let hs, &mut *locker);
         let realm = inner.realm(hs);
         let context = realm.context;
@@ -4327,6 +4361,9 @@ impl Worker {
             return Vec::new();
         };
         let (mut locker, _cells) = inner.lock();
+        if entry.retire_if_cell_released() {
+            return Vec::new();
+        }
         v8::scope!(let hs, &mut *locker);
         let realm = inner.realm(hs);
         let context = realm.context;
@@ -4614,6 +4651,7 @@ fn begin<'s>(
                 gated_reply: None,
                 background: None,
                 completed_cell_event: false,
+                cell_release_observed: false,
                 ops: std::collections::HashSet::new(),
                 io_context_ops: std::collections::HashSet::new(),
                 unrefed_ops: std::collections::HashSet::new(),
@@ -4708,6 +4746,7 @@ fn begin_entrypoint_rpc(
                 gated_reply: None,
                 background: None,
                 completed_cell_event: false,
+                cell_release_observed: false,
                 ops: std::collections::HashSet::new(),
                 io_context_ops: std::collections::HashSet::new(),
                 unrefed_ops: std::collections::HashSet::new(),
@@ -4947,6 +4986,7 @@ fn begin_queue(
                 gated_reply: None,
                 background: None,
                 completed_cell_event: false,
+                cell_release_observed: false,
                 ops: std::collections::HashSet::new(),
                 io_context_ops: std::collections::HashSet::new(),
                 unrefed_ops: std::collections::HashSet::new(),
@@ -5130,6 +5170,7 @@ fn start_cell_event<'s>(
                 gated_reply: None,
                 background: None,
                 completed_cell_event: false,
+                cell_release_observed: false,
                 ops: std::collections::HashSet::new(),
                 io_context_ops: std::collections::HashSet::new(),
                 unrefed_ops: std::collections::HashSet::new(),
@@ -5185,6 +5226,7 @@ fn start_cell_event<'s>(
                     gated_reply,
                     background,
                     completed_cell_event: false,
+                    cell_release_observed: false,
                     ops: std::collections::HashSet::new(),
                     io_context_ops: std::collections::HashSet::new(),
                     unrefed_ops: std::collections::HashSet::new(),
@@ -6241,6 +6283,9 @@ impl Worker {
             return Vec::new();
         };
         let (mut locker, _cells) = inner.lock();
+        if entry.retire_if_cell_released() {
+            return Vec::new();
+        }
         v8::scope!(let hs, &mut *locker);
         let realm = inner.realm(hs);
         let context = realm.context;
@@ -6265,6 +6310,9 @@ impl Worker {
             return Vec::new();
         };
         let (mut locker, _cells) = inner.lock();
+        if entry.retire_if_cell_released() {
+            return Vec::new();
+        }
         v8::scope!(let hs, &mut *locker);
         let realm = inner.realm(hs);
         let context = realm.context;
@@ -6785,6 +6833,9 @@ ops! { OP_NAMES, install_op_functions,
         "__event_depth" => op_event_depth,
         "__als_get" => op_als_get,
         "__als_set" => op_als_set,
+        "__workflow_trace_new" => op_workflow_trace_new,
+        "__workflow_trace_enter" => op_workflow_trace_enter,
+        "__workflow_span" => op_workflow_span,
         "__util_type_flags" => op_util_type_flags,
         "__util_constructor_name" => op_util_constructor_name,
         "__util_proxy_details" => op_util_proxy_details,
@@ -8683,6 +8734,7 @@ fn op_rpc_call(
         method,
         args,
         reply: tx,
+        parent: current_trace_context(scope),
     };
     let id = asyncrt::enqueue(async move {
         gated_channel_send(gate, &RPC_CALL_TX, request, "no RPC channel").await?;
@@ -9781,6 +9833,74 @@ fn op_log(
     };
     tracing::info!(target: "cell_console", "{}", displayed);
 }
+/// Allocate a serializable, sampling-preserving Workflow context.
+fn op_workflow_trace_new(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    if !crate::telemetry::active() {
+        return;
+    }
+    let parent = if args.get(0).is_string() {
+        serde_json::from_str::<crate::telemetry::WorkflowTrace>(
+            &args.get(0).to_rust_string_lossy(scope),
+        )
+        .ok()
+        .map(crate::telemetry::WorkflowTrace::context)
+    } else {
+        current_trace_context(scope)
+    };
+    if let Some(trace) = crate::telemetry::WorkflowTrace::new(parent) {
+        if let Ok(json) = serde_json::to_string(&trace) {
+            if let Some(value) = v8::String::new(scope, &json) {
+                rv.set(value.into());
+            }
+        }
+    }
+}
+
+/// Bind only the trace CPED rider; preserve ALS and the native IoContext token.
+/// Promise continuations registered by the callback inherit this exact context.
+fn op_workflow_trace_enter(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let Ok(callback) = v8::Local::<v8::Function>::try_from(args.get(1)) else {
+        return;
+    };
+    let trace = serde_json::from_str::<crate::telemetry::WorkflowTrace>(
+        &args.get(0).to_rust_string_lossy(scope),
+    )
+    .ok()
+    .map(crate::telemetry::WorkflowTrace::context);
+    let previous = install_trace(scope, trace.as_ref());
+    let receiver = v8::undefined(scope).into();
+    let result = callback.call(scope, receiver, &[]);
+    restore_trace(scope, previous);
+    if let Some(value) = result {
+        rv.set(value);
+    }
+}
+
+fn op_workflow_span(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
+    if !crate::telemetry::active() {
+        return;
+    }
+    let json = args.get(0).to_rust_string_lossy(scope);
+    if json.len() > 64 * 1024 {
+        return;
+    }
+    if let Ok(span) = serde_json::from_str::<crate::telemetry::WorkflowSpan>(&json) {
+        crate::telemetry::record_workflow_span(span);
+    }
+}
+
 /// `__isolate_condemn(reason)` -> whether this isolate will be replaced.
 ///
 /// The guest's own verdict that it cannot run here again: the Python bundle
@@ -10720,6 +10840,9 @@ pub struct IoContext {
     /// Wakes this event's driver when `handed` grows or a pending entrypoint
     /// starts. Both changes can make the driver's current wait obsolete.
     handed_wake: tokio::sync::Notify,
+    /// Set under the isolate lock before the owning residency is released.
+    /// Unlike client cancellation, release ends detached Durable Object I/O.
+    cell_released: AtomicBool,
     /// IDs of nested `WorkerEntrypoint` calls that have not settled. The
     /// driver consumes these IDs only when the request has no native work, so
     /// it can reject the calls instead of timing out the enclosing event.
@@ -10906,6 +11029,7 @@ impl IoContext {
             handed: Mutex::new(Some(Vec::new())),
             handed_len: AtomicUsize::new(0),
             handed_wake: tokio::sync::Notify::new(),
+            cell_released: AtomicBool::new(false),
             pending_events: Mutex::new(HashSet::new()),
             subrequest_limit: limits.and_then(|limits| limits.sub_requests),
             subrequests: AtomicUsize::new(0),
@@ -10938,6 +11062,7 @@ impl IoContext {
             handed: Mutex::new(Some(Vec::new())),
             handed_len: AtomicUsize::new(0),
             handed_wake: tokio::sync::Notify::new(),
+            cell_released: AtomicBool::new(false),
             pending_events: Mutex::new(HashSet::new()),
             subrequest_limit: runtime_state
                 .resource_limits
@@ -10971,6 +11096,9 @@ impl IoContext {
     /// the continuation waiting on it.
     #[must_use]
     fn hand_op(&self, id: u64, future: asyncrt::OpFuture, lifetime: asyncrt::OpLifetime) -> bool {
+        if self.cell_released.load(Ordering::Acquire) {
+            return false;
+        }
         let mut handed = self.handed.lock().unwrap();
         let Some(queue) = handed.as_mut() else {
             return false;

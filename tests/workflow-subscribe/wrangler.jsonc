@@ -1,0 +1,13 @@
+{
+  "name": "workflow-subscribe-tests",
+  "main": "worker.js",
+  "no_bundle": true,
+  "compatibility_date": "2026-09-15",
+  "workflows": [
+    { "name": "probe", "binding": "PROBE", "class_name": "Probe" }
+  ],
+  "durable_objects": {
+    "bindings": [{ "name": "EVIDENCE", "class_name": "Evidence" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Evidence"] }]
+}
