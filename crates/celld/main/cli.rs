@@ -357,6 +357,11 @@ TUNING:
   CELLD_LOCAL_CACHE_MAX_BYTES     Hibernated SQLite cache limit (default: 2 GiB; 0 disables)
   CELLD_MAX_RESIDENT_CELLS        Resident-cell hard cap, enforced at admission
   CELLD_MAX_CELL_REQUESTS         Concurrent fetches per cell (default: 64)
+  CELLD_MIN_STATELESS_ISOLATES    Warm stateless isolates per service (default: 0)
+                                  Prewarmed; retained except under memory pressure
+                                  or while an old deployment drains
+  CELLD_MAX_STATELESS_ISOLATES    Stateless isolates per service ceiling
+                                  (default: available CPU count; at least the minimum)
   CELLD_MAX_REQUEST_BODY_BYTES    Ingress request body limit (default: 1 GiB)
   CELLD_MAX_ASSET_FILE_BYTES      Per-file asset limit (default: 25 MiB)
   CELLD_MAX_DYNAMIC_WORKER_CODE_BYTES  Loaded module total (default: 64 MiB)
