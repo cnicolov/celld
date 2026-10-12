@@ -95,7 +95,7 @@ def wait_for(check, timeout=15):
 
 
 class Node:
-    def __init__(self, binary, project, monitor):
+    def __init__(self, binary, project, monitor, *, settings=None):
         self.internal = None
         self.ready = queue.Queue()
         self.logs = deque(maxlen=100)
@@ -106,6 +106,7 @@ class Node:
         # Never accidentally use a caller's fleet, credentials or runtime tuning.
         env = {key: value for key, value in os.environ.items() if not key.startswith("CELLD_")}
         env.update(CELLD_MONITOR=str(int(monitor)), NO_COLOR="1")
+        env.update(settings or {})
         self.process = subprocess.Popen(
             [str(binary), "dev", str(project), "--port", str(port), "--logs"],
             env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,

@@ -214,6 +214,20 @@ The native seam rejects payloads above 32 KiB. Cycles become `[circular]`, depth
 limits become `[truncated]`, BigInts become decimal strings, and Errors retain
 name/message/stack. Throwing getters do not fail the application request.
 
+[`examples/telemetry/`](../examples/telemetry/) is a runnable, dependency-free
+Worker using all four exports directly. It demonstrates parented nested spans,
+context across native awaits, typed structured logs and an intentional error path:
+
+```sh
+CELLD_OTEL=1 CELLD_OTEL_FLUSH_MS=1000 target/debug/celld dev examples/telemetry --port 8080
+curl 'http://127.0.0.1:8080/?customer=alice'
+curl 'http://127.0.0.1:8080/?customer=bob&fail=1'
+```
+
+Open the printed `/monitor/` URL and query `example.checkout` or the returned
+Trace ID after the export flush. See the example's README for sampling and
+disabled-telemetry behavior.
+
 ## Effect application traces and logs
 
 [`examples/effect/telemetry.js`](../examples/effect/telemetry.js) is the Effect
