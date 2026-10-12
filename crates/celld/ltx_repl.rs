@@ -2305,6 +2305,25 @@ impl LtxRepl {
             .retain(|_, promotion| promotion.expires_mono_ms > now);
     }
 
+    pub(crate) fn has_hot_promotion(
+        &self,
+        cell: &str,
+        session: &str,
+        log_epoch: u64,
+        cell_epoch: u64,
+    ) -> bool {
+        self.hot_promotions
+            .lock()
+            .unwrap()
+            .get(cell)
+            .is_some_and(|promotion| {
+                promotion.session == session
+                    && promotion.log_epoch == log_epoch
+                    && promotion.source_epoch == cell_epoch
+                    && promotion.expires_mono_ms > asyncrt::mono_ms()
+            })
+    }
+
     #[cfg(test)]
     pub(crate) fn hot_promotions_for_test(&self, cell: &str) -> crate::hot_recovery::Promotion {
         self.hot_promotions.lock().unwrap().remove(cell).unwrap()
