@@ -759,6 +759,33 @@ pub(crate) async fn receive_service_fetch_response_for_test(
 }
 
 impl RuntimeManager {
+    /// Capture an existing node-wide heap ID from the monitor, without placing
+    /// a new isolate or activating any dormant cells.
+    pub async fn heap_snapshot(
+        &self,
+        heap_id: &str,
+    ) -> Result<crate::heap_snapshot::Snapshot, crate::heap_snapshot::Error> {
+        let slot = {
+            let generations = {
+                let generations = self.generations.read().expect("generation lock poisoned");
+                std::iter::once(generations.current.clone())
+                    .chain(generations.draining.iter().cloned())
+                    .collect::<Vec<_>>()
+            };
+            generations.iter().find_map(|generation| {
+                std::iter::once(&generation.stateless.isolates)
+                    .chain(generation.services.values().map(|worker| &worker.isolates))
+                    .chain(generation.cell_isolates.values())
+                    .find_map(|pool| {
+                        pool.monitor_slots()
+                            .into_iter()
+                            .find(|slot| slot.heap_id().to_string() == heap_id)
+                    })
+            })
+        };
+        crate::heap_snapshot::capture(slot.ok_or(crate::heap_snapshot::Error::Gone)?).await
+    }
+
     /// A no-progress signal for health, without interrupting admitted work,
     /// changing ownership, or waiting for an isolate that's already stalled.
     pub fn application_progressing(&self) -> bool {

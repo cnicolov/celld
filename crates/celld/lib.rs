@@ -66,6 +66,7 @@ pub mod fault {
 pub(crate) mod facet_streams;
 pub mod fleet;
 pub mod generation;
+pub mod heap_snapshot;
 pub mod host_channels;
 pub mod host_services;
 pub(crate) mod hot_recovery;

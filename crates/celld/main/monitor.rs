@@ -1,9 +1,13 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
-//! The monitor is read-only and exists only on the operator listener. Its
-//! static assets are generated from Rust and embedded at native build time.
+//! The monitor exists only on the operator listener. Sampling is read-only;
+//! explicit POST diagnostics can pause an isolate to capture its heap.
+//! Static assets are generated from Rust and embedded at native build time.
 
 use super::{response, AppHandle, HttpReply};
+use futures_util::StreamExt as _;
+use http_body_util::{BodyExt as _, StreamBody};
+use hyper::body::Frame;
 use hyper::body::{Bytes, Incoming};
 use hyper::{HeaderMap, Method, Request, StatusCode};
 
@@ -27,11 +31,24 @@ pub(super) async fn handle(request: Request<Incoming>, app: AppHandle) -> HttpRe
 }
 
 async fn handle_inner(request: &Request<Incoming>, app: &AppHandle) -> HttpReply {
-    if !matches!(*request.method(), Method::GET | Method::HEAD) {
-        let mut reply = response(StatusCode::METHOD_NOT_ALLOWED, "{\"error\":\"read_only\"}");
+    let snapshot = request.uri().path().strip_prefix("/monitor/heap-snapshot/");
+    let allowed = if snapshot.is_some() {
+        request.method() == Method::POST
+    } else {
+        matches!(*request.method(), Method::GET | Method::HEAD)
+    };
+    if !allowed {
+        let mut reply = response(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "{\"error\":\"method_not_allowed\"}",
+        );
         reply.headers_mut().insert(
             hyper::header::ALLOW,
-            hyper::header::HeaderValue::from_static("GET, HEAD"),
+            hyper::header::HeaderValue::from_static(if snapshot.is_some() {
+                "POST"
+            } else {
+                "GET, HEAD"
+            }),
         );
         return reply;
     }
@@ -49,6 +66,37 @@ async fn handle_inner(request: &Request<Incoming>, app: &AppHandle) -> HttpReply
             StatusCode::NOT_FOUND,
             "{\"error\":\"monitor_disabled\",\"hint\":\"set CELLD_MONITOR=1\"}",
         );
+    }
+    if let Some(id) = snapshot {
+        if id.is_empty() || id.len() > 20 || !id.bytes().all(|byte| byte.is_ascii_digit()) {
+            return json_error(StatusCode::BAD_REQUEST, "invalid isolate ID");
+        }
+        let Some(runtime) = &app.runtime else {
+            return json_error(StatusCode::SERVICE_UNAVAILABLE, "runtime unavailable");
+        };
+        return match runtime.heap_snapshot(id).await {
+            Ok(snapshot) => hyper::Response::builder()
+                .status(StatusCode::OK)
+                .header(hyper::header::CONTENT_TYPE, "application/json")
+                .header(hyper::header::CONTENT_LENGTH, snapshot.len())
+                .header(
+                    hyper::header::CONTENT_DISPOSITION,
+                    format!("attachment; filename=\"celld-isolate-{id}.heapsnapshot\""),
+                )
+                .body(
+                    StreamBody::new(snapshot.into_stream().map(|chunk| chunk.map(Frame::data)))
+                        .boxed_unsync(),
+                )
+                .expect("validated heap snapshot response"),
+            Err(error) => {
+                let status = match &error {
+                    celld::heap_snapshot::Error::Busy => StatusCode::CONFLICT,
+                    celld::heap_snapshot::Error::Gone => StatusCode::NOT_FOUND,
+                    _ => StatusCode::INTERNAL_SERVER_ERROR,
+                };
+                json_error(status, error)
+            }
+        };
     }
     let name = match request.uri().path() {
         "/monitor" | "/monitor/" => "index.html",

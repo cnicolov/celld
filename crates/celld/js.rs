@@ -4204,6 +4204,20 @@ pub struct HeapBytes {
 }
 
 impl Worker {
+    /// The pool holds this worker's permit and runs this on a blocking thread.
+    /// The snapshot covers the shared isolate, including every resident cell.
+    pub(crate) fn write_heap_snapshot(
+        &self,
+        output: &mut impl std::io::Write,
+    ) -> Result<u64, crate::heap_snapshot::Error> {
+        let inner = self
+            .inner
+            .as_ref()
+            .ok_or(crate::heap_snapshot::Error::Gone)?;
+        let (mut locker, _cells) = inner.lock();
+        crate::heap_snapshot::write(&mut locker, output)
+    }
+
     /// The heap V8 reports for this isolate. Takes the isolate lock, so the
     /// caller must hold the pool's permit for this worker, exactly as a turn
     /// does; `None` once the isolate has been freed.
