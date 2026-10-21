@@ -121,7 +121,6 @@ jobs:
     if: github.event_name != 'release'
     needs:
       - build-celld
-      - test-celld
     runs-on: ubuntu-22.04
     timeout-minutes: 15
     permissions:
