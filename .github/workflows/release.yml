@@ -210,7 +210,7 @@ jobs:
           rustup toolchain install "$RUST_VERSION" --profile minimal
           rustup default "$RUST_VERSION"
           rustup target add wasm32-unknown-unknown
-          cargo test --locked --workspace
+          cargo test --locked --workspace -- --test-threads=1
 
   build-container:
     # Static name so a skipped run shows "Build container" instead of the
