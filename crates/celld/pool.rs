@@ -477,6 +477,22 @@ impl Slot {
         self.heap_id
     }
 
+    /// Diagnostic capture never queues behind application work or activates a
+    /// retired slot. The permit makes V8's blocking Locker uncontended.
+    pub(crate) fn write_heap_snapshot(
+        &self,
+        output: &mut impl std::io::Write,
+    ) -> Result<u64, crate::heap_snapshot::Error> {
+        let worker = self
+            .worker
+            .try_lock()
+            .map_err(|_| crate::heap_snapshot::Error::Busy)?;
+        worker
+            .as_ref()
+            .ok_or(crate::heap_snapshot::Error::Gone)?
+            .write_heap_snapshot(output)
+    }
+
     fn active_turn_age_ms(&self) -> Option<u64> {
         self.active_turn
             .lock()

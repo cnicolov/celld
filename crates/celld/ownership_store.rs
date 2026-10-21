@@ -9,6 +9,7 @@
 use crate::bucket::Bucket;
 use crate::host_services::HostMetricsSample;
 use anyhow::Context;
+use celld_logic::placement::Pool;
 use celld_logic::{
     CapacityPeer, CasGuard, CasOutcome, LeaseCasOutcome, NodeLeaseRecord, OwnerRecord,
 };
@@ -18,14 +19,31 @@ use serde_json::value::RawValue;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+mod pool_wire {
+    use super::Pool;
+    use serde::{Deserialize, Deserializer, Serializer};
+    pub fn serialize<S: Serializer>(pool: &Pool, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(pool.as_str())
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Pool, D::Error> {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(serde::de::Error::custom)
+    }
+}
+
 #[derive(Serialize)]
 struct OwnerWire<'a> {
+    #[serde(with = "pool_wire")]
+    placement_pool: Pool,
     node: &'a str,
     epoch: u64,
 }
 
 #[derive(Deserialize)]
 struct OwnerWireOwned {
+    #[serde(default, with = "pool_wire")]
+    placement_pool: Pool,
     node: String,
     epoch: u64,
 }
@@ -33,6 +51,10 @@ struct OwnerWireOwned {
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(from = "NodeLeaseWireRaw")]
 pub(crate) struct NodeLeaseWire {
+    #[serde(default, with = "pool_wire")]
+    pub(crate) placement_pool: Pool,
+    #[serde(default)]
+    pub(crate) hot_recovery: bool,
     pub(crate) node: String,
     pub(crate) expires_ms: u64,
     #[serde(default)]
@@ -144,6 +166,8 @@ enum CapacitySampleWire {
 impl NodeLeaseWire {
     fn into_capacity_peer(self) -> CapacityPeer {
         CapacityPeer {
+            placement_pool: self.placement_pool,
+            hot_recovery: self.hot_recovery,
             node: self.node,
             addr: self.addr,
             expires_ms: self.expires_ms,
@@ -173,6 +197,10 @@ impl NodeLeaseWire {
 /// a live node as a pre-generation one for the length of a rollout.
 #[derive(Deserialize)]
 struct NodeLeaseWireRaw {
+    #[serde(default, with = "pool_wire")]
+    placement_pool: Pool,
+    #[serde(default)]
+    hot_recovery: bool,
     node: String,
     expires_ms: u64,
     #[serde(default)]
@@ -199,6 +227,8 @@ impl From<NodeLeaseWireRaw> for NodeLeaseWire {
             raw.generation
         };
         Self {
+            placement_pool: raw.placement_pool,
+            hot_recovery: raw.hot_recovery,
             node: raw.node,
             expires_ms: raw.expires_ms,
             addr: raw.addr,
@@ -388,6 +418,8 @@ impl std::fmt::Display for LeaseCasError {
 /// store definitively returned HTTP 412, or the attempt provably wrote no
 /// object. See [`LeaseCasError`].
 pub struct BucketOwnership {
+    placement_pool: Pool,
+    hot_recovery: bool,
     bucket: Bucket,
     lease_bucket: Bucket,
     node: String,
@@ -502,6 +534,8 @@ impl BucketOwnership {
         probe_public_key: String,
     ) -> Self {
         Self {
+            placement_pool: Pool::DEFAULT,
+            hot_recovery: false,
             bucket,
             lease_bucket,
             node,
@@ -526,6 +560,16 @@ impl BucketOwnership {
     pub fn with_lease_ttl_ms(mut self, ttl_ms: u64) -> Self {
         self.lease_ttl_ms = ttl_ms;
         self
+    }
+
+    pub fn with_placement_pool(mut self, pool: Pool, hot_recovery: bool) -> Self {
+        self.placement_pool = pool;
+        self.hot_recovery = hot_recovery;
+        self
+    }
+
+    pub fn placement_pool(&self) -> Pool {
+        self.placement_pool
     }
 
     #[cfg(all(test, celld_internal_tests))]
@@ -574,11 +618,47 @@ impl BucketOwnership {
             return Ok(None);
         };
         let record = OwnerRecord {
+            placement_pool: owner.placement_pool,
             node: (!owner.node.is_empty()).then_some(owner.node),
             epoch: owner.epoch,
             etag,
         };
         Ok(Some(record))
+    }
+
+    /// Reserve immutable placement before any owner can activate the cell.
+    /// Epoch zero has no writer authority or database; the first claim advances
+    /// it to epoch one. A raced registration can only agree, never rewrite it.
+    pub async fn create_cell(&self, cell: &str, pool: Pool) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            celld_logic::cell::valid_cell_scope(cell),
+            "invalid cell scope"
+        );
+        for _ in 0..2 {
+            if let Some(owner) = self.read_owner(cell).await? {
+                anyhow::ensure!(
+                    owner.placement_pool == pool,
+                    "cell placement is immutable: existing pool {}, requested {}",
+                    owner.placement_pool,
+                    pool
+                );
+                return Ok(());
+            }
+            let body = serde_json::to_vec(&OwnerWire {
+                placement_pool: pool,
+                node: "",
+                epoch: 0,
+            })?;
+            if self
+                .bucket
+                .put_cas(&format!("cells/{cell}/own.json"), body, None)
+                .await?
+                .is_some()
+            {
+                return Ok(());
+            }
+        }
+        anyhow::bail!("cell placement registration raced; retry creation")
     }
 
     pub async fn read_node_lease(&self, owner: &str) -> anyhow::Result<Option<NodeLeaseRecord>> {
@@ -892,7 +972,11 @@ impl BucketOwnership {
             return Ok(CasOutcome::Rejected);
         }
         let key = format!("cells/{cell}/own.json");
-        let body = serde_json::to_vec(&OwnerWire { node: "", epoch })?;
+        let body = serde_json::to_vec(&OwnerWire {
+            placement_pool: current.placement_pool,
+            node: "",
+            epoch,
+        })?;
         match self.bucket.put_cas(&key, body, Some(&current.etag)).await? {
             Some(_) => Ok(CasOutcome::Applied),
             None => Ok(CasOutcome::Rejected),
@@ -906,7 +990,22 @@ impl BucketOwnership {
         epoch: u64,
     ) -> anyhow::Result<CasOutcome> {
         let key = format!("cells/{cell}/own.json");
+        match &guard {
+            CasGuard::Absent if self.placement_pool != Pool::DEFAULT => {
+                return Ok(CasOutcome::Rejected)
+            }
+            CasGuard::Match(expected) => {
+                let Some(current) = self.read_owner(cell).await? else {
+                    return Ok(CasOutcome::Rejected);
+                };
+                if current.etag != *expected || current.placement_pool != self.placement_pool {
+                    return Ok(CasOutcome::Rejected);
+                }
+            }
+            _ => {}
+        }
         let body = serde_json::to_vec(&OwnerWire {
+            placement_pool: self.placement_pool,
             node: &self.node,
             epoch,
         })?;
@@ -934,6 +1033,11 @@ impl BucketOwnership {
                 "refusing to publish a node lease without a signed-probe key"
             )));
         }
+        if record.placement_pool != self.placement_pool {
+            return Err(LeaseCasError::NotCommitted(anyhow::anyhow!(
+                "node lease placement does not match this node"
+            )));
+        }
         let key = format!("nodes/{}.json", self.node);
         // Snapshot the folded log ONCE, before serialization: the applied
         // notification below reports THIS seq — the identity of the body
@@ -944,6 +1048,8 @@ impl BucketOwnership {
         // still learns what the possibly-landed body carried.
         *stamped = log_state_from_wire(&log);
         let body = serde_json::to_vec(&NodeLeaseWire {
+            placement_pool: record.placement_pool,
+            hot_recovery: self.hot_recovery,
             node: record.node.clone(),
             expires_ms: record.expires_ms,
             addr: record.addr.clone(),
@@ -1140,6 +1246,7 @@ pub(crate) async fn load_node_lease(
     Ok(load_json::<NodeLeaseWire>(bucket, &key)
         .await?
         .map(|(lease, etag)| NodeLeaseRecord {
+            placement_pool: lease.placement_pool,
             log_state: log_state_from_wire(&lease.log),
             node: lease.node,
             addr: lease.addr,

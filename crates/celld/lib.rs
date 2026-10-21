@@ -66,6 +66,7 @@ pub mod fault {
 pub(crate) mod facet_streams;
 pub mod fleet;
 pub mod generation;
+pub mod heap_snapshot;
 pub mod host_channels;
 pub mod host_services;
 pub(crate) mod hot_recovery;
@@ -87,6 +88,8 @@ pub mod otlp;
 pub mod ownership_store;
 pub mod peer_auth;
 pub mod peer_probe;
+#[cfg(test)]
+mod placement_tests;
 pub mod pool;
 pub mod protocol;
 pub(crate) mod queue_batching;
@@ -99,6 +102,8 @@ pub mod runtime;
 pub mod startup;
 pub mod storage;
 pub mod telemetry;
+#[cfg(test)]
+mod test_runtime;
 pub mod wake;
 pub mod wake_entry;
 pub mod wake_format;

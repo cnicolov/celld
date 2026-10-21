@@ -108,16 +108,14 @@ impl LocalStore {
             .ok_or_else(|| not_found(key))
     }
 
-    fn metadata(&self) -> object_store::Result<Vec<StoredObject>> {
+    /// The listing metadata (no bodies) of the objects whose keys lie in `range`,
+    /// in key order. Only those rows are visited and decoded.
+    fn metadata(&self, range: &KeyRange) -> object_store::Result<Vec<StoredObject>> {
         let connection = self.connect()?;
-        let mut statement = connection
-            .prepare(
-                "SELECT key, CAST(X'' AS BLOB), etag, modified_ms, attributes, length(body)
-                 FROM objects ORDER BY key",
-            )
-            .map_err(db_error)?;
+        let (sql, bounds) = range.statement();
+        let mut statement = connection.prepare(&sql).map_err(db_error)?;
         let rows = statement
-            .query_map([], |row| {
+            .query_map(rusqlite::params_from_iter(bounds), |row| {
                 Ok(StoredObject {
                     key: row.get(0)?,
                     body: row.get(1)?,
@@ -296,7 +294,10 @@ impl ObjectStore for LocalStore {
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
         let prefix = prefix.cloned();
-        let result = self.metadata().and_then(|objects| {
+        let range = prefix
+            .as_ref()
+            .map_or_else(KeyRange::default, KeyRange::directory);
+        let result = self.metadata(&range).and_then(|objects| {
             objects
                 .into_iter()
                 .map(|object| object_meta(&object))
@@ -321,7 +322,7 @@ impl ObjectStore for LocalStore {
         let prefix = prefix.cloned().unwrap_or_default();
         let mut common_prefixes = BTreeSet::new();
         let mut objects = Vec::new();
-        for object in self.metadata()? {
+        for object in self.metadata(&KeyRange::directory(&prefix))? {
             let location = stored_location(&object.key)?;
             let Some(mut remainder) = location.prefix_match(&prefix) else {
                 continue;
@@ -372,7 +373,7 @@ impl PaginatedListStore for LocalStore {
         let delimiter = options.delimiter.as_deref();
         let limit = options.max_keys.unwrap_or(usize::MAX);
         let mut entries: Vec<(String, Option<Path>, Option<ObjectMeta>)> = Vec::new();
-        for object in self.metadata()? {
+        for object in self.metadata(&KeyRange::prefixed(prefix, after))? {
             let Some(remainder) = object.key.strip_prefix(prefix) else {
                 continue;
             };
@@ -519,6 +520,120 @@ fn decode_attributes(encoded: &str) -> object_store::Result<Attributes> {
 #[cfg(all(test, celld_internal_tests))]
 mod internal_tests {
     include!(env!("CELLD_INTERNAL_LOCAL_STORE_TESTS"));
+}
+
+#[cfg(test)]
+mod prefix_tests;
+
+/// The keys of `objects` that a listing can return, as bounds on the primary
+/// key's index so SQLite seeks to them instead of reading the whole table.
+///
+/// SQLite orders TEXT keys with its BINARY collation: byte order of the UTF-8
+/// encoding, which is the order of `str`. The keys that start with a prefix are
+/// therefore exactly those from the prefix up to (not including) its
+/// [`prefix_successor`]. The bounds are bound parameters, never `LIKE`: `LIKE`
+/// treats `%` and `_` in a key as wildcards and folds ASCII case, neither of
+/// which is prefix matching.
+///
+/// A range only narrows what is read. The listings still apply their original
+/// per-row checks to every row it returns, so a range that is too wide costs
+/// time but cannot change a result, and one that is too narrow would be a bug
+/// the equivalence tests exist to catch.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct KeyRange {
+    lower: Option<Lower>,
+    /// Smallest key *not* read.
+    upper: Option<String>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Lower {
+    Included(String),
+    Excluded(String),
+}
+
+impl KeyRange {
+    /// Keys that start with `prefix` and sort after `after`. The empty prefix
+    /// and no `after` is every key.
+    fn prefixed(prefix: &str, after: Option<&str>) -> Self {
+        let lower = match after {
+            // Every key after `after` is also at least `prefix`.
+            Some(after) if after >= prefix => Some(Lower::Excluded(after.to_string())),
+            // Every key at least `prefix` is also after `after`.
+            _ if !prefix.is_empty() => Some(Lower::Included(prefix.to_string())),
+            _ => None,
+        };
+        Self {
+            lower,
+            upper: prefix_successor(prefix),
+        }
+    }
+
+    /// Keys below the directory `directory`: those starting with `directory/`.
+    /// The root is every key. The `Path` listings also exclude the directory's
+    /// own key and keys that merely share its leading characters
+    /// (`nodes-x/a` is not below `nodes`); the `/` in the bound is what
+    /// excludes the latter.
+    fn directory(directory: &Path) -> Self {
+        let directory: &str = directory.as_ref();
+        if directory.is_empty() {
+            Self::default()
+        } else {
+            Self::prefixed(&format!("{directory}/"), None)
+        }
+    }
+
+    /// The listing query for this range and its bound parameters, in the order
+    /// of their `?N` placeholders. Only fixed fragments reach the SQL text.
+    fn statement(&self) -> (String, Vec<&str>) {
+        let (filter, bounds) = match (&self.lower, &self.upper) {
+            (None, None) => ("", Vec::new()),
+            (Some(Lower::Included(lower)), None) => (" WHERE key >= ?1", vec![lower.as_str()]),
+            (Some(Lower::Excluded(lower)), None) => (" WHERE key > ?1", vec![lower.as_str()]),
+            (None, Some(upper)) => (" WHERE key < ?1", vec![upper.as_str()]),
+            (Some(Lower::Included(lower)), Some(upper)) => (
+                " WHERE key >= ?1 AND key < ?2",
+                vec![lower.as_str(), upper.as_str()],
+            ),
+            (Some(Lower::Excluded(lower)), Some(upper)) => (
+                " WHERE key > ?1 AND key < ?2",
+                vec![lower.as_str(), upper.as_str()],
+            ),
+        };
+        (
+            format!(
+                "SELECT key, CAST(X'' AS BLOB), etag, modified_ms, attributes, length(body) \
+                 FROM objects{filter} ORDER BY key"
+            ),
+            bounds,
+        )
+    }
+}
+
+/// The smallest string greater than every string that starts with `prefix`, or
+/// `None` when there is none (the empty prefix, or one made only of the largest
+/// character).
+///
+/// The last character is replaced by the next Unicode scalar value; a last
+/// character with no successor is dropped and the one before it is advanced.
+/// Working in scalar values keeps the bound valid UTF-8 (incrementing the last
+/// *byte* can produce an invalid string, such as after U+00BF), and UTF-8 byte
+/// order is scalar value order, so the bound sorts correctly in SQLite.
+fn prefix_successor(prefix: &str) -> Option<String> {
+    let mut characters: Vec<char> = prefix.chars().collect();
+    while let Some(last) = characters.pop() {
+        let next = match last {
+            char::MAX => None,
+            // The surrogates are not scalar values; the next one is U+E000.
+            '\u{D7FF}' => Some('\u{E000}'),
+            other => char::from_u32(other as u32 + 1),
+        };
+        if let Some(next) = next {
+            characters.push(next);
+            return Some(characters.into_iter().collect());
+        }
+    }
+    None
 }
 
 /// The [`Path`] a stored key came from. Every key is stored as

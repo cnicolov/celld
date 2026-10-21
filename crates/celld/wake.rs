@@ -146,6 +146,15 @@ pub(crate) async fn probe_entries(
                 elected.then_some((cell, entry_ms))
             }
             Ok(record) => {
+                if record
+                    .as_ref()
+                    .map_or(celld_logic::placement::Pool::DEFAULT, |record| {
+                        record.placement_pool
+                    })
+                    != ownership.placement_pool()
+                {
+                    return None;
+                }
                 let owner = record.as_ref().and_then(|record| record.node.as_deref());
                 let owner_live = owner.is_some_and(|owner| live.contains(owner));
                 (owner == Some(node) || (elected && elected_hint_needed(owner, node, owner_live)))
@@ -258,7 +267,27 @@ async fn run_due_scans(
     let mut dead_node_gc = crate::dead_node_gc::DeadNodeGc::default();
     loop {
         tick.tick().await;
-        let elected = dead_node_gc.run_elected_pass(&bucket, &node, tick_ms).await;
+        // Garbage collection remains fleet-wide. Alarm discovery has a separate
+        // lease per pool: a CPU waker cannot execute a GPU orphan's alarm.
+        let gc_live = dead_node_gc.run_elected_pass(&bucket, &node, tick_ms).await;
+        let elected = if try_hold_pool_waker(
+            &bucket,
+            &node,
+            ownership.placement_pool(),
+            crate::asyncrt::wall_ms(),
+            tick_ms.saturating_mul(3).min(i64::MAX as u64) as i64,
+        )
+        .await
+        {
+            Some(match gc_live {
+                Some(live) => live,
+                None => {
+                    crate::dead_node_gc::live_nodes(&bucket, crate::ownership_store::now_ms()).await
+                }
+            })
+        } else {
+            None
+        };
         let due = due_scan(&bucket, crate::asyncrt::wall_ms()).await;
         let (scope, due) = match elected {
             Some(live) => (
@@ -288,8 +317,8 @@ struct WakerRoleLease {
     expires_ms: i64,
 }
 
-async fn same_node_still_holds_waker(bucket: &Bucket, node: &str) -> bool {
-    let Ok(Some((bytes, _))) = bucket.get("wake/waker.json").await else {
+async fn same_node_still_holds_waker(bucket: &Bucket, key: &str, node: &str) -> bool {
+    let Ok(Some((bytes, _))) = bucket.get(key).await else {
         return false;
     };
     let Ok(lease) = serde_json::from_slice::<WakerRoleLease>(&bytes) else {
@@ -302,10 +331,36 @@ async fn same_node_still_holds_waker(bucket: &Bucket, node: &str) -> bool {
 /// Correctness never depends on it — concurrent wakers race activation CAS
 /// harmlessly — so a caller skips the tick when another node holds the role.
 pub async fn try_hold_waker(bucket: &Bucket, node: &str, now_ms: i64, ttl_ms: i64) -> bool {
-    const KEY: &str = "wake/waker.json";
+    try_hold_waker_key(bucket, "wake/waker.json", node, now_ms, ttl_ms).await
+}
+
+pub async fn try_hold_pool_waker(
+    bucket: &Bucket,
+    node: &str,
+    pool: celld_logic::placement::Pool,
+    now_ms: i64,
+    ttl_ms: i64,
+) -> bool {
+    try_hold_waker_key(
+        bucket,
+        &format!("wake/pool-wakers/{pool}.json"),
+        node,
+        now_ms,
+        ttl_ms,
+    )
+    .await
+}
+
+async fn try_hold_waker_key(
+    bucket: &Bucket,
+    key: &str,
+    node: &str,
+    now_ms: i64,
+    ttl_ms: i64,
+) -> bool {
     let body =
         |expires: i64| format!("{{\"node\":{node:?},\"expires_ms\":{expires}}}").into_bytes();
-    let token = match bucket.get(KEY).await {
+    let token = match bucket.get(key).await {
         // absent (or unreadable): claim if absent
         Ok(None) | Err(_) => None,
         Ok(Some((bytes, etag))) => {
@@ -319,14 +374,14 @@ pub async fn try_hold_waker(bucket: &Bucket, node: &str, now_ms: i64, ttl_ms: i6
         }
     };
     match bucket
-        .put_cas(KEY, body(now_ms + ttl_ms), token.as_deref())
+        .put_cas(key, body(now_ms + ttl_ms), token.as_deref())
         .await
     {
         Ok(Some(_)) => true,
         // The cleanup loop and the due-scan loop renew the same node's role.
         // A clean CAS conflict can be their overlap, so check the winner
         // before cancelling a GC pass and repeating its fleet-wide LIST.
-        Ok(None) => same_node_still_holds_waker(bucket, node).await,
+        Ok(None) => same_node_still_holds_waker(bucket, key, node).await,
         Err(_) => false,
     }
 }

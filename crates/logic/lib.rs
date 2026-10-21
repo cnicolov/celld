@@ -25,6 +25,7 @@ pub mod log_evict;
 pub mod log_tier;
 mod output_gate;
 pub mod peer;
+pub mod placement;
 pub mod pressure;
 pub mod queue;
 pub mod rebalance;
@@ -405,6 +406,7 @@ pub struct DrainPin {
 
 #[derive(Clone, Debug)]
 struct Cell {
+    placement_pool: placement::Pool,
     phase: Phase,
     /// The highest committed-write position a verified proof has covered in
     /// this residency, and the epoch it belongs to. A read-only output that
@@ -589,6 +591,7 @@ enum NodeAuthority {
 impl Default for Cell {
     fn default() -> Self {
         Self {
+            placement_pool: placement::Pool::DEFAULT,
             phase: Phase::Inactive,
             proven_position: None,
             owner_log_recovery_attempts: 0,
@@ -899,6 +902,10 @@ impl State {
 
     pub fn node(&self) -> &str {
         &self.node
+    }
+
+    pub fn placement_pool(&self) -> placement::Pool {
+        self.config.placement_pool
     }
 
     pub fn is_fenced(&self) -> bool {
@@ -2100,6 +2107,7 @@ impl State {
         }
         for local in cells {
             let mut cell = Cell {
+                placement_pool: self.config.placement_pool,
                 resume_demand: true,
                 ..Cell::default()
             };
@@ -2202,6 +2210,13 @@ impl State {
         activation: Activation,
         effects: &mut Vec<Effect>,
     ) {
+        if cell.placement_pool != self.config.placement_pool {
+            cell.waiting_for = None;
+            set_phase(&mut self.occupied, cell, Phase::Inactive);
+            self.finish_requests(id, cell, Err(RequestError::PlacementUnavailable), effects);
+            self.activation_permits.remove(id);
+            return;
+        }
         if let Activation::Claim(claim) = &activation {
             if self.refuse_new_ownership_during_drain(id, cell, claim.prior.as_deref(), effects) {
                 return;
@@ -2340,6 +2355,7 @@ impl State {
         effects: &mut Vec<Effect>,
     ) {
         let desired = NodeLeaseRecord {
+            placement_pool: self.config.placement_pool,
             node: self.node.clone(),
             addr: spec.addr.clone(),
             expires_ms: now_ms.saturating_add(spec.ttl_ms),
@@ -3058,6 +3074,7 @@ impl State {
                 prior.last_attempt_mono_ms = now_mono_ms;
                 let spec = prior.spec.clone();
                 let desired = NodeLeaseRecord {
+                    placement_pool: self.config.placement_pool,
                     node: self.node.clone(),
                     addr: spec.addr.clone(),
                     expires_ms: now_ms.saturating_add(spec.ttl_ms),
@@ -3952,6 +3969,15 @@ impl State {
         if self.refuse_new_ownership_during_drain(id, cell, claim.prior.as_deref(), effects) {
             return;
         }
+        if cell.placement_pool != self.config.placement_pool {
+            if self.config.require_node_lease {
+                self.begin_capacity_lookup(id, cell, claim, effects);
+            } else {
+                set_phase(&mut self.occupied, cell, Phase::Inactive);
+                self.finish_requests(id, cell, Err(RequestError::PlacementUnavailable), effects);
+            }
+            return;
+        }
         if self.has_capacity() {
             self.activate_or_wait(
                 id,
@@ -4031,6 +4057,11 @@ impl State {
             return;
         };
         let mut cell = self.cells.remove(&id).expect("cell found above");
+        cell.placement_pool = result
+            .as_ref()
+            .ok()
+            .and_then(|record| record.as_ref())
+            .map_or(placement::Pool::DEFAULT, |record| record.placement_pool);
         if std::mem::take(&mut cell.confirming) {
             self.settle_confirmation(&id);
             if cell.requests.is_empty() && !cell.alarm_wake {
@@ -4039,7 +4070,10 @@ impl State {
                 // dormant at that epoch, exactly as an idle eviction does,
                 // and the next request wakes it through the usual claim.
                 let phase = match result {
-                    Ok(Some(record)) if record.node.as_deref() == Some(self.node.as_str()) => {
+                    Ok(Some(record))
+                        if record.node.as_deref() == Some(self.node.as_str())
+                            && record.placement_pool == self.config.placement_pool =>
+                    {
                         Phase::Dormant {
                             epoch: record.epoch,
                         }
@@ -4061,6 +4095,25 @@ impl State {
         let reconciles = reconciling_claim
             .as_ref()
             .map_or(0, |claim| claim.reconciles);
+        if result
+            .as_ref()
+            .ok()
+            .and_then(|owner| owner.as_ref())
+            .is_some_and(|owner| {
+                owner.node.as_deref() == Some(self.node.as_str())
+                    && owner.placement_pool != self.config.placement_pool
+            })
+        {
+            set_phase(&mut self.occupied, &mut cell, Phase::Inactive);
+            self.finish_requests(
+                &id,
+                &mut cell,
+                Err(RequestError::PlacementUnavailable),
+                effects,
+            );
+            self.cells.insert(id, cell);
+            return;
+        }
         match result {
             Ok(Some(record))
                 if reconciling_claim.as_ref().is_some_and(|claim| {
@@ -4070,10 +4123,10 @@ impl State {
             {
                 let spec = RestoreSpec {
                     epoch: record.epoch,
-                    fresh: matches!(
-                        reconciling_claim.as_ref().map(|claim| &claim.guard),
-                        Some(CasGuard::Absent)
-                    ),
+                    fresh: reconciling_claim.as_ref().is_some_and(|claim| {
+                        matches!(claim.guard, CasGuard::Absent)
+                            || (claim.epoch == 1 && !claim.takeover)
+                    }),
                     took_over: reconciling_claim
                         .as_ref()
                         .is_some_and(|claim| claim.takeover),
@@ -4141,7 +4194,7 @@ impl State {
                     Claim {
                         guard: CasGuard::Match(record.etag),
                         epoch,
-                        takeover: true,
+                        takeover: record.epoch != 0,
                         prior: None,
                         reconciles,
                     },
@@ -4290,6 +4343,17 @@ impl State {
                 // to admit a placement a peer had room for, and the released
                 // record then stayed unowned with its epoch retained until
                 // some node read it again.
+                if cell.placement_pool != self.config.placement_pool {
+                    set_phase(&mut self.occupied, &mut cell, Phase::Inactive);
+                    self.finish_requests(
+                        &id,
+                        &mut cell,
+                        Err(RequestError::PlacementUnavailable),
+                        effects,
+                    );
+                    self.cells.insert(id, cell);
+                    return;
+                }
                 self.activate_or_wait(
                     &id,
                     &mut cell,
@@ -4319,6 +4383,7 @@ impl State {
             .into_iter()
             .filter(|peer| {
                 peer.node != self.node
+                    && peer.placement_pool == cell.placement_pool
                     && peer.expires_ms > now_ms
                     && !peer.addr.is_empty()
                     && peer.peer_protocol == self.config.peer_protocol
@@ -4386,6 +4451,14 @@ impl State {
                 }),
                 effects,
             );
+        } else if cell.placement_pool != self.config.placement_pool {
+            set_phase(&mut self.occupied, &mut cell, Phase::Inactive);
+            self.finish_requests(
+                &id,
+                &mut cell,
+                Err(RequestError::PlacementUnavailable),
+                effects,
+            );
         } else {
             self.activate_or_wait(
                 &id,
@@ -4408,6 +4481,13 @@ impl State {
         effects: &mut Vec<Effect>,
     ) {
         match result {
+            Ok(Some(CachedNodeLease { record: lease, .. }))
+                if lease.expires_ms > issued_ms
+                    && lease.placement_pool != record.placement_pool =>
+            {
+                set_phase(&mut self.occupied, cell, Phase::Inactive);
+                self.finish_requests(id, cell, Err(RequestError::PlacementUnavailable), effects);
+            }
             Ok(Some(CachedNodeLease { record: lease, .. }))
                 if lease.expires_ms > issued_ms
                     && !lease.addr.is_empty()
@@ -4454,6 +4534,25 @@ impl State {
             Ok(lease) => {
                 if self.refuse_new_ownership_during_drain(id, cell, record.node.as_deref(), effects)
                 {
+                    return;
+                }
+                if record.placement_pool != self.config.placement_pool {
+                    let Some(epoch) = self.next_writer_epoch(id, cell, record.epoch, effects)
+                    else {
+                        return;
+                    };
+                    self.begin_capacity_lookup(
+                        id,
+                        cell,
+                        Claim {
+                            guard: CasGuard::Match(record.etag),
+                            epoch,
+                            takeover: true,
+                            prior: record.node,
+                            reconciles: 0,
+                        },
+                        effects,
+                    );
                     return;
                 }
                 // The takeover interlock, decided HERE on the lease the
@@ -4641,7 +4740,8 @@ impl State {
             Ok(CasOutcome::Applied) => {
                 let spec = RestoreSpec {
                     epoch: claim.epoch,
-                    fresh: matches!(claim.guard, CasGuard::Absent),
+                    fresh: matches!(claim.guard, CasGuard::Absent)
+                        || (claim.epoch == 1 && !claim.takeover),
                     took_over: claim.takeover,
                     resume_local: false,
                     prior: claim.prior.clone(),

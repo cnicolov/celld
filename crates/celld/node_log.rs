@@ -4152,6 +4152,8 @@ pub struct NodeLogManager {
     /// stores weak values, so observing many historical sessions does not
     /// retain one allocation per session for the process lifetime.
     recovery_locks: Mutex<BTreeMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>,
+    #[cfg(test)]
+    hot_preparation_pause: Mutex<Option<Arc<hot_recovery::HotPreparationPause>>>,
     /// Sessions for which this process won the Open -> Recovering CAS. A
     /// failed elected pass can retry immediately; other processes wait for
     /// the bounded claim before they compete to replace it.
@@ -4628,6 +4630,8 @@ impl NodeLogManager {
             recovery_gather_peak_bytes: std::sync::atomic::AtomicU64::new(0),
             predecessors_clean: std::sync::atomic::AtomicBool::new(false),
             recovery_locks: Mutex::new(BTreeMap::new()),
+            #[cfg(test)]
+            hot_preparation_pause: Mutex::new(None),
             gc_confirmed_empty: Mutex::new(std::collections::HashSet::new()),
             epoch_gc_due: Mutex::new(BTreeMap::new()),
             task_stop,
@@ -4986,19 +4990,21 @@ impl NodeLogManager {
         self.recover_as(dead, RecoverMode::Sweep).await
     }
 
-    pub(crate) async fn recover_as(&self, dead: &str, mode: RecoverMode) -> anyhow::Result<()> {
-        let recovery_lock = {
-            let mut locks = self.recovery_locks.lock().unwrap();
-            locks.retain(|_, lock| lock.strong_count() > 0);
-            match locks.get(dead).and_then(std::sync::Weak::upgrade) {
-                Some(lock) => lock,
-                None => {
-                    let lock = Arc::new(tokio::sync::Mutex::new(()));
-                    locks.insert(dead.to_string(), Arc::downgrade(&lock));
-                    lock
-                }
+    fn recovery_lock(&self, dead: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self.recovery_locks.lock().unwrap();
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        match locks.get(dead).and_then(std::sync::Weak::upgrade) {
+            Some(lock) => lock,
+            None => {
+                let lock = Arc::new(tokio::sync::Mutex::new(()));
+                locks.insert(dead.to_string(), Arc::downgrade(&lock));
+                lock
             }
-        };
+        }
+    }
+
+    pub(crate) async fn recover_as(&self, dead: &str, mode: RecoverMode) -> anyhow::Result<()> {
+        let recovery_lock = self.recovery_lock(dead);
         // A sweep that finds this process already recovering the session,
         // for a boot or a cold route, has nothing to add; waiting here held
         // the maintenance ticker for the length of the recovery.
@@ -5665,15 +5671,17 @@ impl NodeLogManager {
         match shortfall {
             log_tier::Shortfall::NoPeer => info!(
                 live_peers,
+                placement_pool = %self.ownership.placement_pool(),
                 "fleet durability requested and no peer is available; writes \
                  wait for the bucket. A second node acknowledges a write when \
                  its follower holds it on disk, which is much faster"
             ),
             log_tier::Shortfall::NoEligiblePeer => warn!(
                 live_peers,
+                placement_pool = %self.ownership.placement_pool(),
                 "fleet durability requested and no peer is eligible; writes \
-                 wait for the bucket. Every live peer is quarantined for \
-                 incapability or has not been recruited yet"
+                 wait for the bucket. Peers must match the placement pool, \
+                 advertise hot recovery for named pools, and pass protocol/health checks"
             ),
         }
     }
@@ -5747,6 +5755,11 @@ impl NodeLogManager {
         let members: Vec<Member> = peers
             .into_iter()
             .filter(|peer| peer.node != self.node && peer.expires_ms > now)
+            .filter(|peer| {
+                self.ownership
+                    .placement_pool()
+                    .accepts_follower(peer.placement_pool, peer.hot_recovery)
+            })
             // Only a follower that cannot serve appends at all sits out a
             // term. A gray one is recruitable again at once, because the
             // latency rule can judge it again and the swap rate cap is what

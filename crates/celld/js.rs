@@ -76,6 +76,7 @@ pub use crate::engine_api::CELL_OVERLOAD_ERROR_MARKER;
 pub use crate::host_channels::install_outbound_ws_connector_for_test;
 pub(crate) use crate::host_channels::outbound_ws_tx;
 pub use crate::host_channels::set_asset_call_tx;
+pub use crate::host_channels::set_cell_create_tx;
 pub use crate::host_channels::set_facet_tx;
 pub use crate::host_channels::set_gate_tx;
 pub use crate::host_channels::set_kv_blob_store;
@@ -85,6 +86,7 @@ pub use crate::host_channels::set_rpc_call_tx;
 pub use crate::host_channels::set_svc_call_tx;
 pub use crate::host_channels::set_svc_rpc_tx;
 pub use crate::host_channels::AssetCallReq;
+pub use crate::host_channels::CellCreateReq;
 pub use crate::host_channels::FacetReq;
 pub use crate::host_channels::GateReq;
 pub use crate::host_channels::QueueDispatchReq;
@@ -95,6 +97,7 @@ pub use crate::host_channels::SvcRpcReq;
 #[cfg(celld_internal_tests)]
 pub use crate::host_channels::TestOutboundWsConnector;
 pub(crate) use crate::host_channels::ASSET_CALL_TX;
+pub(crate) use crate::host_channels::CELL_CREATE_TX;
 pub(crate) use crate::host_channels::FACET_TX;
 pub(crate) use crate::host_channels::GATE_TX;
 pub(crate) use crate::host_channels::QUEUE_DISPATCH_TX;
@@ -4201,6 +4204,20 @@ pub struct HeapBytes {
 }
 
 impl Worker {
+    /// The pool holds this worker's permit and runs this on a blocking thread.
+    /// The snapshot covers the shared isolate, including every resident cell.
+    pub(crate) fn write_heap_snapshot(
+        &self,
+        output: &mut impl std::io::Write,
+    ) -> Result<u64, crate::heap_snapshot::Error> {
+        let inner = self
+            .inner
+            .as_ref()
+            .ok_or(crate::heap_snapshot::Error::Gone)?;
+        let (mut locker, _cells) = inner.lock();
+        crate::heap_snapshot::write(&mut locker, output)
+    }
+
     /// The heap V8 reports for this isolate. Takes the isolate lock, so the
     /// caller must hold the pool's permit for this worker, exactly as a turn
     /// does; `None` once the isolate has been freed.
@@ -6892,6 +6909,7 @@ ops! { OP_NAMES, install_op_functions,
         "__facet_abort" => op_facet_abort,
         "__facet_delete" => op_facet_delete,
         "__do_call" => op_do_call,
+        "__do_create" => op_do_create,
         "__svc_call" => op_svc_call,
         "__svc_call_cancellable" => op_svc_call_cancellable,
         "__svc_rpc" => op_svc_rpc,
@@ -8772,6 +8790,37 @@ fn op_loader_drop(
         // turn has left V8.
         asyncrt::op_handle().spawn(async move { drop(entry.state) });
     }
+}
+
+fn op_do_create(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let cell = args.get(0).to_rust_string_lossy(scope);
+    if !celld_logic::cell::valid_cell_scope(&cell) {
+        return loader_throw(scope, "invalid cell scope");
+    }
+    let pool = match args.get(1).to_rust_string_lossy(scope).parse() {
+        Ok(pool) => pool,
+        Err(error) => return loader_throw(scope, error),
+    };
+    let (reply, receive) = tokio::sync::oneshot::channel();
+    let request = CellCreateReq {
+        scope: cell,
+        placement_pool: pool,
+        reply,
+    };
+    let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::CellRpc);
+    let id = asyncrt::enqueue(async move {
+        gated_channel_send(gate, &CELL_CREATE_TX, request, "no cell placement channel").await?;
+        receive
+            .await
+            .map_err(|_| "cell creation was dropped".to_string())?
+            .map_err(|error| format!("create cell: {error:#}"))?;
+        Ok(Vec::new())
+    });
+    rv.set(promise_for(scope, id));
 }
 
 fn op_do_call(

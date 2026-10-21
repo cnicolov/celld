@@ -17,6 +17,7 @@ use tokio::sync::Notify;
 type Key = (String, String, u64);
 
 struct Image {
+    serial: u64,
     path: PathBuf,
     txid: u64,
     checksum: u64,
@@ -78,6 +79,7 @@ mod tests {
 
     #[test]
     fn hot_recovery_requires_checkpoint_coverage_and_a_complete_observed_range() {
+        crate::test_runtime::init();
         let root = tempfile::tempdir().unwrap();
         let cache = Arc::new(HotStandbys::new(root.path(), 16384, 4).unwrap());
         cache.observe(
@@ -96,6 +98,7 @@ mod tests {
 
     #[test]
     fn hot_recovery_applies_growth_and_truncation_and_detects_cache_damage() {
+        crate::test_runtime::init();
         let root = tempfile::tempdir().unwrap();
         let cache = Arc::new(HotStandbys::new(root.path(), 16384, 4).unwrap());
         let first = entry("cell", 1, 1, 1, 2, 0);
@@ -120,6 +123,7 @@ mod tests {
 
     #[test]
     fn hot_recovery_rejects_ltx_gaps_and_drops_cache_certificates_on_restart() {
+        crate::test_runtime::init();
         let root = tempfile::tempdir().unwrap();
         let cache = Arc::new(HotStandbys::new(root.path(), 16384, 4).unwrap());
         let first = entry("cell", 1, 1, 1, 1, 0);
@@ -156,6 +160,7 @@ mod tests {
 
     #[test]
     fn hot_recovery_budget_includes_prepared_promotions() {
+        crate::test_runtime::init();
         let root = tempfile::tempdir().unwrap();
         let cache = Arc::new(HotStandbys::new(root.path(), 4096, 1).unwrap());
         cache.observe("owner/g", range(0), range(1), &[entry("a", 1, 1, 1, 1, 0)]);
@@ -169,6 +174,318 @@ mod tests {
         covered(&cache);
         assert!(cache.take("owner/g", "b", 1, range(3)).is_some());
     }
+
+    #[test]
+    fn cold_standby_seeding_does_not_require_an_empty_checkpoint_queue() {
+        crate::test_runtime::init();
+        let root = tempfile::tempdir().unwrap();
+        let cache = HotStandbys::new(root.path(), 16384, 4).unwrap();
+        let first = entry("cell", 1, 1, 1, 1, 0);
+        let pre = ltx::decode_file(&first.bytes)
+            .unwrap()
+            .trailer
+            .post_apply_checksum;
+        let second = entry("cell", 2, 2, 2, 1, pre);
+        let pre = ltx::decode_file(&second.bytes)
+            .unwrap()
+            .trailer
+            .post_apply_checksum;
+        cache.observe(
+            "owner/g",
+            range(1),
+            range(3),
+            &[second, entry("cell", 3, 3, 3, 1, pre)],
+        );
+        let job = cache.next_checkpoint().unwrap();
+        assert!(
+            cache.checkpointed(&job),
+            "a published prefix must allow seeding even while writes are queued"
+        );
+    }
+
+    #[test]
+    fn cold_standby_replays_writes_observed_during_a_canonical_seed() {
+        crate::test_runtime::init();
+        let root = tempfile::tempdir().unwrap();
+        let cache = Arc::new(HotStandbys::new(root.path(), 16384, 4).unwrap());
+        let first = entry("cell", 1, 1, 1, 1, 0);
+        let pre = ltx::decode_file(&first.bytes)
+            .unwrap()
+            .trailer
+            .post_apply_checksum;
+        let second = entry("cell", 2, 2, 2, 1, pre);
+        let pre = ltx::decode_file(&second.bytes)
+            .unwrap()
+            .trailer
+            .post_apply_checksum;
+        cache.observe("owner/g", range(1), range(2), &[second]);
+        let job = cache.next_checkpoint().unwrap();
+        cache.checkpointed(&job);
+        // The publisher fixes its seed at t2, then a new append arrives while
+        // the canonical pages are being streamed from the object store.
+        cache.observe(
+            "owner/g",
+            range(2),
+            range(3),
+            &[entry("cell", 3, 3, 3, 1, pre)],
+        );
+        let source = root.path().join("seed.sqlite");
+        std::fs::write(&source, vec![2; 4096]).unwrap();
+        let queued_bytes = cache.status()["queued_bytes"].clone();
+        cache.seed(&job, &source, 2, 4096).unwrap();
+        let status = cache.status();
+        assert_eq!(status["queued_bytes"], queued_bytes);
+        assert_eq!(status["candidates"][0]["txid"], 3);
+        assert_eq!(status["candidates"][0]["covered_txid"], 2);
+        assert_eq!(status["candidates"][0]["ready"], false);
+        let retained = FollowerState {
+            base: 1,
+            ..range(3)
+        };
+        assert!(cache.take("owner/g", "cell", 1, retained).is_none());
+        covered(&cache);
+        let promotion = cache.take("owner/g", "cell", 1, retained).unwrap();
+        assert_eq!(std::fs::read(&promotion.path).unwrap(), vec![3; 4096]);
+        promotion.verify().unwrap();
+    }
+
+    #[test]
+    fn cold_standby_seed_replay_rejects_gaps_and_checksum_changes() {
+        crate::test_runtime::init();
+        for gap in [true, false] {
+            let root = tempfile::tempdir().unwrap();
+            let cache = Arc::new(HotStandbys::new(root.path(), 16384, 4).unwrap());
+            let first = entry("cell", 1, 1, 1, 1, 0);
+            let pre = ltx::decode_file(&first.bytes)
+                .unwrap()
+                .trailer
+                .post_apply_checksum;
+            let second = entry("cell", 2, 2, 2, 1, pre);
+            let pre = ltx::decode_file(&second.bytes)
+                .unwrap()
+                .trailer
+                .post_apply_checksum;
+            cache.observe("owner/g", range(1), range(2), &[second]);
+            let job = cache.next_checkpoint().unwrap();
+            cache.checkpointed(&job);
+            cache.observe(
+                "owner/g",
+                range(2),
+                range(3),
+                &[if gap {
+                    entry("cell", 3, 4, 4, 1, pre)
+                } else {
+                    entry("cell", 3, 3, 3, 1, pre ^ 1)
+                }],
+            );
+            let source = root.path().join("seed.sqlite");
+            std::fs::write(&source, vec![2; 4096]).unwrap();
+            assert!(cache.seed(&job, &source, 2, 4096).is_err());
+            // The checkpoint worker discards a failed seed; no certificate or
+            // additional queue/disk reservation survives that failure.
+            cache.failed(&job);
+            assert!(cache.take("owner/g", "cell", 1, range(3)).is_none());
+            assert_eq!(cache.status()["bytes"], 0);
+            assert_eq!(cache.status()["queued_bytes"], 0);
+        }
+    }
+
+    #[test]
+    fn cold_standby_seed_replay_accounts_for_peak_size_before_truncation() {
+        crate::test_runtime::init();
+        let root = tempfile::tempdir().unwrap();
+        let cache = HotStandbys::new(root.path(), 12288, 4).unwrap();
+        let first = entry("cell", 1, 1, 1, 1, 0);
+        let pre = ltx::decode_file(&first.bytes)
+            .unwrap()
+            .trailer
+            .post_apply_checksum;
+        let second = entry("cell", 2, 2, 2, 1, pre);
+        let pre = ltx::decode_file(&second.bytes)
+            .unwrap()
+            .trailer
+            .post_apply_checksum;
+        cache.observe("owner/g", range(1), range(2), &[second]);
+        let job = cache.next_checkpoint().unwrap();
+        cache.checkpointed(&job);
+        let third = entry("cell", 3, 3, 3, 3, pre);
+        let pre = ltx::decode_file(&third.bytes)
+            .unwrap()
+            .trailer
+            .post_apply_checksum;
+        cache.observe(
+            "owner/g",
+            range(2),
+            range(4),
+            &[third, entry("cell", 4, 4, 4, 1, pre)],
+        );
+        // The shrinking cold image now reserves one page. Another image fits,
+        // but replay's earlier growth would exceed the aggregate disk budget.
+        cache.observe(
+            "owner/g",
+            range(4),
+            range(5),
+            &[entry("other", 5, 1, 1, 1, 0)],
+        );
+        let source = root.path().join("seed.sqlite");
+        std::fs::write(&source, vec![2; 4096]).unwrap();
+        assert!(cache.seed(&job, &source, 2, 4096).is_err());
+        assert!(
+            source.exists(),
+            "reject over-budget replay before installing its seed"
+        );
+        cache.failed(&job);
+        assert_eq!(cache.status()["bytes"], 4096);
+    }
+
+    #[test]
+    fn a_seed_from_a_superseded_fragment_cannot_replace_or_discard_its_new_image() {
+        crate::test_runtime::init();
+        let root = tempfile::tempdir().unwrap();
+        let cache = Arc::new(HotStandbys::new(root.path(), 16384, 4).unwrap());
+        let first = entry("cell", 1, 1, 1, 1, 0);
+        let pre = ltx::decode_file(&first.bytes)
+            .unwrap()
+            .trailer
+            .post_apply_checksum;
+        cache.observe(
+            "owner/g",
+            range(1),
+            range(2),
+            &[entry("cell", 2, 2, 2, 1, pre)],
+        );
+        let job = cache.next_checkpoint().unwrap();
+        cache.checkpointed(&job);
+        // Reconfiguration invalidates the cache while its seed is in flight.
+        let next = FollowerState {
+            fragment_epoch: 2,
+            end: 1,
+            ..Default::default()
+        };
+        cache.observe("owner/g", range(0), next, &[entry("cell", 1, 3, 1, 1, 0)]);
+        let source = root.path().join("old-seed.sqlite");
+        std::fs::write(&source, vec![2; 4096]).unwrap();
+        cache.seed(&job, &source, 2, 4096).unwrap();
+        cache.failed(&job);
+        assert_eq!(cache.status()["candidates"][0]["txid"], 3);
+        assert_eq!(cache.status()["candidates"][0]["covered_txid"], 0);
+        assert!(source.exists());
+        covered(&cache);
+        let promotion = cache.take("owner/g", "cell", 1, next).unwrap();
+        assert_eq!(std::fs::read(&promotion.path).unwrap(), vec![3; 4096]);
+        promotion.verify().unwrap();
+    }
+
+    #[test]
+    fn a_seed_checksum_scan_does_not_hold_the_cache_mutex() {
+        crate::test_runtime::init();
+        let root = tempfile::tempdir().unwrap();
+        let cache = Arc::new(HotStandbys::new(root.path(), 16384, 4).unwrap());
+        let pre = CHECKSUM_FLAG | ltx::checksum_page(1, &vec![1; 4096]);
+        cache.observe(
+            "owner/g",
+            range(1),
+            range(2),
+            &[entry("cell", 2, 2, 2, 1, pre)],
+        );
+        let job = cache.next_checkpoint().unwrap();
+        cache.checkpointed(&job);
+        let source = root.path().join("seed.sqlite");
+        std::fs::write(&source, vec![2; 4096]).unwrap();
+        let (started, scanning) = std::sync::mpsc::channel();
+        let (resume, resumed) = std::sync::mpsc::channel();
+        let seeding = cache.clone();
+        let seed = std::thread::spawn(move || {
+            seeding.seed_scanned(&job, &source, 2, 4096, || {
+                started.send(()).unwrap();
+                resumed.recv().unwrap();
+                HotStandbys::scan_seed(&source, 4096)
+            })
+        });
+        scanning
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let (sampled, sample) = std::sync::mpsc::channel();
+        let sampling = cache.clone();
+        let status = std::thread::spawn(move || {
+            // Writes can arrive while the canonical checksum is being scanned.
+            let pre = CHECKSUM_FLAG | ltx::checksum_page(1, &vec![2; 4096]);
+            sampling.observe(
+                "owner/g",
+                range(2),
+                range(3),
+                &[entry("cell", 3, 3, 3, 1, pre)],
+            );
+            sampled.send(sampling.status()).unwrap();
+        });
+        let responsive = sample
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .is_ok();
+        // Always release/join both workers before asserting, even on failure.
+        resume.send(()).unwrap();
+        seed.join().unwrap().unwrap();
+        status.join().unwrap();
+        assert!(
+            responsive,
+            "a paused multi-GiB checksum scan blocked cache status"
+        );
+        let retained = FollowerState {
+            base: 1,
+            ..range(3)
+        };
+        assert!(cache.take("owner/g", "cell", 1, retained).is_none());
+        covered(&cache);
+        cache
+            .take("owner/g", "cell", 1, retained)
+            .unwrap()
+            .verify()
+            .unwrap();
+    }
+
+    #[test]
+    fn a_fragment_change_during_the_checksum_scan_fences_its_seed() {
+        crate::test_runtime::init();
+        let root = tempfile::tempdir().unwrap();
+        let cache = Arc::new(HotStandbys::new(root.path(), 16384, 4).unwrap());
+        let pre = CHECKSUM_FLAG | ltx::checksum_page(1, &vec![1; 4096]);
+        cache.observe(
+            "owner/g",
+            range(1),
+            range(2),
+            &[entry("cell", 2, 2, 2, 1, pre)],
+        );
+        let old_job = cache.next_checkpoint().unwrap();
+        cache.checkpointed(&old_job);
+        let source = root.path().join("seed.sqlite");
+        std::fs::write(&source, vec![2; 4096]).unwrap();
+        let new_range = |end| FollowerState {
+            fragment_epoch: 2,
+            end,
+            ..Default::default()
+        };
+        cache
+            .seed_scanned(&old_job, &source, 2, 4096, || {
+                let scan = HotStandbys::scan_seed(&source, 4096)?;
+                cache.observe(
+                    "owner/g",
+                    new_range(0),
+                    new_range(1),
+                    &[entry("cell", 1, 1, 1, 1, 0)],
+                );
+                covered(&cache);
+                Ok(scan)
+            })
+            .unwrap();
+        // Even a completed old scan cannot replace or discard a new incarnation.
+        cache.failed(&old_job);
+        assert!(
+            source.exists(),
+            "obsolete seed was installed over the new image"
+        );
+        let promotion = cache.take("owner/g", "cell", 1, new_range(1)).unwrap();
+        assert_eq!(promotion.txid, 1);
+        promotion.verify().unwrap();
+    }
 }
 
 struct Session {
@@ -179,6 +496,7 @@ struct Session {
 
 pub(crate) struct Checkpoint {
     key: Key,
+    image_serial: u64,
     pub cell: String,
     pub epoch: u64,
     pub txid: u64,
@@ -207,6 +525,8 @@ pub(crate) struct HotStandbys {
 
 pub(crate) struct Promotion {
     pub owner: String,
+    pub session: String,
+    pub log_epoch: u64,
     pub source_epoch: u64,
     pub txid: u64,
     pub commit: u32,
@@ -343,21 +663,7 @@ impl HotStandbys {
     }
 
     fn apply(&self, state: &mut State, key: &Key, entry: &Entry) -> Result<()> {
-        let (decoded, pages) = ltx::decode_file_with_pages(&entry.bytes)?;
-        let header = decoded.header;
-        anyhow::ensure!(
-            header.max_txid.0 == entry.txid,
-            "standby entry TXID mismatch"
-        );
-        let lock = ltx::lock_pgno(header.page_size);
-        let mut seen = BTreeSet::new();
-        anyhow::ensure!(
-            pages.iter().all(|(pgno, _)| *pgno > 0
-                && *pgno <= header.commit
-                && *pgno != lock
-                && seen.insert(*pgno)),
-            "standby has duplicate or out-of-range pages"
-        );
+        let header = ltx::Header::parse(&entry.bytes)?;
         let bytes = u64::from(header.commit) * u64::from(header.page_size);
         if !state.images.contains_key(key) {
             if state.images.len() + state.prepared >= self.max_cells {
@@ -373,6 +679,7 @@ impl HotStandbys {
             state.images.insert(
                 key.clone(),
                 Image {
+                    serial: state.serial,
                     path: self.root.join(format!("{}.sqlite", state.serial)),
                     txid: 0,
                     checksum: 0,
@@ -413,16 +720,58 @@ impl HotStandbys {
             state.queued_bytes.saturating_add(entry.bytes.len() as u64) <= self.queue_bytes,
             "standby checkpoint queue budget reached"
         );
+        Self::materialize(image, entry.txid, &entry.bytes)?;
+        let retained_bytes = if image.txid == 0 {
+            bytes
+        } else {
+            u64::from(image.commit) * u64::from(image.page_size)
+        };
+        state.bytes = state
+            .bytes
+            .saturating_sub(image.bytes)
+            .saturating_add(retained_bytes);
+        image.bytes = retained_bytes;
+        state.queued_bytes += entry.bytes.len() as u64;
+        state.queue.push_back(Checkpoint {
+            key: key.clone(),
+            image_serial: image.serial,
+            cell: entry.cell.clone(),
+            epoch: entry.cell_epoch,
+            txid: entry.txid,
+            bytes: entry.bytes.clone(),
+        });
+        Ok(())
+    }
+
+    fn materialize(image: &mut Image, txid: u64, bytes: &[u8]) -> Result<()> {
+        let (decoded, pages) = ltx::decode_file_with_pages(bytes)?;
+        let header = decoded.header;
+        anyhow::ensure!(header.max_txid.0 == txid, "standby entry TXID mismatch");
+        let lock = ltx::lock_pgno(header.page_size);
+        let mut seen = BTreeSet::new();
+        anyhow::ensure!(
+            pages.iter().all(|(pgno, _)| *pgno > 0
+                && *pgno <= header.commit
+                && *pgno != lock
+                && seen.insert(*pgno)),
+            "standby has duplicate or out-of-range pages"
+        );
         image.expected = image.expected.max(header.max_txid.0);
         // A non-snapshot first entry needs a canonical bucket seed. The bounded
-        // publisher seeds it once its queued checkpoints have caught up.
+        // publisher replays its queued tail if writes arrive during the seed.
         if (image.txid != 0 || header.is_snapshot()) && header.max_txid.0 > image.txid {
             anyhow::ensure!(
                 header.page_size == image.page_size,
                 "standby page size changed"
             );
             if !header.is_snapshot() {
-                anyhow::ensure!(header.min_txid.0 == image.txid + 1, "standby LTX gap");
+                anyhow::ensure!(
+                    header.min_txid.0 == image.txid + 1,
+                    "standby LTX gap: image t{}, incoming t{}-{}",
+                    image.txid,
+                    header.min_txid.0,
+                    header.max_txid.0
+                );
                 anyhow::ensure!(
                     header.no_checksum() || header.pre_apply_checksum == image.checksum,
                     "standby LTX checksum chain changed"
@@ -484,29 +833,11 @@ impl HotStandbys {
                 header.no_checksum() || rolling == decoded.trailer.post_apply_checksum,
                 "standby rolling checksum mismatch"
             );
-            file.set_len(bytes)?;
+            file.set_len(u64::from(header.commit) * u64::from(header.page_size))?;
             image.txid = header.max_txid.0;
             image.checksum = rolling;
             image.commit = header.commit;
         }
-        let retained_bytes = if image.txid == 0 {
-            bytes
-        } else {
-            u64::from(image.commit) * u64::from(image.page_size)
-        };
-        state.bytes = state
-            .bytes
-            .saturating_sub(image.bytes)
-            .saturating_add(retained_bytes);
-        image.bytes = retained_bytes;
-        state.queued_bytes += entry.bytes.len() as u64;
-        state.queue.push_back(Checkpoint {
-            key: key.clone(),
-            cell: entry.cell.clone(),
-            epoch: entry.cell_epoch,
-            txid: entry.txid,
-            bytes: entry.bytes.clone(),
-        });
         Ok(())
     }
 
@@ -519,10 +850,13 @@ impl HotStandbys {
 
     pub fn checkpointed(&self, job: &Checkpoint) -> bool {
         let mut state = self.state.lock().unwrap();
-        let queued = state.queue.iter().any(|next| next.key == job.key);
-        if let Some(image) = state.images.get_mut(&job.key) {
+        if let Some(image) = state
+            .images
+            .get_mut(&job.key)
+            .filter(|image| image.serial == job.image_serial)
+        {
             image.covered = image.covered.max(job.txid);
-            return image.txid == 0 && !queued;
+            return image.txid == 0;
         }
         false
     }
@@ -533,11 +867,19 @@ impl HotStandbys {
             .unwrap()
             .images
             .get(&job.key)
+            .filter(|image| image.serial == job.image_serial)
             .map_or(0, |image| image.covered)
     }
 
     pub fn failed(&self, job: &Checkpoint) {
-        Self::discard(&mut self.state.lock().unwrap(), &job.key);
+        let mut state = self.state.lock().unwrap();
+        if state
+            .images
+            .get(&job.key)
+            .is_some_and(|image| image.serial == job.image_serial)
+        {
+            Self::discard(&mut state, &job.key);
+        }
     }
 
     pub fn seed_budget(&self, job: &Checkpoint) -> Option<u64> {
@@ -546,41 +888,28 @@ impl HotStandbys {
             .unwrap()
             .images
             .get(&job.key)
-            .filter(|image| image.txid == 0)
+            .filter(|image| image.serial == job.image_serial && image.txid == 0)
             .map(|image| image.bytes)
     }
 
     pub fn seed(&self, job: &Checkpoint, source: &Path, txid: u64, page_size: u32) -> Result<()> {
-        let mut state = self.state.lock().unwrap();
-        let Some(image) = state.images.get(&job.key) else {
-            return Ok(());
-        };
-        // Do not replace a cache the append path already advanced.
-        if image.txid != 0 || txid < image.expected {
-            return Ok(());
-        }
+        self.seed_scanned(job, source, txid, page_size, || {
+            Self::scan_seed(source, page_size)
+        })
+    }
+
+    fn scan_seed(source: &Path, page_size: u32) -> Result<(u64, u32, u64)> {
         anyhow::ensure!(
             ltx::is_valid_page_size(page_size),
             "invalid standby seed page size"
         );
-        let bytes = std::fs::metadata(source)?.len();
+        let mut file = std::fs::File::open(source)?;
+        let bytes = file.metadata()?.len();
         anyhow::ensure!(
             bytes % u64::from(page_size) == 0,
             "standby seed has a partial page"
         );
-        anyhow::ensure!(
-            state
-                .bytes
-                .saturating_sub(image.bytes)
-                .saturating_add(bytes)
-                <= self.max_bytes,
-            "standby seed exceeds disk budget"
-        );
-        let old_bytes = image.bytes;
-        let image = state.images.get_mut(&job.key).unwrap();
-        std::fs::rename(source, &image.path)?;
-        let mut file = std::fs::File::open(&image.path)?;
-        let commit = u32::try_from(file.metadata()?.len() / u64::from(page_size))?;
+        let commit = u32::try_from(bytes / u64::from(page_size))?;
         let mut checksum = CHECKSUM_FLAG;
         let lock = ltx::lock_pgno(page_size);
         let mut page = vec![0; page_size as usize];
@@ -590,13 +919,85 @@ impl HotStandbys {
                 checksum = CHECKSUM_FLAG | (checksum ^ ltx::checksum_page(pgno, &page));
             }
         }
+        Ok((bytes, commit, checksum))
+    }
+
+    fn seed_scanned(
+        &self,
+        job: &Checkpoint,
+        source: &Path,
+        txid: u64,
+        page_size: u32,
+        scan: impl FnOnce() -> Result<(u64, u32, u64)>,
+    ) -> Result<()> {
+        if self.seed_budget(job).is_none() {
+            return Ok(());
+        }
+        anyhow::ensure!(txid >= job.txid, "standby seed predates its checkpoint");
+        // The source is private to this checkpoint worker. A multi-GiB page
+        // checksum scan must not hold the cache mutex: appends, status, and
+        // fragment changes must remain responsive while it runs. Recheck the
+        // exact image incarnation before installing the completed scan.
+        let (bytes, commit, checksum) = scan()?;
+        let mut state = self.state.lock().unwrap();
+        let Some(image) = state
+            .images
+            .get(&job.key)
+            .filter(|image| image.serial == job.image_serial)
+        else {
+            return Ok(());
+        };
+        // Do not replace a cache the append path already advanced.
+        if image.txid != 0 {
+            return Ok(());
+        }
+        // This worker pauses queue consumption during the download/scan. Every
+        // later observed commit is still in the bounded queue, so a seed at
+        // least as new as this published job can replay that fixed tail.
+        let mut peak_bytes = bytes;
+        for pending in state.queue.iter().filter(|pending| pending.key == job.key) {
+            if pending.txid > txid {
+                let header = ltx::Header::parse(&pending.bytes)?;
+                peak_bytes = peak_bytes.max(u64::from(header.commit) * u64::from(header.page_size));
+            }
+        }
+        anyhow::ensure!(
+            state
+                .bytes
+                .saturating_sub(image.bytes)
+                .saturating_add(peak_bytes)
+                <= self.max_bytes,
+            "standby seed exceeds disk budget"
+        );
+        let old_bytes = image.bytes;
+        let State {
+            images,
+            queue,
+            bytes: retained_bytes,
+            ..
+        } = &mut *state;
+        let image = images.get_mut(&job.key).unwrap();
+        std::fs::rename(source, &image.path)?;
         image.txid = txid;
         image.covered = image.covered.max(txid);
         image.checksum = checksum;
         image.commit = commit;
         image.page_size = page_size;
-        image.bytes = bytes;
-        state.bytes = state.bytes.saturating_sub(old_bytes).saturating_add(bytes);
+        // Materialize without re-enqueueing or claiming checkpoint coverage
+        // for the replay. Those jobs still need their normal bucket uploads.
+        for pending in queue.iter().filter(|pending| pending.key == job.key) {
+            if pending.txid > txid {
+                Self::materialize(image, pending.txid, &pending.bytes)?;
+            }
+        }
+        anyhow::ensure!(
+            image.txid >= image.expected,
+            "standby seed tail is incomplete"
+        );
+        image.bytes = u64::from(image.commit) * u64::from(image.page_size);
+        *retained_bytes = retained_bytes
+            .saturating_sub(old_bytes)
+            .saturating_add(image.bytes);
         Ok(())
     }
 
@@ -625,6 +1026,8 @@ impl HotStandbys {
         cache.prepared += 1;
         Some(Promotion {
             owner,
+            session: session.to_string(),
+            log_epoch: state.fragment_epoch,
             source_epoch: epoch,
             txid: image.txid,
             commit: image.commit,

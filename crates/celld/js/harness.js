@@ -5126,6 +5126,23 @@ class DurableObjectNamespace {
     Object.defineProperty(this, "_className", { value: className });
     Object.defineProperty(this, "_namespaceKey", { value: namespaceKey });
   }
+  // celld extension: placement is durably reserved, execution remains lazy.
+  // Named creation is idempotent; a different pool for an existing ID fails.
+  async create(options = {}) {
+    if (options === null || typeof options !== "object" || Array.isArray(options))
+      throw new TypeError("create() requires an options object");
+    for (const key of Object.keys(options)) {
+      if (key !== "name" && key !== "placement")
+        throw new TypeError("unknown cell creation option: " + key);
+    }
+    if (options.name !== undefined && (typeof options.name !== "string" || !options.name))
+      throw new TypeError("create() name must be a nonempty string");
+    const placement = options.placement === undefined ? "default" : options.placement;
+    if (typeof placement !== "string") throw new TypeError("placement must be a pool name");
+    const id = options.name === undefined ? this.newUniqueId() : this.idFromName(options.name);
+    await __do_create(id._scope(), placement);
+    return this.get(id);
+  }
   idFromName(name) {
     name = String(name);
     return new DurableObjectId(

@@ -3805,6 +3805,9 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::env::temp_dir().join(format!("celld-{}", std::process::id())));
     let explicit_node = std::env::var("CELLD_NODE").ok();
+    let placement_pool = celld::env_vars::placement_pool()?;
+    let hot_recovery = celld::env_vars::hot_recovery()?;
+    celld::node_identity::validate_placement_pool(&data_dir, placement_pool)?;
     let node = celld::node_identity::load_or_create(&data_dir, explicit_node.as_deref())?;
     let clean_reload_node = node.clone();
     celld::control_plane::install_reexec_node_session_id(&node)?;
@@ -3921,6 +3924,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                     probe_public_key.clone(),
                 )
                 .with_lease_ttl_ms(lease_ttl_ms_from_environment())
+                .with_placement_pool(placement_pool, hot_recovery)
                 .with_fleet_sample_ms(fleet_sample_ms),
             );
             let wake_scan = Some((client, bucket_ownership.clone()));
@@ -4076,6 +4080,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                         probe_public_key.clone(),
                     )
                     .with_lease_ttl_ms(lease_ttl_ms_from_environment())
+                    .with_placement_pool(placement_pool, hot_recovery)
                     .with_fleet_sample_ms(fleet_sample_ms),
                 );
                 let wake_scan = Some((client, bucket_ownership.clone()));
@@ -4157,6 +4162,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                             probe_public_key.clone(),
                         )
                         .with_lease_ttl_ms(lease_ttl_ms_from_environment())
+                        .with_placement_pool(placement_pool, hot_recovery)
                         .with_fleet_sample_ms(fleet_sample_ms),
                     ))),
                     peer_key,
@@ -4339,12 +4345,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                 celld::node_log::eviction_policy_from_env()?,
             ));
             *actor.node_log.lock().unwrap() = Some(manager.clone());
-            let hot_recovery = std::env::var("CELLD_HOT_RECOVERY").unwrap_or_else(|_| "0".into());
-            anyhow::ensure!(
-                matches!(hot_recovery.as_str(), "0" | "1"),
-                "CELLD_HOT_RECOVERY must be 0 or 1"
-            );
-            if hot_recovery == "1" {
+            if hot_recovery {
                 if let Some(follower) = &follower {
                     manager.enable_hot_recovery(
                         follower.clone(),
@@ -4412,6 +4413,31 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
         }
     }
     let mut durability_owner = durability_owner.select();
+    let (cell_create_tx, mut cell_create_rx) =
+        mpsc::unbounded_channel::<celld::js::CellCreateReq>();
+    celld::js::set_cell_create_tx(cell_create_tx);
+    {
+        let ownership = actor.ownership.clone();
+        tokio::spawn(async move {
+            let slots = Arc::new(tokio::sync::Semaphore::new(64));
+            while let Some(request) = cell_create_rx.recv().await {
+                let permit = match slots.clone().acquire_owned().await {
+                    Ok(permit) => permit,
+                    Err(_) => return,
+                };
+                let ownership = ownership.clone();
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    let result = match tokio::time::timeout(std::time::Duration::from_secs(15),
+                        ownership.create_cell(&request.scope, request.placement_pool)).await {
+                        Ok(result) => result,
+                        Err(_) => Err(anyhow::anyhow!("cell creation timed out; named creation may be retried with the same name and placement")),
+                    };
+                    let _ = request.reply.send(result);
+                });
+            }
+        });
+    }
     let (do_call_tx, mut do_call_rx) = mpsc::unbounded_channel();
     celld::js::set_do_call_tx(do_call_tx);
     let (gate_tx, mut gate_rx) = mpsc::unbounded_channel();

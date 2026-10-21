@@ -1,6 +1,7 @@
 # Built-in resource monitor
 
-The monitor is a read-only, cluster dashboard. The runtime and HTTP API are
+The monitor is a cluster dashboard with read-only sampling and on-demand heap
+diagnostics. The runtime and HTTP API are
 native Rust; the Leptos dashboard is Rust compiled to WebAssembly. Trunk generates
 the browser loader, so there is no handwritten application JavaScript or npm
 frontend. The HTML, CSS, loader and WebAssembly are embedded in the celld binary.
@@ -66,9 +67,44 @@ API; pages contain 100 cells (API maximum 250). CPU and memory sorting ranks the
 open browser tab, are partitioned by node, and reset on node restart. They are not
 persistent history.
 
-V8 Inspector, CPU profiles, heap snapshots,
-dedicated-isolate diagnostics and persistent Parquet resource history are not
-implemented in this slice. Their dashboard actions are disabled.
+V8 Inspector, CPU profiles, dedicated-isolate diagnostics and persistent Parquet
+resource history are not implemented in this slice. Their dashboard actions are
+disabled. Heap snapshots are available through the operator API below.
+
+## Capture an isolate heap
+
+Use the node's `/monitor/api` response to select an `isolates[].id`, then POST to
+that same node's internal listener:
+
+```sh
+curl --fail --request POST \
+  http://127.0.0.1:9878/monitor/heap-snapshot/1 \
+  --output isolate-1.heapsnapshot
+```
+
+Replace the address with the monitor URL printed by `celld dev`, and the ID with
+the selected resident isolate. Load the `.heapsnapshot` file in Chrome DevTools
+under **Memory → Load**. The snapshot describes the whole shared isolate, including
+all its resident cells and their retained JavaScript objects.
+
+Capture is explicit and temporarily pauses that isolate while V8 builds its heap
+graph. Other isolates keep serving. A busy isolate or existing capture/download
+returns 409; a retired or unknown ID returns 404. GET and HEAD do not capture.
+The route uses the monitor's existing enablement and origin/host checks and is
+available only on the operator listener.
+
+JSON is serialized into an anonymous temporary file and streamed in 64 KiB chunks,
+with one capture/download per node and a 1 GiB output limit. It is not retained as
+another full in-memory copy. Closing the download releases the file and slot.
+V8 still needs temporary memory to construct its graph. An incomplete capture or
+disk error fails the request rather than returning a successful partial snapshot.
+
+The native smoke test also verifies shared-cell contents, repeat capture, busy
+isolate rejection, origin checks and the public/private listener boundary:
+
+```sh
+python3 scripts/monitor-smoke.py --binary target/debug/celld --heap-snapshot-only
+```
 
 ## Cluster coverage
 
