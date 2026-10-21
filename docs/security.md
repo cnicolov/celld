@@ -1,6 +1,6 @@
 # Security
 
-celld v0.6.2 is a beta release. It is not safe for hostile multi-tenant use.
+celld v0.6.3 is a beta release. It is not safe for hostile multi-tenant use.
 Only the latest release receives security fixes.
 
 ## Security boundary

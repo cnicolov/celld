@@ -542,6 +542,8 @@ release, so keep operator tooling and celld releases together.
   failure on the owner of a forwarded Durable Object fetch can reach the
   caller as a 500 response. A v0.6.2 pair rejects the caller's `stub.fetch()`
   instead, as a local owner does. A rollback to v0.6.1 can also roll.
+- **v0.6.2 to v0.6.3: rolling.** No runtime or protocol changes, so a mixed
+  v0.6.2 and v0.6.3 fleet behaves as v0.6.2 does, and a rollback can roll.
 
 ## Diagnose a fleet
 
