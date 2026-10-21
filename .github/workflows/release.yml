@@ -19,6 +19,12 @@ on:
   release:
     types: [published]
   workflow_dispatch:
+    inputs:
+      publish_binaries:
+        description: Publish a binaries-only GitHub release (no container jobs)
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: read
@@ -81,7 +87,7 @@ jobs:
   # be published; nothing is pushed at candidate time.
   container-check:
     name: Container smoke build
-    if: github.event_name != 'release'
+    if: github.event_name != 'release' && inputs.publish_binaries != true
     runs-on: ubuntu-22.04
     timeout-minutes: 60
     permissions:
@@ -115,6 +121,7 @@ jobs:
     if: github.event_name != 'release'
     needs:
       - build-celld
+      - test-celld
     runs-on: ubuntu-22.04
     timeout-minutes: 15
     permissions:
@@ -153,7 +160,7 @@ jobs:
         with:
           subject-path: assets/*.gz
 
-      - name: Create or refresh the draft release
+      - name: Create or refresh the release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -162,12 +169,9 @@ jobs:
           tag="v$version"
           existing=$(gh release view "$tag" --json isDraft \
             --jq .isDraft 2>/dev/null || echo "absent")
-          if [ "$existing" = "false" ]; then
-            echo "release $tag is already published; bump the version" >&2
+          if [ "$existing" != "absent" ]; then
+            echo "release $tag already exists; refusing to overwrite it" >&2
             exit 1
-          fi
-          if [ "$existing" = "true" ]; then
-            gh release delete "$tag" --yes
           fi
           # The release body is the release commit's message: subject
           # dropped (it is the title), trailers stripped, hard wraps
@@ -182,12 +186,31 @@ jobs:
                       buf = (buf == "" ? $0 : buf " " $0) }
               END   { if (buf != "") print buf }
             ' | cat -s > /tmp/notes.md
+          draft_flag=--draft
+          if [ "${{ inputs.publish_binaries }}" = "true" ]; then
+            draft_flag=--verify-tag
+          fi
           gh release create "$tag" \
-            --draft \
+            $draft_flag \
             --target "$GITHUB_SHA" \
             --title "$tag" \
             --notes-file /tmp/notes.md \
             assets/*
+
+  test-celld:
+    name: Test celld
+    if: github.event_name != 'release'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v6
+      - name: Test workspace
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$RUST_VERSION" --profile minimal
+          rustup default "$RUST_VERSION"
+          rustup target add wasm32-unknown-unknown
+          cargo test --locked --workspace
 
   build-container:
     # Static name so a skipped run shows "Build container" instead of the
