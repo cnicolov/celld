@@ -118,9 +118,16 @@ jobs:
 
   draft-release:
     name: Attest and draft the release
-    if: github.event_name != 'release'
+    if: >-
+      always() && !cancelled() && github.event_name != 'release' &&
+      needs.build-celld.result == 'success' &&
+      needs.test-celld.result == 'success' &&
+      (needs.container-check.result == 'success' ||
+       (inputs.publish_binaries == true && needs.container-check.result == 'skipped'))
     needs:
       - build-celld
+      - test-celld
+      - container-check
     runs-on: ubuntu-22.04
     timeout-minutes: 15
     permissions:
@@ -185,12 +192,14 @@ jobs:
                       buf = (buf == "" ? $0 : buf " " $0) }
               END   { if (buf != "") print buf }
             ' | cat -s > /tmp/notes.md
-          draft_flag=--draft
+          draft_flags=(--draft)
           if [ "${{ inputs.publish_binaries }}" = "true" ]; then
-            draft_flag=--verify-tag
+            # --target creates the new tag at the exact workflow commit.
+            # --verify-tag would incorrectly require a tag to exist already.
+            draft_flags=()
           fi
           gh release create "$tag" \
-            $draft_flag \
+            "${draft_flags[@]}" \
             --target "$GITHUB_SHA" \
             --title "$tag" \
             --notes-file /tmp/notes.md \
