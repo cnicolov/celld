@@ -2347,6 +2347,8 @@ mod metrics;
 mod monitor;
 #[path = "main/peer_tunnel.rs"]
 mod peer_tunnel;
+#[path = "main/repl.rs"]
+mod repl;
 #[path = "main/trace_monitor.rs"]
 mod trace_monitor;
 #[path = "main/websocket.rs"]
@@ -2924,6 +2926,7 @@ async fn handle_internal(
     let cell_scope = path.strip_prefix("/cell/");
     let evict_scope = path.strip_prefix("/evict/");
     let result = match path.as_str() {
+        _ if path == "/repl" || path.starts_with("/repl/") => repl::handle(request, app).await,
         _ if path == "/monitor" || path.starts_with("/monitor/") => {
             monitor::handle(request, app).await
         }
@@ -3598,6 +3601,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
         Action::Kv(arguments) => return celld::kv_cli::run(arguments).await,
         Action::Queue(arguments) => return celld::queue_cli::run(arguments).await,
         Action::R2(arguments) => return celld::r2_cli::run(arguments).await,
+        Action::Repl(arguments) => return celld::repl::run(arguments).await,
         Action::Connect(arguments) => {
             return celld::control_plane::handle_connect_command(arguments).await
         }

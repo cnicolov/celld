@@ -5358,6 +5358,23 @@ __celld.__makeIncomingRequest = (
   url, method,
   streamId === undefined ? body : new CelldHttpBodyStream(streamId),
   headersJson, undefined, true);
+// Evaluate operator code as an ordinary event of one live object. Indirect
+// eval keeps REPL declarations in the realm for the next input, while the
+// instance and its state are explicit globals rather than host internals.
+__celld.__debugEval = async (scope, source) => {
+  const actorEvent = __beginActorEvent(scope);
+  try {
+    const instance = await _readyInstance(scope);
+    globalThis.env = __cell.env;
+    globalThis.object = instance;
+    globalThis.state = instance.__celldState;
+    globalThis.storage = instance.__celldState.storage;
+    globalThis.cell = scope;
+    return await __ctxRun(undefined, () => (0, eval)(source));
+  } finally {
+    __endActorEvent(actorEvent);
+  }
+};
 const __dispatchTo = __celld.__dispatchTo = async (
   scope, url, method, body, headersJson, requestId = null, bodyStreamId = null,
 ) => {

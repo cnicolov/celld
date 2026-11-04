@@ -43,6 +43,7 @@ pub(crate) enum Action {
     Kv(Vec<String>),
     Queue(Vec<String>),
     R2(Vec<String>),
+    Repl(Vec<String>),
     Connect(Vec<String>),
     Credentials(Vec<String>),
     Token(Vec<String>),
@@ -81,6 +82,7 @@ pub(crate) fn action_from_process() -> anyhow::Result<Action> {
             "kv" => return Ok(Action::Kv(arguments)),
             "queue" => return Ok(Action::Queue(arguments)),
             "r2" => return Ok(Action::R2(arguments)),
+            "repl" => return Ok(Action::Repl(arguments)),
             "connect" => return Ok(Action::Connect(arguments)),
             "credentials" => return Ok(Action::Credentials(arguments)),
             "token" => return Ok(Action::Token(arguments)),
@@ -278,6 +280,7 @@ USAGE:
   celld kv get|put|delete|list|info NAMESPACE --bucket [s3://|gs://|az://]NAME[/PREFIX]
   celld queue info|peek|purge|pause|resume|redrive QUEUE --bucket [s3://|gs://|az://]NAME[/PREFIX]
   celld r2 get|head|put|delete|list BUCKET [KEY] --bucket [s3://|gs://|az://]NAME[/PREFIX]
+  celld repl [PROJECT] [--url INTERNAL_URL] [--isolate HEAP_ID | --object CLASS:NAME] [--eval CODE]
   celld diagnose --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS] [--peer NODE_ID]...
 
 Production install: celld --bucket s3://NAME [OPTIONS]
@@ -341,6 +344,9 @@ ENVIRONMENT:
                                   on the internal listener (on by default in dev)
   CELLD_METRICS                   `1` serves /metrics on the internal listener and
                                   pushes OTLP metrics when CELLD_OTEL is a collector
+  CELLD_REPL                      `1` enables arbitrary JavaScript evaluation on
+                                  the internal listener (on by default in dev)
+  CELLD_REPL_URL                  Operator URL used by celld repl when --url is absent
   CELLD_ESBUILD                   Override esbuild executable path
   CELLD_ACTIVATIONS               Concurrent cold activations
   CELLD_ASSET_CACHE_DIR           Downloaded static-asset cache directory

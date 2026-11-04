@@ -63,6 +63,16 @@ response formats. These routes do not authenticate the caller:
 - `POST /shutdown` starts a graceful ownership handoff. `handoff=preserve`
   prepares a same-node reload.
 
+`/repl` is deliberately not part of that default operator surface. It evaluates
+arbitrary JavaScript in a live Worker isolate, with that Worker's bindings and
+the ability to change its behavior. Local development enables it on the
+loopback-only dev node by default (`CELLD_REPL=0` opts out); every other node
+requires `CELLD_REPL=1`. Enabling monitoring does not enable the REPL. The REPL
+route uses the same origin and dev loopback-host checks, but those are not
+request authentication. Enable it only when every client of the internal
+listener is trusted with the Worker's full authority, and never expose it to
+the public internet.
+
 `/do/<ID>` refuses every reserved runtime class, such as D1, Workflows, KV,
 and Queues, because their protocols can access application data. Use the
 HMAC-authenticated `/runtime/<SCOPE>` route for these classes.

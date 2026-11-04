@@ -98,6 +98,7 @@ pub mod queue_cli;
 pub mod queue_policy;
 pub mod r2_cli;
 pub(crate) mod r2_store;
+pub mod repl;
 pub mod replication;
 pub mod runtime;
 pub mod startup;
@@ -273,6 +274,11 @@ pub enum WorkerJob {
         queued_at: std::time::Instant,
         batch: js::QueueBatch,
         reply: tokio::sync::oneshot::Sender<anyhow::Result<js::QueueDispatchResult>>,
+    },
+    /// Operator-supplied JavaScript evaluated in an attached isolate.
+    Eval {
+        code: String,
+        reply: tokio::sync::oneshot::Sender<anyhow::Result<repl::Evaluation>>,
     },
 }
 

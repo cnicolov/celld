@@ -198,7 +198,9 @@ impl StatelessWorkerJob {
             crate::WorkerJob::Fetch { request_id, .. } => {
                 request_id.map(RequestCancellationLifetime::from_request_id)
             }
-            crate::WorkerJob::Rpc { .. } | crate::WorkerJob::Queue { .. } => None,
+            crate::WorkerJob::Rpc { .. }
+            | crate::WorkerJob::Queue { .. }
+            | crate::WorkerJob::Eval { .. } => None,
         };
         let cancellation = RequestCancellationGuard::new(lifetime);
         Self { job, cancellation }
@@ -759,6 +761,46 @@ pub(crate) async fn receive_service_fetch_response_for_test(
 }
 
 impl RuntimeManager {
+    /// Resolve an explicitly named live isolate for an attached REPL. Default
+    /// attachment uses ordinary admission instead, because an idle pool may
+    /// have reclaimed every heap and be ready to grow a fresh one.
+    pub(crate) fn repl_slot(&self, isolate: &str) -> Option<Arc<crate::pool::Slot>> {
+        let generations = {
+            let generations = self.generations.read().expect("generation lock poisoned");
+            std::iter::once(generations.current.clone())
+                .chain(generations.draining.iter().cloned())
+                .collect::<Vec<_>>()
+        };
+        let pools = generations.iter().flat_map(|generation| {
+            std::iter::once(&generation.stateless.isolates)
+                .chain(generation.services.values().map(|worker| &worker.isolates))
+                .chain(generation.cell_isolates.values())
+        });
+        pools
+            .flat_map(|pool| pool.monitor_slots())
+            .into_iter()
+            .find(|slot| !slot.is_retiring() && slot.heap_id().to_string() == isolate)
+    }
+
+    /// Derive a named object's scope in the current main Worker's namespace.
+    pub(crate) fn repl_cell_scope(&self, class: &str, name: &str) -> String {
+        let generation = self.generation();
+        let namespace = js::namespace_key(&generation.script_name, class);
+        let id = js::durable_object_id_for_name(&namespace, name);
+        format!("{class}:{}", js::durable_object_id_hex(&id))
+    }
+
+    /// Affiliate with a resident object for a debugging session. Dormant and
+    /// remote objects are deliberately not activated by the REPL attach path.
+    pub(crate) fn repl_cell(&self, scope: &str) -> Option<crate::pool::Affiliation> {
+        self.cells
+            .lock()
+            .expect("cell registry poisoned")
+            .published
+            .get(scope)
+            .map(|handle| handle.residency.slot().affiliate())
+    }
+
     /// Capture an existing node-wide heap ID from the monitor, without placing
     /// a new isolate or activating any dormant cells.
     pub async fn heap_snapshot(
@@ -2996,6 +3038,12 @@ impl StatelessTiming {
                 "celld.fetch",
                 crate::telemetry::KIND_SERVER,
             ),
+            crate::WorkerJob::Eval { .. } => (
+                Instant::now(),
+                None,
+                "celld.repl",
+                crate::telemetry::KIND_SERVER,
+            ),
         };
         StatelessTiming {
             queued_at,
@@ -3151,6 +3199,16 @@ impl StatelessRuntime {
             node,
             region,
         })
+    }
+
+    /// Attach a REPL through the same admission path as a stateless request.
+    /// Unlike searching the monitor's live heaps, this grows a fresh isolate
+    /// when idle maintenance reclaimed the whole pool.
+    pub(crate) async fn attach_repl(
+        &self,
+    ) -> Result<crate::pool::Affiliation, crate::pool::AdmitError> {
+        let shedding = crate::ownership_store::node_is_shedding();
+        self.isolates.admit_or_wait(shedding).await
     }
 
     /// Admit and drive one stateless event. A verb supplies only its job and
@@ -3673,6 +3731,7 @@ impl Invocation {
     fn start(job: &CellJob) -> Option<Self> {
         crate::metrics::get()?;
         let (event, trigger) = match job {
+            CellJob::Eval { .. } => ("repl", "other"),
             CellJob::Fetch { .. } => ("fetch", "http"),
             CellJob::Rpc { .. } => ("rpc", "other"),
             CellJob::WsOpen { .. } => ("ws_open", "other"),
@@ -3766,6 +3825,7 @@ async fn drive_cell_inner(
     let recording = trace.and_then(crate::telemetry::TraceContext::recording_ids);
     let span_seed = recording.map(|_| {
         let name = match &job {
+            CellJob::Eval { .. } => "celld.repl",
             CellJob::Fetch { .. } => "celld.cell_fetch",
             CellJob::Alarm { .. } => "celld.alarm",
             CellJob::Rpc { .. } => "celld.rpc",

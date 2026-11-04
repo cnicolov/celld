@@ -313,6 +313,123 @@ and it does not watch files outside the project.
 The local object store is not available to a fleet node or an operator
 subcommand; they need a supported cloud bucket.
 
+## Attach a JavaScript REPL
+
+While `celld dev` is running, attach another terminal to its real main Worker
+isolate:
+
+```sh
+celld repl
+```
+
+The command discovers the operator address in `.celld/dev/operator`. Pass the
+same project directory or Wrangler config as `celld dev` when not running from
+the project root. Evaluation uses the existing V8 context and turn queue, not a
+separate Node.js process. The module's bindings and exports are available as
+`env` and `exports`:
+
+```js
+var startingCount = 40
+startingCount + 2
+// 42
+
+(async () => {
+  const value = await Promise.resolve(startingCount + 3)
+  return { value, exports: Object.keys(exports) }
+})()
+```
+
+A returned promise is awaited. Use an async IIFE as above for top-level `await`;
+ordinary script input does not itself accept `await` at the top level. `var`,
+`let`, `const`, and `globalThis` declarations remain in that isolate for the
+rest of the attach session. `console.log` and the other console levels are
+returned to the terminal. Interactive input continues on the `...` prompt
+until V8 can parse the complete buffer, so multiline functions, objects,
+arrays, and strings need no special marker. End a line with `\` to force
+continuation, use `.cancel` to discard the buffered input, and `.exit` to close
+the session. A syntax error that is not an unfinished construct is reported
+immediately.
+
+The session pins its selected isolate so idle maintenance cannot reclaim its
+state. An abandoned session expires after 30 minutes without evaluation. A dev
+restart destroys the old V8 heap, so attach again afterwards. Values written
+only to the JavaScript heap are not durable; writes through a Durable Object,
+KV, D1, R2, or another binding use that binding's normal durability path.
+Evaluation can mutate the running Worker's globals and has all of its authority.
+It is not a sandbox.
+
+Evaluate once, or evaluate a script from stdin, without entering interactive
+mode:
+
+```sh
+celld repl --eval 'Object.keys(env)'
+celld repl < debug.js
+```
+
+The default target is the current main Worker's first live stateless isolate.
+Use an `isolates[].id` from `/monitor/api` to attach to a service, cell, or other
+stateless isolate explicitly:
+
+```sh
+celld repl --isolate 2
+```
+
+### Debug a live Durable Object
+
+Use `--object CLASS:NAME` to attach to the actual Durable Object instance rather
+than to a stateless Worker heap. The class and name derive the same object ID as
+`idFromName` in the current main Worker. The object must already be resident on
+the node you attach to; attaching does not activate a dormant object or route
+to its owner. Call it once through its binding or the application first:
+
+```sh
+celld repl --object Counter:demo
+```
+
+An object session provides these additional globals:
+
+| global | value |
+| --- | --- |
+| `object` | The live class instance, with its own fields and methods |
+| `state` | That instance's `DurableObjectState` |
+| `storage` | Shorthand for `state.storage` |
+| `cell` | The resolved `Class:ID` scope |
+
+`env` and `exports` remain available. Inspect the instance, invoke its methods,
+or read and write its storage directly:
+
+```js
+Object.keys(object)
+object.constructor.name
+state.constructor.name
+(async () => await storage.get("n"))()
+(async () => Object.fromEntries(await storage.list()))()
+(async () => { await storage.put("debug", { seen: true }); return storage.get("debug") })()
+```
+
+Evaluation runs as an event of that object, with its input gate, current actor
+scope, and normal execution budget. Reads and writes use the object's actual
+SQLite storage. Returned values and errors pass through the same durability
+output gate as an ordinary Durable Object response; a write is not reported
+back as complete without that proof. Code can mutate the live instance and its
+database, so debugging is not read-only. `--object` and `--isolate` are mutually
+exclusive.
+
+Local development enables the REPL by default; `CELLD_REPL=0` disables it. A
+regular node requires `CELLD_REPL=1`, and the CLI then takes its internal
+operator address explicitly (or through `CELLD_REPL_URL`):
+
+```sh
+celld repl --url http://127.0.0.1:8081 --isolate 1
+```
+
+The `/repl` API exists only on the internal listener, is not enabled by the
+monitor switch, and has the same origin checks plus loopback-host protection in
+dev. It does not add request authentication. Anyone who can evaluate code has
+the Worker's bindings and can change its behavior, so enable it only on a
+loopback or trusted private operator listener. Fleet routing for REPL sessions
+is not implemented; attach to the node that owns the target isolate.
+
 ## Operate D1, KV, and R2
 
 These commands use the fleet bucket. `celld d1` and `celld kv` reach the
@@ -685,6 +802,8 @@ unset variable selects its default. A Boolean variable accepts only `0` or
 | `CELLD_TOKIO_THREADS` | Host Tokio worker threads (default: the CPU count). The `host_runtime` log event at startup reports `worker_count` |
 | `CELLD_METRICS` | `1` serves operational [metrics](metrics.md) at `/metrics` on the internal listener, and pushes them to the `CELLD_OTEL` collector when it is a URL (default: `0`) |
 | `OTEL_METRIC_EXPORT_INTERVAL` | Milliseconds between OTLP metric pushes (default: 60000) |
+| `CELLD_REPL` | `1` enables the [JavaScript REPL](#attach-a-javascript-repl) on the internal listener (default: `1` in `celld dev`, `0` elsewhere) |
+| `CELLD_REPL_URL` | The internal operator URL for `celld repl` when `--url` is absent |
 | `RUST_LOG` | The runtime log filter |
 
 An L1 compaction merges at most 256 source objects within a 64 MiB buffer.

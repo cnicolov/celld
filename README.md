@@ -151,6 +151,24 @@ if a build fails, and a successful restart retains the durable state. See
 the [documentation](docs/README.md#develop-an-application-locally) for
 the complete local-development contract.
 
+While that dev node is running, `celld repl` attaches to its real Worker isolate
+and evaluates JavaScript with the live `env` bindings and module `exports`.
+Globals persist for the session, and returned promises are awaited:
+
+```sh
+celld repl
+celld repl --eval '(async () => ({ keys: Object.keys(env) }))()'
+# Interactive input may span lines; V8 decides when it is complete.
+```
+
+Use `--isolate HEAP_ID` to select another resident isolate from the monitor
+API, or `--object Counter:demo` to debug a live Durable Object's actual instance
+and `state.storage`. Local dev enables this operator capability by default; `CELLD_REPL=0`
+disables it. Other nodes require `CELLD_REPL=1` and an explicit `--url` for the
+internal listener. Evaluation has the Worker's full authority, so use it only
+on a trusted operator listener. See the
+[REPL documentation](docs/README.md#attach-a-javascript-repl).
+
 celld uses the standard AWS credential chain. On Amazon EKS, celld reads the
 Pod Identity credentials from the injected environment variables and the
 authorization-token file. Deploy to an S3-compatible bucket, then start celld

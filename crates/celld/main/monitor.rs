@@ -283,7 +283,7 @@ fn allowed_origin(headers: &HeaderMap, path: &str) -> bool {
                 .is_some_and(|dest| dest == "document"))
 }
 
-fn same_origin(headers: &HeaderMap) -> bool {
+pub(super) fn same_origin(headers: &HeaderMap) -> bool {
     if headers
         .get("sec-fetch-site")
         .is_some_and(|value| !matches!(value.to_str(), Ok("same-origin" | "none")))
@@ -326,7 +326,7 @@ fn same_origin(headers: &HeaderMap) -> bool {
         && host.fragment().is_none()
 }
 
-fn local_host(headers: &HeaderMap) -> bool {
+pub(super) fn local_host(headers: &HeaderMap) -> bool {
     let Some(host) = headers
         .get(hyper::header::HOST)
         .and_then(|host| host.to_str().ok())

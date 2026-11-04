@@ -588,6 +588,12 @@ pub enum AlarmDispatch {
 /// is a direct call on the isolate, because it is not an event and has no
 /// handler to run.
 pub enum CellJob {
+    /// Evaluate operator code against one live Durable Object instance.
+    Eval {
+        scope: String,
+        code: String,
+        reply: tokio::sync::oneshot::Sender<Result<crate::repl::Evaluation>>,
+    },
     Fetch {
         request_id: Option<RequestId>,
         scope: String,
@@ -668,7 +674,8 @@ impl CellJob {
     /// The cell this event addresses, which is also the realm it runs in.
     pub fn scope(&self) -> &str {
         match self {
-            CellJob::Fetch { scope, .. }
+            CellJob::Eval { scope, .. }
+            | CellJob::Fetch { scope, .. }
             | CellJob::Rpc { scope, .. }
             | CellJob::WsOpen { scope, .. }
             | CellJob::WsMessage { scope, .. }
@@ -708,6 +715,7 @@ impl CellJob {
     /// Fail this event without running it.
     pub fn fail(self, error: anyhow::Error) {
         match self {
+            CellJob::Eval { reply, .. } => drop(reply.send(Err(error))),
             CellJob::Fetch { reply, .. } => drop(reply.send(Err(error))),
             CellJob::Rpc { reply, .. } => drop(reply.send(Err(error))),
             CellJob::WsOpen { reply, .. } => drop(reply.send(Err(error))),
@@ -2250,6 +2258,7 @@ pub struct WorkerIsolate {
 struct Realm {
     context: v8::Global<v8::Context>,
     fetch: v8::Global<v8::Function>,
+    namespace: v8::Global<v8::Object>,
 }
 
 impl WorkerIsolate {
@@ -2347,6 +2356,7 @@ impl WorkerIsolate {
         Entered {
             context: v8::Local::new(hs, &self.realm.context),
             fetch: v8::Local::new(hs, &self.realm.fetch),
+            namespace: v8::Local::new(hs, &self.realm.namespace),
         }
     }
 }
@@ -2356,6 +2366,7 @@ impl WorkerIsolate {
 struct Entered<'s> {
     context: v8::Local<'s, v8::Context>,
     fetch: v8::Local<'s, v8::Function>,
+    namespace: v8::Local<'s, v8::Object>,
 }
 
 impl std::ops::Deref for Worker {
@@ -2960,6 +2971,7 @@ pub enum Answer {
     Fetch(tokio::sync::oneshot::Sender<Result<HttpResponse>>),
     Rpc(tokio::sync::oneshot::Sender<Result<Vec<u8>>>),
     Queue(tokio::sync::oneshot::Sender<Result<QueueDispatchResult>>),
+    Eval(tokio::sync::oneshot::Sender<Result<crate::repl::Evaluation>>),
     /// A DO method call, which answers a value rather than a response.
     CellRpc(tokio::sync::oneshot::Sender<Result<RpcOutcome>>),
     /// A `webSocketMessage`, which answers the frames the output gate held
@@ -3077,6 +3089,7 @@ impl Answer {
             Answer::Fetch(reply) => send_answer_after_arm_gates(reply, Err(error), gates),
             Answer::Rpc(reply) => send_answer_after_arm_gates(reply, Err(error), gates),
             Answer::Queue(reply) => send_answer_after_arm_gates(reply, Err(error), gates),
+            Answer::Eval(reply) => send_answer_after_arm_gates(reply, Err(error), gates),
             Answer::CellRpc(reply) => send_answer_after_arm_gates(reply, Err(error), gates),
             Answer::WsMessage(reply) => send_answer_after_arm_gates(reply, Err(error), gates),
             Answer::Ack(reply) => send_answer_after_arm_gates(reply, Err(error), gates),
@@ -3440,6 +3453,28 @@ impl InFlight {
                         ));
                     }
                 }
+                send_and_end(tc, &self.context, reply, read)
+            }
+            Answer::Eval(reply) => {
+                let read = self.gate_positions().and_then(|positions| {
+                    let (write_position, observed_position) = positions;
+                    format_eval_value(tc, value)
+                        .map(|value| crate::repl::Evaluation {
+                            value,
+                            logs: self
+                                .context
+                                .take_tail_logs()
+                                .into_iter()
+                                .map(|log| crate::repl::ConsoleLog {
+                                    level: log.level,
+                                    message: log.message.join(" "),
+                                })
+                                .collect(),
+                            write_position,
+                            observed_position,
+                        })
+                        .map_err(|error| fail_in_turn_error(error, positions))
+                });
                 send_and_end(tc, &self.context, reply, read)
             }
             Answer::CellRpc(reply) => {
@@ -4359,7 +4394,7 @@ impl Worker {
             | crate::WorkerJob::Rpc {
                 invocation_limits, ..
             } => *invocation_limits,
-            crate::WorkerJob::Queue { .. } => None,
+            crate::WorkerJob::Queue { .. } | crate::WorkerJob::Eval { .. } => None,
         };
         let initial_limits =
             effective_resource_limits(inner.runtime_state.resource_limits, invocation_limits);
@@ -4368,7 +4403,7 @@ impl Worker {
             declared_ms.map(|milliseconds| Duration::from_millis(u64::from(milliseconds))),
             declared_ms,
         );
-        let begun = begin(tc, realm.fetch, job);
+        let begun = begin(tc, realm.fetch, realm.namespace, job);
         drop(cpu_watchdog);
         let out = match begun {
             Begun::Running(mut entry) => {
@@ -4384,10 +4419,11 @@ impl Worker {
                     answer,
                     cpu_error,
                     tail_report,
+                    description,
                 } = *failure;
                 let error = take_execution_termination(tc)
                     .or_else(|| cpu_error.map(anyhow::Error::msg))
-                    .unwrap_or_else(|| anyhow!("fetch threw: {}", exc!(tc)));
+                    .unwrap_or_else(|| anyhow!("{description}: {}", exc!(tc)));
                 if let Some((mut report, context)) = tail_report {
                     report.record_failure(format!("{error:#}"));
                     report.finish(&context);
@@ -4673,6 +4709,7 @@ struct BegunFailure {
     answer: Answer,
     cpu_error: Option<String>,
     tail_report: Option<(TailReportState, Arc<IoContext>)>,
+    description: &'static str,
 }
 
 /// Start a request: build it, call the Worker's `fetch`, and hand back what
@@ -4682,9 +4719,13 @@ struct BegunFailure {
 fn begin<'s>(
     tc: &mut v8::PinScope<'s, '_>,
     fetch: v8::Local<'s, v8::Function>,
+    namespace: v8::Local<'s, v8::Object>,
     job: crate::WorkerJob,
 ) -> Begun {
     let job = match job {
+        crate::WorkerJob::Eval { code, reply } => {
+            return begin_eval(tc, namespace, code, reply);
+        }
         crate::WorkerJob::Rpc {
             entrypoint,
             operation,
@@ -4768,6 +4809,7 @@ fn begin<'s>(
                 answer: Answer::Fetch(reply),
                 cpu_error,
                 tail_report: tail_report.take().map(|report| (report, context)),
+                description: "fetch threw",
             }));
         }
         Err(error) => Err(error),
@@ -5085,6 +5127,215 @@ fn queue_batch_value<'s>(
     Ok(value.into())
 }
 
+/// Whether a syntax error means more input could finish the construct, rather
+/// than that the input is already invalid. V8 reports unterminated strings
+/// and block comments with the same message as an invalid token, so those
+/// need the source check below as well.
+fn repl_input_continues(message: &str, code: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    if message.contains("unexpected end of input")
+        || message.contains("unterminated")
+        || message.contains("invalid regular expression: missing /")
+    {
+        return true;
+    }
+    message.contains("invalid or unexpected token") && repl_unclosed_literal(code)
+}
+
+/// Whether source ends inside a string, template literal, or block comment.
+/// Only called after V8 rejected the source, so this need not parse regular
+/// expressions or every nested template substitution.
+fn repl_unclosed_literal(code: &str) -> bool {
+    #[derive(Clone, Copy, PartialEq)]
+    enum State {
+        Code,
+        Single,
+        Double,
+        Template,
+        LineComment,
+        BlockComment,
+    }
+    let mut state = State::Code;
+    let mut bytes = code.bytes();
+    while let Some(byte) = bytes.next() {
+        match state {
+            State::Code => match byte {
+                b'\'' => state = State::Single,
+                b'"' => state = State::Double,
+                b'`' => state = State::Template,
+                b'/' => match bytes.next() {
+                    Some(b'/') => state = State::LineComment,
+                    Some(b'*') => state = State::BlockComment,
+                    _ => {}
+                },
+                _ => {}
+            },
+            State::Single | State::Double | State::Template => {
+                let quote = match state {
+                    State::Single => b'\'',
+                    State::Double => b'"',
+                    _ => b'`',
+                };
+                match byte {
+                    b'\\' => {
+                        bytes.next();
+                    }
+                    b'\n' if state != State::Template => {
+                        // A raw newline cannot be repaired by another line.
+                        return false;
+                    }
+                    byte if byte == quote => state = State::Code,
+                    _ => {}
+                }
+            }
+            State::LineComment => {
+                if byte == b'\n' {
+                    state = State::Code;
+                }
+            }
+            State::BlockComment => {
+                if byte == b'*' && bytes.next() == Some(b'/') {
+                    state = State::Code;
+                }
+            }
+        }
+    }
+    !matches!(state, State::Code | State::LineComment)
+}
+
+impl Worker {
+    /// Compile, but never run, one REPL input in this Worker's realm. `true`
+    /// means it parses, `false` means V8 expects more input; a different
+    /// syntax error also returns `true`, so the evaluator can report it now.
+    /// Takes the isolate lock, so the caller must hold this worker's permit.
+    pub(crate) fn repl_input_complete(&self, code: &str) -> Option<bool> {
+        let inner = self.inner.as_ref()?;
+        let (mut locker, _cells) = inner.lock();
+        v8::scope!(let hs, &mut *locker);
+        let realm = inner.realm(hs);
+        let cs = &mut v8::ContextScope::new(hs, realm.context);
+        let tc = std::pin::pin!(v8::TryCatch::new(cs));
+        let tc = &mut tc.init();
+        let source = v8::String::new(tc, code)?;
+        match v8::Script::compile(tc, source, None) {
+            Some(_) => Some(true),
+            None => {
+                let message = tc
+                    .exception()
+                    .map(|exception| exception.to_rust_string_lossy(tc))
+                    .unwrap_or_default();
+                Some(!repl_input_continues(&message, code))
+            }
+        }
+    }
+}
+
+/// Start one operator evaluation in the Worker's existing realm. Script-level
+/// declarations stay in that realm for the next evaluation, while a returned
+/// promise uses the same asynchronous driver as a request.
+fn begin_eval(
+    tc: &mut v8::PinScope,
+    namespace: v8::Local<v8::Object>,
+    code: String,
+    reply: tokio::sync::oneshot::Sender<Result<crate::repl::Evaluation>>,
+) -> Begun {
+    let context = IoContext::with_options(actor_runtime_state(tc).resource_limits, true);
+    let guard = CurrentGuard::enter(context.clone());
+    context.begin_cpu_turn();
+    let started = (|| {
+        let env = harness_env(tc)?;
+        let global = tc.get_current_context().global(tc);
+        let env_key = v8::String::new(tc, "env").unwrap();
+        let exports_key = v8::String::new(tc, "exports").unwrap();
+        anyhow::ensure!(
+            global.create_data_property(tc, env_key.into(), env) == Some(true)
+                && global.create_data_property(tc, exports_key.into(), namespace.into())
+                    == Some(true),
+            "could not install REPL globals"
+        );
+        begin_event_context(tc)?;
+        let code =
+            v8::String::new(tc, &code).ok_or_else(|| anyhow!("REPL input is too large for V8"))?;
+        let script = v8::Script::compile(tc, code, None)
+            .ok_or_else(|| anyhow!("REPL input did not compile"))?;
+        let ret = script
+            .run(tc)
+            .ok_or_else(|| anyhow!("evaluation did not return a value"))?;
+        match ret.try_cast::<v8::Promise>() {
+            Ok(promise) => Ok(promise),
+            Err(_) => resolved_promise(tc, ret),
+        }
+    })();
+    match started {
+        Ok(promise) => {
+            tc.perform_microtask_checkpoint();
+            let entry = InFlight {
+                runtime_state: actor_runtime_state(tc),
+                promise: v8::Global::new(tc, promise),
+                context,
+                scope: None,
+                writes_before: None,
+                request_id: None,
+                active_request_id: None,
+                reply: Some(Answer::Eval(reply)),
+                gated_reply: None,
+                background: None,
+                completed_cell_event: false,
+                cell_release_observed: false,
+                ops: std::collections::HashSet::new(),
+                io_context_ops: std::collections::HashSet::new(),
+                unrefed_ops: std::collections::HashSet::new(),
+                alarm: None,
+                started: Instant::now(),
+                trace: None,
+                failure: None,
+                failed: None,
+                tail_report: None,
+            };
+            drop(guard);
+            Begun::Running(Box::new(entry))
+        }
+        Err(_error) => {
+            let _ = end_event_context(tc);
+            let cpu_error = context.finish_cpu_turn().err();
+            drop(guard);
+            Begun::Threw(Box::new(BegunFailure {
+                answer: Answer::Eval(reply),
+                cpu_error,
+                tail_report: None,
+                description: "evaluation threw",
+            }))
+        }
+    }
+}
+
+/// A compact, deterministic display for the common REPL values. JSON handles
+/// structured data; bigint, functions, symbols, errors and circular objects
+/// still produce useful text instead of failing the evaluation after it ran.
+fn format_eval_value(tc: &mut v8::PinScope, value: v8::Local<v8::Value>) -> Result<String> {
+    const FORMAT: &str = r#"(value) => {
+        if (value === undefined) return "undefined";
+        if (typeof value === "string") return JSON.stringify(value);
+        if (typeof value === "bigint") return `${value}n`;
+        if (typeof value === "function" || typeof value === "symbol") return value.toString();
+        if (value instanceof Error && value.stack) return value.stack;
+        try {
+            const json = JSON.stringify(value, (_key, nested) => {
+                if (typeof nested === "bigint") return `${nested}n`;
+                return nested;
+            }, 2);
+            if (json !== undefined) return json;
+        } catch {}
+        return String(value);
+    }"#;
+    let formatter = compile_fn(tc, FORMAT)?;
+    let recv = v8::undefined(tc).into();
+    let formatted = formatter
+        .call(tc, recv, &[value])
+        .ok_or_else(|| anyhow!("could not format the REPL result"))?;
+    Ok(formatted.to_rust_string_lossy(tc))
+}
+
 /// Start a queue consumer's first turn. The batch body bytes move directly
 /// into V8, and only the small settlement record crosses back out.
 fn begin_queue(
@@ -5255,7 +5506,11 @@ fn start_cell_event<'s>(
     call: impl FnOnce(&mut v8::PinScope<'s, '_>) -> Result<v8::Local<'s, v8::Value>>,
 ) -> Begun {
     let runtime_state = actor_runtime_state(tc);
-    let context = IoContext::tracked(&runtime_state);
+    let context = if matches!(&answer, Answer::Eval(_)) {
+        IoContext::tracked_with_options(&runtime_state, true)
+    } else {
+        IoContext::tracked(&runtime_state)
+    };
     if let Some(stream_id) = body_stream_id {
         context.own_body_stream(stream_id);
     }
@@ -5410,8 +5665,32 @@ fn facet_socket_refusal(scope: &str, facet_opening: Option<u64>) -> Option<anyho
 /// serviced other cells' events inside *that* — each is now an entry a tokio
 /// task drives, so two events of one cell interleave by suspending rather
 /// than by nesting.
-fn begin_cell(tc: &mut v8::PinScope, job: CellJob, event_time: i64) -> Begun {
+fn begin_cell(
+    tc: &mut v8::PinScope,
+    namespace: v8::Local<v8::Object>,
+    job: CellJob,
+    event_time: i64,
+) -> Begun {
     match job {
+        CellJob::Eval { scope, code, reply } => {
+            start_cell_event(tc, &scope, Answer::Eval(reply), None, None, false, |tc| {
+                let global = tc.get_current_context().global(tc);
+                let exports_key = v8::String::new(tc, "exports").unwrap();
+                anyhow::ensure!(
+                    global.create_data_property(tc, exports_key.into(), namespace.into())
+                        == Some(true),
+                    "could not install REPL exports"
+                );
+                let function = internal_function(tc, "__debugEval")?;
+                let scope = v8::String::new(tc, &scope).unwrap();
+                let code = v8::String::new(tc, &code)
+                    .ok_or_else(|| anyhow!("REPL input is too large for V8"))?;
+                let recv = v8::undefined(tc).into();
+                function
+                    .call(tc, recv, &[scope.into(), code.into()])
+                    .ok_or_else(|| anyhow!("object evaluation did not return a value"))
+            })
+        }
         CellJob::Fetch {
             request_id,
             scope,
@@ -6026,7 +6305,7 @@ impl Worker {
             tree: OnceLock::new(),
         }));
         isolate.add_near_heap_limit_callback(near_heap_limit, heap_limit_state_ptr);
-        let (context, fetch) = {
+        let (context, fetch, namespace) = {
             v8::scope!(let hs, &mut isolate);
             let context = v8::Context::new(hs, Default::default());
             let cs = &mut v8::ContextScope::new(hs, context);
@@ -6251,7 +6530,11 @@ impl Worker {
                     }
                 }
             }
-            (v8::Global::new(scope, context), v8::Global::new(scope, f))
+            (
+                v8::Global::new(scope, context),
+                v8::Global::new(scope, f),
+                v8::Global::new(scope, ns),
+            )
         };
         // Module evaluation and harness installation allocate temporary V8
         // objects. No request can reuse them after these scopes close, and a
@@ -6289,7 +6572,11 @@ impl Worker {
                 isolate: unsafe { isolate.try_into_shared() }
                     .unwrap_or_else(|error| panic!("cell isolate cannot be shared: {error}")),
                 runtime_state,
-                realm: Realm { context, fetch },
+                realm: Realm {
+                    context,
+                    fetch,
+                    namespace,
+                },
                 original_heap_limit,
                 compat,
                 loader_owner,
@@ -6476,7 +6763,7 @@ impl Worker {
                 .resource_limits
                 .and_then(|limits| limits.cpu_ms),
         );
-        let begun = begin_cell(tc, job, event_time);
+        let begun = begin_cell(tc, realm.namespace, job, event_time);
         drop(cpu_watchdog);
         let out = match begun {
             Begun::Running(mut entry) => {
@@ -11524,6 +11811,13 @@ impl IoContext {
     }
 
     fn tracked(runtime_state: &Arc<ActorRuntimeState>) -> Arc<Self> {
+        Self::tracked_with_options(runtime_state, false)
+    }
+
+    fn tracked_with_options(
+        runtime_state: &Arc<ActorRuntimeState>,
+        tail_reporting: bool,
+    ) -> Arc<Self> {
         let id = allocate_io_context_id();
         let context = Arc::new(Self {
             continuation: Some((id, Arc::downgrade(runtime_state))),
@@ -11555,9 +11849,9 @@ impl IoContext {
             cpu_used_nanos: AtomicU64::new(0),
             cpu_turn: Mutex::new(None),
             // Tracked contexts drive cell and RPC events. Dynamic Worker tail
-            // reports currently belong only to fetch jobs, whose untracked
-            // context is constructed from the report sender in `begin`.
-            tail_reporting: false,
+            // reports belong to fetch jobs; REPL cell events opt in to capture
+            // the operator's console output instead.
+            tail_reporting,
             tail_logs: Mutex::new(TailLogCapture::default()),
         });
         runtime_state

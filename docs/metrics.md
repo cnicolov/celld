@@ -90,7 +90,8 @@ isolates are not listed.
 | `http.server.request.duration` | histogram | s | `http.request.method`, `http.response.status_code`, `error.type` | A stateless Worker request, to its response headers. |
 
 `faas.trigger` is `http` for a fetch, `timer` for an alarm (cron included),
-`pubsub` for a queue batch, and `other` for RPC and WebSocket events.
+`pubsub` for a queue batch, and `other` for RPC, WebSocket, and operator REPL
+events (`celld.cell.event=repl`).
 `error.type` is `exception`, `timeout`, `stuck`, `storage`, `overloaded`,
 `gate_failed`, `cell_stopped`, or `_OTHER`. The invocation count is the
 histogram's count, so an error rate is `faas.errors` over it.

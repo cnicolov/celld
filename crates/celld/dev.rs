@@ -637,7 +637,9 @@ async fn run_stack(
     loop {
         match wait_for_node_event(&mut running.child, &mut signals, watcher.as_mut()).await? {
             NodeEvent::Exited(status) => {
-                let _ = running.output.await;
+                if let Some(output) = running.output.take() {
+                    let _ = output.await;
+                }
                 if status.success() {
                     return Ok(());
                 }
@@ -672,7 +674,17 @@ async fn run_stack(
 struct RunningNode {
     child: Child,
     internal: String,
-    output: tokio::task::JoinHandle<()>,
+    output: Option<tokio::task::JoinHandle<()>>,
+    operator_file: PathBuf,
+}
+
+impl Drop for RunningNode {
+    #[allow(clippy::disallowed_methods)] // Remove only this operator's dev metadata file.
+    fn drop(&mut self) {
+        // This file is only a pointer to the live child. Never leave a stopped
+        // node looking attachable to a later `celld repl` invocation.
+        let _ = std::fs::remove_file(&self.operator_file);
+    }
 }
 
 enum NodeEvent {
@@ -691,6 +703,8 @@ async fn start_node(
     console: &Console,
 ) -> anyhow::Result<RunningNode> {
     let executable = std::env::current_exe().context("locate the celld executable")?;
+    let operator_file = state.join("operator");
+    let _ = std::fs::remove_file(&operator_file);
     let listen = listener.to_string();
     let mut command = Command::new(executable);
     // The supervisor owns the child's complete storage and listener topology.
@@ -815,6 +829,8 @@ async fn start_node(
         let _ = output.await;
         return Err(error);
     }
+    std::fs::write(&operator_file, format!("{internal}\n"))
+        .with_context(|| format!("write REPL operator metadata {}", operator_file.display()))?;
     console.ready(&format!("http://{listener}"));
     if crate::env_vars::flag("CELLD_MONITOR", true)? {
         console.detail("monitor", &format!("{internal}/monitor/"));
@@ -822,7 +838,8 @@ async fn start_node(
     Ok(RunningNode {
         child,
         internal,
-        output,
+        output: Some(output),
+        operator_file,
     })
 }
 
@@ -891,7 +908,9 @@ async fn wait_for_project_change(watcher: Option<&mut ProjectWatcher>) -> anyhow
 
 async fn stop_running_node(mut running: RunningNode) {
     stop_child(&mut running.child, Some(&running.internal)).await;
-    let _ = running.output.await;
+    if let Some(output) = running.output.take() {
+        let _ = output.await;
+    }
 }
 
 #[allow(clippy::disallowed_methods)] // Shutdown deadlines govern a real child process.
