@@ -667,10 +667,10 @@ release, so keep operator tooling and celld releases together.
   cell whose ownership record was lost and start the cell with an empty
   database. A rollback to v0.6.2 can also roll.
 - **This fork's binary-only v0.6.3 release** did not contain those upstream
-  v0.6.3 changes. Upgrading from it is rolling with the same caveat: until
-  every node runs a release with them, a node without them can still acquire
-  a cell whose ownership record was lost, including through named cell
-  creation with a placement pool.
+  v0.6.3 changes. Upgrading from it to v0.6.4 is rolling with the same caveat:
+  until every node runs v0.6.4, an older node can still acquire a cell whose
+  ownership record was lost, including through named cell creation with a
+  placement pool.
 
 ## Diagnose a fleet
 

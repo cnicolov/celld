@@ -1,6 +1,6 @@
 # Limitations
 
-celld v0.6.3 is a beta release with these operational limits. See
+celld v0.6.4 is a beta release with these operational limits. See
 [Cloudflare compatibility](cloudflare-compat.md) for the supported services,
 APIs, and Wrangler configuration.
 
