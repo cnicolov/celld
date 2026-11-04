@@ -70,6 +70,13 @@ celld reserves `probe/`, `cells/`, `nodes/`, `node-cells/`, `fleet/`, `deploy/`,
 `deploy-blobs/`, `log/`, `wake/`, and `telemetry/`, and deletes objects under
 some of them. An application must not write under any of them.
 
+An operator must not delete, expire, or overwrite an object under these
+prefixes, except under `probe/` and `telemetry/`. celld reads these objects to
+fence and restore cells, and celld deletes the objects that it no longer needs.
+A bucket lifecycle rule therefore must not select an object under another
+reserved prefix. With a key prefix, each reserved prefix follows the key prefix,
+for example `PREFIX/telemetry/`.
+
 ## The supervisor
 
 Run celld under a supervisor that restarts the process, such as systemd, Docker
@@ -87,6 +94,47 @@ session and carries a fencing epoch. A node acquires a cell with a conditional
 create when no record exists, or a compare-and-swap on an existing record, so
 two nodes cannot acquire the same cell. Every activation, a takeover or a local
 wake, advances the epoch, so an epoch never has two writers.
+
+The record is `cells/<cell>/own.json`. celld never deletes it, and it must stay
+in the bucket for the life of the cell. A missing record next to LTX under
+`cells/<cell>/ltx/` means that the record was lost, for example to a lifecycle
+rule. celld then refuses to acquire the cell, because a new record at epoch 1
+would start it with an empty database. Each request that must read the record,
+to acquire the cell or to find its owner, fails, and the node writes
+`celld ownership record lost` to stderr. The node then refuses the cell for 10
+seconds without a bucket request, so it writes the line at most once in that
+interval. A node that still serves the cell keeps serving it and keeps writing
+LTX until it stops. That node cannot acknowledge a write that a bucket proof
+covers, because the record no longer names it, so the write fails and the node
+writes `celld output gate` to stderr. With `CELLD_DURABILITY=bucket`, every
+write takes a bucket proof. celld detects the loss only from LTX under
+`cells/<cell>/ltx/`. A new cell can keep its first writes in a node bundle under
+`log/` until the tiering path drains them, so a loss before that drain starts
+the cell empty.
+
+To restore the cell, first stop each node that served the cell with SIGTERM, not
+with `POST /shutdown?handoff=preserve`. A preserved restart resumes its cells
+without a read of the record, so the node keeps serving the cell. No peer can
+acquire the cell, so its handoff cannot complete: the stop can take the whole
+`CELLD_SHUTDOWN_TOTAL_MS` and log `shutdown_handoff_stalled`.
+
+A stopped process can still hold acknowledged writes in its node log, outside
+the per-cell prefixes, so wait until that log is recovered. A new process with
+the same `CELLD_NODE` recovers it during startup, so the log is recovered when
+that process reports healthy. Without the same `CELLD_NODE`, a running node
+with `CELLD_DURABILITY=fleet`, the default, recovers it after the lease of the
+stopped process expires. In that case, wait until `nodes/<node>.json` of the
+stopped process is absent, has no `log` object, or shows `"state": "sealed"` in
+it. A stop that logs `node-log close: sealed epoch` has already sealed its log.
+
+Then write a released record, which names no node, at the newest epoch: the
+numerically highest `e<epoch>` prefix under `cells/<cell>/ltx/`. For a newest
+epoch of 7, the record is `{"node": "", "epoch": 7}`. After the refusal interval
+ends, the next request acquires the cell at the next epoch and restores it from
+the bucket. A released record skips the recovery of the node log of the
+previous owner. A record that is written before these logs are recovered can
+therefore lose acknowledged writes, and a node that still serves the cell
+becomes a second writer.
 
 ### The epoch prefix
 

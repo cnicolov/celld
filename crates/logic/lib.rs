@@ -82,7 +82,11 @@ enum WhenFull {
 pub struct RestoreSpec {
     pub epoch: Epoch,
     /// This activation conditionally created epoch one, so no replica can
-    /// precede it.
+    /// precede it. The bucket shell reports a missing record only when no LTX
+    /// exists under `cells/<cell>/ltx/`. A record deleted outside celld
+    /// therefore produces a fresh activation only when that prefix holds no
+    /// LTX of the cell: before the first drain of a node bundle, or after the
+    /// LTX was deleted as well.
     pub fresh: bool,
     /// Ownership was seized from a different node (or a released record), so
     /// a previous local eviction cache is not authoritative.

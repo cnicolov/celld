@@ -413,6 +413,15 @@ impl std::fmt::Display for LeaseCasError {
     }
 }
 
+/// How long a node refuses a cell whose record it found lost before it reads
+/// the bucket again. A due alarm of a dormant cell retries its wake every
+/// 100 ms, and a draining donor retries a handoff every 250 ms, so without a
+/// hold a lost record costs two GETs and a LIST, and one stderr line, per
+/// retry until an operator repairs it. The hold stays below the default 25 s
+/// no-progress window of a shutdown handoff and the default 60 s wake scan,
+/// so a repair takes effect well within either.
+pub(crate) const LOST_RECORD_RECHECK_MS: u64 = 10_000;
+
 /// The production-compatible conditional object store used by ownership
 /// effects. A failed write is reported to the core as ambiguous unless the
 /// store definitively returned HTTP 412, or the attempt provably wrote no
@@ -448,6 +457,9 @@ pub struct BucketOwnership {
     /// (one publish outstanding at a time), >= S implies the applied body
     /// IS the waiter's object.
     applied: tokio::sync::watch::Sender<(String, u64)>,
+    /// Each cell whose record this node found lost, with the monotonic time
+    /// at which its hold ends. See [`LOST_RECORD_RECHECK_MS`].
+    lost_records: std::sync::Mutex<std::collections::BTreeMap<String, u64>>,
 }
 
 /// What this node currently looks like, for peers deciding where to place a
@@ -547,6 +559,7 @@ impl BucketOwnership {
             ambient_load_override: None,
             own_log: std::sync::Mutex::new((0, None)),
             applied: tokio::sync::watch::channel((String::new(), 0)).0,
+            lost_records: std::sync::Mutex::default(),
         }
     }
 
@@ -629,13 +642,37 @@ impl BucketOwnership {
     /// Reserve immutable placement before any owner can activate the cell.
     /// Epoch zero has no writer authority or database; the first claim advances
     /// it to epoch one. A raced registration can only agree, never rewrite it.
+    ///
+    /// A missing record with LTX in the bucket is a lost record, not a new
+    /// cell. Writing epoch zero over it would let the next claim open epoch
+    /// one as a fresh, empty cell, which is the loss
+    /// `Ownership::read_owner_for_claim` refuses, so creation refuses it too.
     pub async fn create_cell(&self, cell: &str, pool: Pool) -> anyhow::Result<()> {
         anyhow::ensure!(
             celld_logic::cell::valid_cell_scope(cell),
             "invalid cell scope"
         );
         for _ in 0..2 {
-            if let Some(owner) = self.read_owner(cell).await? {
+            let owner = match self.read_owner(cell).await? {
+                Some(owner) => Some(owner),
+                // As in the claim path, only a read after the listing that
+                // still finds no record proves the loss: a first claim on
+                // another node can write it between the two reads.
+                None if self.ltx_exists(cell).await? => match self.read_owner(cell).await? {
+                    Some(owner) => Some(owner),
+                    None => {
+                        self.hold_lost_record(cell, crate::asyncrt::mono_ms());
+                        anyhow::bail!(
+                            "celld ownership record lost: cells/{cell}/own.json is missing, but \
+                             the bucket holds LTX under cells/{cell}/ltx/; refusing to create \
+                             {cell} as a new cell. See the ownership record repair in \
+                             docs/guarantees.md."
+                        );
+                    }
+                },
+                None => None,
+            };
+            if let Some(owner) = owner {
                 anyhow::ensure!(
                     owner.placement_pool == pool,
                     "cell placement is immutable: existing pool {}, requested {}",
@@ -659,6 +696,40 @@ impl BucketOwnership {
             }
         }
         anyhow::bail!("cell placement registration raced; retry creation")
+    }
+
+    /// Whether the bucket holds any LTX for `cell`. LTX exists only under an
+    /// epoch that a claim opened, and the claim writes the ownership record
+    /// first, so LTX proves that a record existed before the listing.
+    pub async fn ltx_exists(&self, cell: &str) -> anyhow::Result<bool> {
+        self.bucket.list_any(&format!("cells/{cell}/ltx")).await
+    }
+
+    /// Whether this node found the record of `cell` lost less than
+    /// [`LOST_RECORD_RECHECK_MS`] ago. An ended hold is dropped, so the
+    /// caller reads the bucket again.
+    pub(crate) fn lost_record_held(&self, cell: &str, now_mono_ms: u64) -> bool {
+        let mut lost = self.lost_records.lock().unwrap();
+        match lost.get(cell) {
+            Some(until) if now_mono_ms < *until => true,
+            Some(_) => {
+                lost.remove(cell);
+                false
+            }
+            None => false,
+        }
+    }
+
+    /// Hold a confirmed loss of the record of `cell`. Ended holds are dropped
+    /// here as well, so the map keeps only the cells refused within the last
+    /// hold interval.
+    pub(crate) fn hold_lost_record(&self, cell: &str, now_mono_ms: u64) {
+        let mut lost = self.lost_records.lock().unwrap();
+        lost.retain(|_, until| now_mono_ms < *until);
+        lost.insert(
+            cell.to_string(),
+            now_mono_ms.saturating_add(LOST_RECORD_RECHECK_MS),
+        );
     }
 
     pub async fn read_node_lease(&self, owner: &str) -> anyhow::Result<Option<NodeLeaseRecord>> {

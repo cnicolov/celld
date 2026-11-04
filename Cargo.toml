@@ -124,7 +124,15 @@ regex = "1"
 reqwest = { version = "0.12", default-features = false }
 rsa = { version = "0.9", features = ["sha2"] }
 rusqlite = "0.31"
-rustls = { version = "0.23", default-features = false, features = ["ring"] }
+# 0.23.45 fixes GHSA-2mjx-qc3c-rqvc, where rustls accepts a TLS 1.3
+# handshake message across an encryption level boundary.
+rustls = { version = "0.23.46", default-features = false, features = ["ring"] }
+# celld never imports rustls-webpki; this entry only sets a floor. 0.103.16
+# rejects every chain through the eight eMudhra intermediate CA certificates
+# whose private keys are public, and rustls itself accepts 0.103.14. Without
+# the floor, a resolver can select a version that still trusts those chains
+# on a host whose own trust store still holds the emSign ECC root.
+rustls-webpki = { version = "0.103.16", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
 sha1 = "0.10"
@@ -156,4 +164,5 @@ urlpattern = "=0.4.2"
 # ordinary dependency again — no path override, and no hand-built archive.
 v8 = "152.1"
 wasm-bindgen-futures = "0.4"
-webpki-roots = "1"
+# 1.0.10 drops the emSign ECC root, whose intermediate CA keys are public.
+webpki-roots = "1.0.10"

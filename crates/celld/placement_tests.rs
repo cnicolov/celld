@@ -469,6 +469,36 @@ fn concurrent_registration_cannot_overwrite_a_different_pool() {
 }
 
 #[test]
+fn creation_refuses_a_lost_record_instead_of_reopening_epoch_one() {
+    run(async {
+        let dir = tempfile::tempdir()?;
+        let bucket = Bucket::open_dev(&dir.path().join("bucket.sqlite"))?;
+        let a = adapter(&bucket, "gpu-a", gpu());
+        // Committed LTX with no ownership record: the record was lost after
+        // the cell had acknowledged writes.
+        bucket
+            .put(
+                "cells/Cell:lost/ltx/e1/0000000000000001-0000000000000001.ltx",
+                b"ltx".to_vec(),
+            )
+            .await?;
+        let error = a.create_cell("Cell:lost", gpu()).await.unwrap_err();
+        assert!(
+            format!("{error:#}").contains("ownership record lost"),
+            "{error:#}"
+        );
+        assert!(
+            a.read_owner("Cell:lost").await?.is_none(),
+            "a refused creation writes no record for the next claim to open as fresh"
+        );
+        // A cell with no LTX is still registered at epoch zero.
+        a.create_cell("Cell:new", gpu()).await?;
+        assert_eq!(a.read_owner("Cell:new").await?.unwrap().epoch, 0);
+        Ok(())
+    });
+}
+
+#[test]
 fn legacy_owner_and_node_lease_decode_as_default_without_hot_capability() {
     run(async {
         let dir = tempfile::tempdir()?;

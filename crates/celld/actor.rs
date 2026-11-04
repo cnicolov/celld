@@ -200,6 +200,11 @@ pub enum Ownership {
     Bucket(Arc<BucketOwnership>),
 }
 
+fn ownership_read_failed(error: anyhow::Error) -> Failure {
+    eprintln!("celld ownership read failed: {error:#}");
+    Failure::Definite
+}
+
 impl Ownership {
     pub async fn create_cell(
         &self,
@@ -246,14 +251,68 @@ impl Ownership {
         }
     }
 
+    /// Read the record as it is stored. A missing record here means only that
+    /// no record exists now, so this read must not decide a claim; the core
+    /// reads through [`Self::read_owner_for_claim`].
     pub(crate) async fn read_owner(&self, cell: &str) -> Result<Option<OwnerRecord>, Failure> {
         match self {
             Self::Memory(memory) => Ok(memory.lock().await.owners.get(cell).cloned()),
-            Self::Bucket(bucket) => bucket.read_owner(cell).await.map_err(|error| {
-                eprintln!("celld ownership read failed: {error:#}");
-                Failure::Definite
-            }),
+            Self::Bucket(bucket) => bucket.read_owner(cell).await.map_err(ownership_read_failed),
         }
+    }
+
+    /// Read the record for the core, which claims epoch one as a fresh cell
+    /// when the record is missing.
+    pub(crate) async fn read_owner_for_claim(
+        &self,
+        cell: &str,
+    ) -> Result<Option<OwnerRecord>, Failure> {
+        // Memory ownership runs without replication, so it never has LTX.
+        let Self::Bucket(bucket) = self else {
+            return self.read_owner(cell).await;
+        };
+        if bucket.lost_record_held(cell, crate::asyncrt::mono_ms()) {
+            return Err(Failure::Definite);
+        }
+        let record = self.read_owner(cell).await?;
+        if record.is_some()
+            || !bucket
+                .ltx_exists(cell)
+                .await
+                .map_err(ownership_read_failed)?
+        {
+            return Ok(record);
+        }
+        // A claim writes the record before any LTX, and celld never deletes
+        // the record, so LTX proves that a record existed before the listing.
+        // A first claim on another node can still write it after the first
+        // read. Only a read after the listing that finds no record proves a
+        // loss; without it, this node fails a request that it can forward and
+        // reports a record that exists.
+        if let Some(record) = self.read_owner(cell).await? {
+            return Ok(Some(record));
+        }
+        // A missing record tells the core that the cell was never owned, so
+        // the core claims epoch one as a fresh cell and the activation
+        // restores nothing. celld never deletes `own.json`, but a bucket
+        // lifecycle rule, a manual cleanup, or a partial bucket copy can. The
+        // cell would then serve an empty database beside its acknowledged
+        // chain and ship over `e1/`, and a node that asks while the owner
+        // still serves would become a second writer. Failing the read writes
+        // nothing: each claim fails until an operator restores the record and
+        // the hold ends.
+        // A refusal in `LtxRepl::activate_with` comes too late, because the
+        // claim has already written a record at epoch one. Each later wake
+        // then advances one epoch, and a wake without a takeover can reuse a
+        // stale local eviction snapshot, which skips the used-epoch check.
+        eprintln!(
+            "celld ownership record lost: cells/{cell}/own.json is missing, but the bucket \
+             holds LTX under cells/{cell}/ltx/; refusing to claim {cell} as a new cell for \
+             {} s. See the ownership record repair in docs/guarantees.md.",
+            crate::ownership_store::LOST_RECORD_RECHECK_MS / 1_000
+        );
+        bucket.hold_lost_record(cell, crate::asyncrt::mono_ms());
+        Err(Failure::Definite)
     }
 
     pub(crate) async fn read_node_lease(
@@ -2398,13 +2457,22 @@ impl Actor {
         .await
     }
 
+    /// Build an Actor on the scripted cell host with the caller's peer client.
+    ///
+    /// `main` passes one client to both the Actor and the AppHandle of a node,
+    /// and the caller of this constructor can do the same. The arguments are
+    /// those of `from_environment`, with the scripted host in place of the
+    /// runtime and with that client added. The added client puts the
+    /// constructor one argument over the Clippy limit.
     #[cfg(all(test, celld_internal_tests))]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn from_environment_with_scripted_host(
         limits: AdmissionLimits,
         fail_publish_once: bool,
         fence: mpsc::UnboundedSender<i32>,
         host: crate::conformance_sim_cell_host::SimCellHost,
         ownership: Option<Ownership>,
+        peer_http: reqwest::Client,
         identity: ActorIdentity,
         resume_generation: Option<String>,
     ) -> anyhow::Result<Self> {
@@ -2417,7 +2485,7 @@ impl Actor {
                 host: Some(CellHost::Scripted(host)),
                 drain_pins: DrainPinRegistry::default(),
                 ownership,
-                peer_http: reqwest::Client::new(),
+                peer_http,
                 peer_auth,
             },
             identity,
@@ -2439,6 +2507,7 @@ impl Actor {
         fence: mpsc::UnboundedSender<i32>,
         host: crate::conformance_sim_cell_host::SimCellHost,
         ownership: Option<Ownership>,
+        peer_http: reqwest::Client,
         identity: ActorIdentity,
         decision_state: ScriptedActorDecisionState,
     ) -> anyhow::Result<Self> {
@@ -2469,6 +2538,7 @@ impl Actor {
             fence,
             host,
             ownership,
+            peer_http,
             identity,
             resume_generation,
         )
@@ -3311,7 +3381,7 @@ impl Actor {
                 let timing_cell = cell.clone();
                 out.spawn_scoped(async move {
                     let started = crate::asyncrt::mono_ms();
-                    let result = ownership.read_owner(&cell).await;
+                    let result = ownership.read_owner_for_claim(&cell).await;
                     CompletedEffect::timed(
                         Event::OwnerRead {
                             op,
