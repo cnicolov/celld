@@ -156,15 +156,7 @@ fn total_memory_bytes() -> Option<u64> {
 }
 
 pub fn pressure_config_from_environment() -> anyhow::Result<celld_logic::pressure::PressureConfig> {
-    // Residency is a hard cap (`CELLD_MAX_RESIDENT_CELLS` -> `Config::max_resident`),
-    // enforced at admission -- not a pressure watermark, so it is not built here.
-    // Memory shedding is on by default: a node that runs into its memory ceiling
-    // must give cells back, not be killed. The arithmetic lives in the core;
-    // the shell supplies only the two facts it can read.
-    let config = celld_logic::pressure::PressureConfig::from_limits(
-        total_memory_bytes(),
-        crate::env_vars::optional::<u64>("CELLD_MAX_RSS_MB")?,
-    );
+    let config = pressure_config()?;
     if config.ceiling_above_cap() {
         tracing::warn!(
             high_bytes = config.high_bytes,
@@ -174,6 +166,20 @@ pub fn pressure_config_from_environment() -> anyhow::Result<celld_logic::pressur
         );
     }
     Ok(config)
+}
+
+/// [`pressure_config_from_environment`] without its startup warning, for a
+/// reader that only reports the ceilings.
+pub(crate) fn pressure_config() -> anyhow::Result<celld_logic::pressure::PressureConfig> {
+    // Residency is a hard cap (`CELLD_MAX_RESIDENT_CELLS` -> `Config::max_resident`),
+    // enforced at admission -- not a pressure watermark, so it is not built here.
+    // Memory shedding is on by default: a node that runs into its memory ceiling
+    // must give cells back, not be killed. The arithmetic lives in the core;
+    // the shell supplies only the two facts it can read.
+    Ok(celld_logic::pressure::PressureConfig::from_limits(
+        total_memory_bytes(),
+        crate::env_vars::optional::<u64>("CELLD_MAX_RSS_MB")?,
+    ))
 }
 
 pub fn local_cache_max_bytes_from_environment() -> anyhow::Result<Option<u64>> {

@@ -311,6 +311,7 @@ impl Ownership {
              {} s. See the ownership record repair in docs/guarantees.md.",
             crate::ownership_store::LOST_RECORD_RECHECK_MS / 1_000
         );
+        crate::metrics::record_lost_ownership(cell, "claim");
         bucket.hold_lost_record(cell, crate::asyncrt::mono_ms());
         Err(Failure::Definite)
     }
@@ -653,10 +654,22 @@ pub enum Message {
     Presence {
         reply: oneshot::Sender<celld_logic::PresenceSnapshot>,
     },
+    Metrics {
+        reply: oneshot::Sender<CoreMetrics>,
+    },
     ResidentEpoch {
         cell: String,
         reply: oneshot::Sender<Option<u64>>,
     },
+}
+
+/// What an operational metrics collection reads from the core.
+#[derive(Clone, Debug, Default)]
+pub struct CoreMetrics {
+    /// Cells per lifecycle phase, by `phase_census`'s stable names.
+    pub phases: Vec<(&'static str, usize)>,
+    pub activity: celld_logic::ActivitySnapshot,
+    pub shed_reason: Option<&'static str>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1937,6 +1950,14 @@ impl AppHandle {
         receive.await.ok()
     }
 
+    /// The core's counts for an operational metrics collection. Unlike
+    /// [`AppHandle::snapshot`], this builds no per-cell list.
+    pub async fn core_metrics(&self) -> Option<CoreMetrics> {
+        let (reply, receive) = oneshot::channel();
+        self.tx.send(Message::Metrics { reply }).ok()?;
+        receive.await.ok()
+    }
+
     async fn resident_epoch(&self, cell: String) -> Option<u64> {
         let (reply, receive) = oneshot::channel();
         self.tx.send(Message::ResidentEpoch { cell, reply }).ok()?;
@@ -3170,6 +3191,13 @@ impl Actor {
             }
             Message::Presence { reply } => {
                 let _ = reply.send(self.state.presence_snapshot());
+            }
+            Message::Metrics { reply } => {
+                let _ = reply.send(CoreMetrics {
+                    phases: self.state.phase_census(),
+                    activity: self.state.activity(),
+                    shed_reason: self.state.shed_reason(),
+                });
             }
         }
     }
@@ -4441,6 +4469,24 @@ impl Actor {
                 .saturating_add(mono_elapsed_us(started));
         }
         let (owner_node, epoch) = owner.unwrap_or(("", 0));
+        let total_us = mono_elapsed_us(timing.started_mono_ms);
+        if let Some(metrics) = crate::metrics::get() {
+            let mut pairs = vec![("celld.cell.activation.outcome", outcome)];
+            if outcome == "activated" {
+                let source = if timing.fresh.unwrap_or(false) {
+                    "new"
+                } else {
+                    "existing"
+                };
+                pairs.push(("celld.cell.activation.source", source));
+            }
+            if !failure_phase.is_empty() {
+                pairs.push(("error.type", failure_phase));
+            }
+            metrics
+                .cell_activation_duration
+                .record(&pairs, total_us as f64 / 1e6);
+        }
         tracing::debug!(
             target: "timing",
             event = "cell_route_timing",
@@ -4453,7 +4499,7 @@ impl Actor {
             owner_node,
             epoch,
             fresh = timing.fresh.unwrap_or(false),
-            total_us = mono_elapsed_us(timing.started_mono_ms),
+            total_us,
             latch_wait_us = timing.latch_wait_us,
             ownership_read_us = timing.ownership_read_us,
             node_lease_lookup_us = timing.node_lease_lookup_us,

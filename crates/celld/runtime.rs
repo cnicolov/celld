@@ -786,6 +786,106 @@ impl RuntimeManager {
         crate::heap_snapshot::capture(slot.ok_or(crate::heap_snapshot::Error::Gone)?).await
     }
 
+    /// Isolate heap and state per script for operational metrics. Like the
+    /// monitor, this never waits for a running isolate or activates a cell.
+    /// Worker Loader isolates belong to no pool and are not listed here.
+    pub fn collect_isolate_metrics(&self, out: &mut Vec<crate::metrics::Metric>) {
+        use crate::metrics::{attributes, script_label, Metric, Number};
+        let generations = {
+            let generations = self.generations.read().expect("generation lock poisoned");
+            std::iter::once(generations.current.clone())
+                .chain(generations.draining.iter().cloned())
+                .collect::<Vec<_>>()
+        };
+        // The primary script's stateless pool is also its service pool, so
+        // slots are keyed by heap to count each isolate once.
+        let mut slots = BTreeMap::new();
+        for generation in &generations {
+            let pools = std::iter::once((
+                generation.script_name.as_str(),
+                "stateless",
+                &generation.stateless.isolates,
+            ))
+            .chain(
+                generation
+                    .services
+                    .iter()
+                    .map(|(script, worker)| (script.as_str(), "stateless", &worker.isolates)),
+            )
+            .chain(
+                generation
+                    .cell_isolates
+                    .iter()
+                    .map(|(script, pool)| (script.as_str(), "cell", pool)),
+            );
+            for (script, kind, pool) in pools {
+                for slot in pool.monitor_slots() {
+                    slots
+                        .entry(slot.heap_id())
+                        .or_insert_with(|| (script_label(script).to_string(), kind, slot));
+                }
+            }
+        }
+
+        #[derive(Default)]
+        struct Group {
+            usage: u64,
+            limit: u64,
+            utilization: Option<f64>,
+            states: BTreeMap<&'static str, i64>,
+        }
+        let mut groups: BTreeMap<(String, &'static str), Group> = BTreeMap::new();
+        for (script, kind, slot) in slots.into_values() {
+            let Some(sample) = slot.metrics_sample() else {
+                continue;
+            };
+            let group = groups.entry((script, kind)).or_default();
+            let over_limit = sample.heap.is_some_and(|heap| heap.over_limit);
+            let state = match (sample.retiring, over_limit) {
+                (true, _) => "retiring",
+                (false, true) => "condemned",
+                (false, false) => "serving",
+            };
+            *group.states.entry(state).or_default() += 1;
+            if let Some(heap) = sample.heap {
+                group.usage = group.usage.saturating_add(heap.used_bytes);
+                group.limit = group.limit.max(heap.limit_bytes);
+                if heap.limit_bytes > 0 {
+                    let share = heap.used_bytes as f64 / heap.limit_bytes as f64;
+                    group.utilization = Some(group.utilization.map_or(share, |max| max.max(share)));
+                }
+            }
+        }
+
+        let (mut usage, mut limits, mut utilization, mut counts) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for ((script, kind), group) in &groups {
+            let labels = attributes(&[("celld.script", script), ("celld.isolate.kind", kind)]);
+            for (state, count) in &group.states {
+                let mut labels = labels.clone();
+                labels.push(("celld.isolate.state", (*state).to_string()));
+                labels.sort_by(|a, b| a.0.cmp(b.0));
+                counts.push((labels, Number::Int(*count)));
+            }
+            let Some(share) = group.utilization else {
+                continue;
+            };
+            usage.push((labels.clone(), Number::Int(group.usage as i64)));
+            limits.push((labels.clone(), Number::Int(group.limit as i64)));
+            utilization.push((labels, Number::Double(share)));
+        }
+        for (descriptor, points) in [
+            (&crate::metrics::ISOLATE_COUNT, counts),
+            (&crate::metrics::ISOLATE_HEAP_USAGE, usage),
+            (&crate::metrics::ISOLATE_HEAP_LIMIT, limits),
+            (&crate::metrics::ISOLATE_HEAP_UTILIZATION, utilization),
+        ] {
+            if !points.is_empty() {
+                out.push(Metric::numbers(descriptor, points));
+            }
+        }
+    }
+
     /// A no-progress signal for health, without interrupting admitted work,
     /// changing ownership, or waiting for an isolate that's already stalled.
     pub fn application_progressing(&self) -> bool {
@@ -3560,6 +3660,58 @@ fn notify_gated_failure_for_test(
     }
 }
 
+/// A cell event's invocation metrics, recorded once at its outcome. The
+/// duration runs from admission, so it includes the order, gate and isolate
+/// waits an event spends before its handler runs.
+struct Invocation {
+    event: &'static str,
+    trigger: &'static str,
+    started_us: u64,
+}
+
+impl Invocation {
+    fn start(job: &CellJob) -> Option<Self> {
+        crate::metrics::get()?;
+        let (event, trigger) = match job {
+            CellJob::Fetch { .. } => ("fetch", "http"),
+            CellJob::Rpc { .. } => ("rpc", "other"),
+            CellJob::WsOpen { .. } => ("ws_open", "other"),
+            CellJob::WsMessage { .. } => ("ws_message", "other"),
+            CellJob::WsClosed { .. } => ("ws_close", "other"),
+            CellJob::Alarm { .. } => ("alarm", "timer"),
+            #[cfg(celld_internal_tests)]
+            CellJob::SyncErrorForTest { .. } => ("test", "other"),
+        };
+        Some(Self {
+            event,
+            trigger,
+            started_us: crate::asyncrt::mono_us(),
+        })
+    }
+
+    /// `scope` is the event's cell, borrowed so recording allocates nothing.
+    fn finish(self, scope: &str, error: Option<&'static str>) {
+        let Some(metrics) = crate::metrics::get() else {
+            return;
+        };
+        let elapsed_us = crate::asyncrt::mono_us().saturating_sub(self.started_us);
+        let pairs = [
+            ("faas.trigger", self.trigger),
+            ("celld.cell.event", self.event),
+            ("celld.cell.class", crate::metrics::cell_class(scope)),
+        ];
+        metrics
+            .faas_invoke_duration
+            .record(&pairs, elapsed_us as f64 / 1e6);
+        if let Some(error) = error {
+            let [trigger, event, class] = pairs;
+            metrics
+                .faas_errors
+                .add(&[trigger, event, class, ("error.type", error)], 1);
+        }
+    }
+}
+
 async fn drive_cell_inner(
     affiliation: crate::pool::Affiliation,
     mut job: CellJob,
@@ -3575,11 +3727,18 @@ async fn drive_cell_inner(
     // a parked event (denoland/celld#147).
     let slot = affiliation.slot().clone();
     let scope = job.scope().to_string();
+    let invocation = Invocation::start(&job);
+    let finish = |invocation: Option<Invocation>, error| {
+        if let Some(invocation) = invocation {
+            invocation.finish(&scope, error);
+        }
+    };
     let _queue_producer = if job.is_queue_producer() {
         match slot.queue_producer(&scope) {
             Some(permit) => Some(permit),
             None => {
                 job.fail(anyhow!(js::CellOverloaded));
+                finish(invocation, Some("overloaded"));
                 return Ok(None);
             }
         }
@@ -3672,10 +3831,14 @@ async fn drive_cell_inner(
                         if let Some(job) = pending.take() {
                             job.fail(anyhow!(failure));
                         }
+                        finish(invocation, Some("gate_failed"));
                         return Ok(None);
                     }
                     // The cell stopped while this event waited.
-                    Err(_) => return Ok(None),
+                    Err(_) => {
+                        finish(invocation, Some("cell_stopped"));
+                        return Ok(None);
+                    }
                 },
             },
         }
@@ -3695,6 +3858,7 @@ async fn drive_cell_inner(
     // Nothing is in flight; the reply already carries the error.
     let Some(mut entry) = begun else {
         drop(started);
+        finish(invocation, Some("_OTHER"));
         return Ok(None);
     };
     if entry.keeps_native_ops() {
@@ -3821,6 +3985,7 @@ async fn drive_cell_inner(
         report_alarm_moves(&report, moves);
         alarm_write = write;
     }
+    finish(invocation, entry.failure_class());
     if let (Some(ids), Some((name, cell, started, start_unix))) = (recording, span_seed) {
         let kind = if name == "celld.cell_fetch" {
             crate::telemetry::KIND_SERVER

@@ -3572,6 +3572,9 @@ async fn stream_lane(
                     let age_ms = now.saturating_sub(head_started);
                     if !head.stall_reported && age_ms >= policy.backstop_ms / 2 {
                         head.stall_reported = true;
+                        if let Some(metrics) = crate::metrics::get() {
+                            metrics.log_head_stalls.add(&[], 1);
+                        }
                         warn!(
                             event = "log_head_stall",
                             member = member.node,
@@ -5692,6 +5695,17 @@ impl NodeLogManager {
             .lock()
             .unwrap()
             .as_ref()
+            .map_or(0, |shipper| shipper.members.len())
+    }
+
+    /// Followers that can prove a write now: the active ensemble's width, or
+    /// zero while every write waits for the bucket instead.
+    pub fn proving_followers(&self) -> usize {
+        self.inner
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|shipper| shipper.is_active())
             .map_or(0, |shipper| shipper.members.len())
     }
 

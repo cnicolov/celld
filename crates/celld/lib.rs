@@ -79,6 +79,7 @@ pub mod ltx_repl;
 pub mod ltx_replication;
 pub mod machine;
 pub mod memory;
+pub mod metrics;
 pub mod monitor;
 pub mod node_identity;
 pub mod node_log;

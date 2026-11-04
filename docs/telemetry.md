@@ -67,7 +67,8 @@ Durable Object call keeps the trace id, uses a new span id, and keeps the
 sampled flag clear.
 
 Under load, telemetry sheds before requests do, and celld counts what it
-sheds. celld records no metrics yet.
+sheds. With `CELLD_METRICS=1`, the count is the `celld.telemetry.dropped`
+metric, and the same OTLP collector receives celld's [metrics](metrics.md).
 
 ## Workflow timelines
 

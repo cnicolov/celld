@@ -3352,6 +3352,15 @@ impl LtxRepl {
             budget_ms: self.durability_timeout_ms,
         };
         let started = wait.started_ms;
+        let started_us = asyncrt::mono_us();
+        let record = |pairs: &[(&'static str, &str)]| {
+            if let Some(metrics) = crate::metrics::get() {
+                let elapsed_us = asyncrt::mono_us().saturating_sub(started_us);
+                metrics
+                    .durability_proof_duration
+                    .record(pairs, elapsed_us as f64 / 1e6);
+            }
+        };
         loop {
             // Register the waiter before checking, so a sync that completes
             // between the check and the await is not missed. Either proof
@@ -3367,12 +3376,14 @@ impl LtxRepl {
                 } else {
                     celld_logic::ProofSource::Bucket
                 };
+                let proof = if shipped { "fleet" } else { "bucket" };
+                record(&[("celld.durability.proof", proof)]);
                 tracing::debug!(
                     target: "timing",
                     event = "durable_wait",
                     cell,
                     wait_us = asyncrt::mono_ms().saturating_sub(started).saturating_mul(1_000),
-                    proof = if shipped { "fleet" } else { "bucket" },
+                    proof,
                     "durability proof reached"
                 );
                 return Ok(source);
@@ -3391,6 +3402,7 @@ impl LtxRepl {
                 },
             );
             if asyncrt::mono_ms() >= deadline {
+                record(&[("error.type", "timeout")]);
                 anyhow::bail!("ltx durability timed out for {cell} epoch {epoch}");
             }
             let _ = asyncrt::timeout_at(deadline, ready).await;

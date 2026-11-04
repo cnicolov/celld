@@ -2341,6 +2341,8 @@ pub(crate) async fn dispatch_forwarded_rpc(
 
 #[path = "main/cluster_monitor.rs"]
 mod cluster_monitor;
+#[path = "main/metrics.rs"]
+mod metrics;
 #[path = "main/monitor.rs"]
 mod monitor;
 #[path = "main/peer_tunnel.rs"]
@@ -2397,7 +2399,9 @@ async fn handle_ingress(
         Err(response) => return *response,
     };
     let preserve_representation_length = method.eq_ignore_ascii_case("HEAD");
-    match app
+    let started_us = metrics::start();
+    let request_method = started_us.map(|_| method.clone());
+    let reply = match app
         .fetch_worker(url, method, body, headers, connection)
         .await
     {
@@ -2422,7 +2426,11 @@ async fn handle_ingress(
                 format!("Worker failed: {error:#}"),
             ),
         },
+    };
+    if let Some(method) = request_method {
+        metrics::record_http(started_us, &method, reply.status());
     }
+    reply
 }
 
 async fn dispatch_asset_call(app: AppHandle, call: AssetCallReq) {
@@ -2502,6 +2510,7 @@ async fn dispatch_queue_batch(app: AppHandle, call: QueueDispatchReq) {
         batch,
     } = call;
     let queue = batch.queue.clone();
+    let started_us = metrics::start();
     let result = match &app.runtime {
         Some(runtime) => runtime.queue_service(generation, &script, batch).await,
         None => Err(anyhow::anyhow!("no Worker runtime")),
@@ -2509,6 +2518,7 @@ async fn dispatch_queue_batch(app: AppHandle, call: QueueDispatchReq) {
     let result = match result {
         Ok(result) => result,
         Err(error) => {
+            metrics::record_queue_batch(started_us, &script, &queue, Some("_OTHER"));
             tracing::warn!(%scope, %queue, %script, %error, "Queue dispatch failed; its lease will expire");
             return;
         }
@@ -2517,6 +2527,8 @@ async fn dispatch_queue_batch(app: AppHandle, call: QueueDispatchReq) {
         celld::js::QueueOutcome::Ok => "ok",
         celld::js::QueueOutcome::Exception => "exception",
     };
+    let error = (result.outcome == celld::js::QueueOutcome::Exception).then_some("exception");
+    metrics::record_queue_batch(started_us, &script, &queue, error);
     let body = serde_json::json!({
         "leaseId": lease_id,
         "leases": leases,
@@ -2920,6 +2932,7 @@ async fn handle_internal(
         "/peer/handoff" => internal_handoff(request, app).await,
         _ if path.starts_with("/peer/log/") => internal_log(request, app, path.clone()).await,
         "/state" => response(StatusCode::OK, app.snapshot().await),
+        "/metrics" => metrics::handle(&request, &app).await,
         "/hot-recovery" => response(
             StatusCode::OK,
             app.follower
@@ -4204,6 +4217,19 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
         }
         celld::telemetry::init(config, sink_bucket, node.clone(), settings.region.clone())?;
     }
+    let metrics_export = celld::metrics::OtlpExport::from_telemetry(telemetry_config.as_ref())?;
+    if celld::metrics::enabled() {
+        // The same resource the trace and log exporters send, so a backend
+        // joins the three signals on `service.instance.id`.
+        celld::metrics::set_resource(celld::metrics::Resource {
+            node: node.clone(),
+            region: settings.region.clone(),
+            service: match &telemetry_config {
+                Some(config) => config.service.clone(),
+                None => std::env::var("OTEL_SERVICE_NAME").unwrap_or_else(|_| "celld".into()),
+            },
+        });
+    }
     let peer_auth = Arc::new(PeerAuth::new(peer_key, node.clone())?);
     // Connect-only timeout: a peer request may legitimately run through a
     // restore, but a handshake that never completes provably ran nothing.
@@ -4345,6 +4371,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                 celld::node_log::eviction_policy_from_env()?,
             ));
             *actor.node_log.lock().unwrap() = Some(manager.clone());
+            metrics::follow_node_log(manager.clone());
             if hot_recovery {
                 if let Some(follower) = &follower {
                     manager.enable_hot_recovery(
@@ -4493,6 +4520,15 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                 .map(|runtime| runtime.block_on(actor.run(rx)));
             let _ = actor_exit_tx.send(result);
         })?;
+
+    if let Some(export) = metrics_export {
+        let app = app.clone();
+        celld::asyncrt::spawn(celld::metrics::export_otlp(export, move || {
+            let app = app.clone();
+            async move { metrics::collect(&app).await }
+        }))
+        .detach();
+    }
 
     // The sampler is a plain ticker: it measures and posts, and decides
     // nothing. Everything downstream of the numbers -- the latch, the target,
@@ -4661,6 +4697,12 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                         if celld::monitor::enabled() {
                             cluster_monitor::service().update(view.0, &view.1);
                         }
+                        metrics::fleet_sampled(
+                            view.1
+                                .iter()
+                                .filter(|peer| peer.expires_ms > view.0)
+                                .count(),
+                        );
                         view
                     }
                     Err(error) => {

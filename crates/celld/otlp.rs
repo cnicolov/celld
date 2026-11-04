@@ -349,6 +349,148 @@ pub fn logs_request(logs: &[Log], node: &str, region: &str, service: &str) -> Ve
     out
 }
 
+const TEMPORALITY_CUMULATIVE: u64 = 2;
+
+fn metric_attributes(out: &mut Vec<u8>, field: u64, attributes: &crate::metrics::Attributes) {
+    for (name, value) in attributes {
+        key_value(out, field, name, any_string(value));
+    }
+}
+
+/// metrics.v1.NumberDataPoint: start_time=2, time=3, as_double=4, as_int=6,
+/// attributes=7. A gauge carries no start time.
+fn number_point(
+    attributes: &crate::metrics::Attributes,
+    value: crate::metrics::Number,
+    start_unix_ns: Option<u64>,
+    now_unix_ns: u64,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    if let Some(start) = start_unix_ns {
+        field_fixed64(&mut out, 2, start);
+    }
+    field_fixed64(&mut out, 3, now_unix_ns);
+    match value {
+        crate::metrics::Number::Double(value) => field_fixed64(&mut out, 4, value.to_bits()),
+        crate::metrics::Number::Int(value) => field_fixed64(&mut out, 6, value as u64),
+    }
+    metric_attributes(&mut out, 7, attributes);
+    out
+}
+
+/// metrics.v1.HistogramDataPoint: start_time=2, time=3, count=4, sum=5,
+/// bucket_counts=6 (packed fixed64), explicit_bounds=7 (packed double),
+/// attributes=9.
+fn histogram_point(
+    point: &crate::metrics::HistogramPoint,
+    bounds: &[f64],
+    start_unix_ns: u64,
+    now_unix_ns: u64,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    field_fixed64(&mut out, 2, start_unix_ns);
+    field_fixed64(&mut out, 3, now_unix_ns);
+    field_fixed64(&mut out, 4, point.count);
+    field_fixed64(&mut out, 5, point.sum.to_bits());
+    let counts: Vec<u8> = point
+        .bucket_counts
+        .iter()
+        .flat_map(|count| count.to_le_bytes())
+        .collect();
+    field_bytes(&mut out, 6, &counts);
+    let bounds: Vec<u8> = bounds
+        .iter()
+        .flat_map(|bound| bound.to_bits().to_le_bytes())
+        .collect();
+    field_bytes(&mut out, 7, &bounds);
+    metric_attributes(&mut out, 9, &point.attributes);
+    out
+}
+
+/// metrics.v1.Metric: name=1, description=2, unit=3, gauge=5, sum=7,
+/// histogram=9. Sums and histograms are cumulative from `start_unix_ns`.
+fn metric_message(
+    metric: &crate::metrics::Metric,
+    start_unix_ns: u64,
+    now_unix_ns: u64,
+) -> Vec<u8> {
+    use crate::metrics::{Data, Kind};
+    let descriptor = metric.descriptor;
+    let mut out = Vec::new();
+    field_str(&mut out, 1, descriptor.name);
+    field_str(&mut out, 2, descriptor.description);
+    field_str(&mut out, 3, descriptor.unit);
+    match (&metric.data, descriptor.kind) {
+        (Data::Numbers(points), Kind::Gauge) => {
+            let mut gauge = Vec::new();
+            for (attributes, value) in points {
+                field_bytes(
+                    &mut gauge,
+                    1,
+                    &number_point(attributes, *value, None, now_unix_ns),
+                );
+            }
+            field_bytes(&mut out, 5, &gauge);
+        }
+        (Data::Numbers(points), kind) => {
+            let mut sum = Vec::new();
+            for (attributes, value) in points {
+                let point = number_point(attributes, *value, Some(start_unix_ns), now_unix_ns);
+                field_bytes(&mut sum, 1, &point);
+            }
+            field_varint(&mut sum, 2, TEMPORALITY_CUMULATIVE);
+            if kind == Kind::Counter {
+                field_varint(&mut sum, 3, 1);
+            }
+            field_bytes(&mut out, 7, &sum);
+        }
+        (Data::Histogram { bounds, points }, _) => {
+            let mut histogram = Vec::new();
+            for point in points {
+                let point = histogram_point(point, bounds, start_unix_ns, now_unix_ns);
+                field_bytes(&mut histogram, 1, &point);
+            }
+            field_varint(&mut histogram, 2, TEMPORALITY_CUMULATIVE);
+            field_bytes(&mut out, 9, &histogram);
+        }
+    }
+    out
+}
+
+/// collector.v1.ExportMetricsServiceRequest: resource_metrics=1, holding one
+/// ResourceMetrics{resource=1, scope_metrics=2{scope=1, metrics=2}}. The
+/// resource matches the trace and log exports from the same node.
+pub fn metrics_request(
+    metrics: &[crate::metrics::Metric],
+    start_unix_ns: u64,
+    now_unix_ns: u64,
+    resource_identity: &crate::metrics::Resource,
+) -> Vec<u8> {
+    let mut scope_metrics = Vec::new();
+    field_bytes(&mut scope_metrics, 1, &scope("celld"));
+    for metric in metrics {
+        field_bytes(
+            &mut scope_metrics,
+            2,
+            &metric_message(metric, start_unix_ns, now_unix_ns),
+        );
+    }
+    let mut resource_metrics = Vec::new();
+    field_bytes(
+        &mut resource_metrics,
+        1,
+        &resource(
+            &resource_identity.node,
+            &resource_identity.region,
+            &resource_identity.service,
+        ),
+    );
+    field_bytes(&mut resource_metrics, 2, &scope_metrics);
+    let mut out = Vec::new();
+    field_bytes(&mut out, 1, &resource_metrics);
+    out
+}
+
 fn identity<'a>(metadata: Option<&'a serde_json::Value>, service: &'a str) -> (&'a str, &'a str) {
     let name = |key| {
         metadata
@@ -398,6 +540,58 @@ mod tests {
             }
         }
         values
+    }
+
+    #[test]
+    fn metrics_request_encodes_sums_gauges_and_histograms_under_the_shared_resource() {
+        use crate::metrics::{attributes, Data, HistogramPoint, Metric, Number, Resource};
+        let resource = Resource {
+            node: "node-a".into(),
+            region: "local".into(),
+            service: "celld".into(),
+        };
+        let metrics = vec![
+            Metric::single(&crate::metrics::NODE_LEASE_RENEWALS, Number::Int(3)),
+            Metric::single(
+                &crate::metrics::ISOLATE_HEAP_UTILIZATION,
+                Number::Double(0.5),
+            ),
+            Metric {
+                descriptor: &crate::metrics::TURN_DURATION,
+                data: Data::Histogram {
+                    bounds: &[0.1, 1.0],
+                    points: vec![HistogramPoint {
+                        attributes: attributes(&[("celld.script", "api")]),
+                        count: 3,
+                        sum: 1.5,
+                        bucket_counts: vec![1, 1, 1],
+                    }],
+                },
+            },
+        ];
+        let request = metrics_request(&metrics, 10, 20, &resource);
+        let resource_metrics = fields(&request, 1);
+        assert_eq!(resource_metrics.len(), 1);
+        let resource_attributes = fields(fields(resource_metrics[0], 1)[0], 1);
+        assert!(resource_attributes
+            .iter()
+            .any(|pair| fields(pair, 1) == vec![b"service.instance.id".as_slice()]));
+        let encoded = fields(fields(resource_metrics[0], 2)[0], 2);
+        assert_eq!(encoded.len(), 3);
+        assert_eq!(
+            fields(encoded[0], 1),
+            vec![b"celld.node.lease.renewals".as_slice()]
+        );
+        assert_eq!(fields(encoded[0], 3), vec![b"{renewal}".as_slice()]);
+        assert_eq!(fields(encoded[0], 7).len(), 1, "a counter is a sum");
+        assert_eq!(fields(encoded[1], 5).len(), 1, "a gauge is a gauge");
+        let point = fields(fields(encoded[2], 9)[0], 1)[0];
+        assert_eq!(fields(point, 6)[0].len(), 3 * 8, "packed bucket counts");
+        assert_eq!(fields(point, 7)[0].len(), 2 * 8, "packed explicit bounds");
+        assert_eq!(
+            fields(fields(point, 9)[0], 1),
+            vec![b"celld.script".as_slice()]
+        );
     }
 
     #[test]

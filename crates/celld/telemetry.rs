@@ -589,9 +589,19 @@ impl Event {
 
 struct Telemetry {
     tx: tokio::sync::mpsc::Sender<Event>,
+    /// Shed since the pump last reported; the pump resets it.
     dropped: AtomicU64,
+    /// Shed since the process started, for the `celld.telemetry.dropped` metric.
+    dropped_total: AtomicU64,
     sampler: Sampler,
     parent_based: bool,
+}
+
+impl Telemetry {
+    fn shed(&self, count: u64) {
+        self.dropped.fetch_add(count, Ordering::Relaxed);
+        self.dropped_total.fetch_add(count, Ordering::Relaxed);
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -760,8 +770,16 @@ pub fn cap_body(body: &mut String) {
 
 pub(crate) fn count_rejected() {
     if let Some(telemetry) = TELEMETRY.get() {
-        telemetry.dropped.fetch_add(1, Ordering::Relaxed);
+        telemetry.shed(1);
     }
+}
+
+/// Spans and logs dropped since the process started, or `None` when
+/// telemetry is off. Unlike the pump's warning count, this never resets.
+pub fn dropped_total() -> Option<u64> {
+    TELEMETRY
+        .get()
+        .map(|telemetry| telemetry.dropped_total.load(Ordering::Relaxed))
 }
 
 fn send(event: Event) -> bool {
@@ -769,7 +787,7 @@ fn send(event: Event) -> bool {
         return false;
     };
     if telemetry.tx.try_send(event).is_err() {
-        telemetry.dropped.fetch_add(1, Ordering::Relaxed);
+        telemetry.shed(1);
         return false;
     }
     true
@@ -828,6 +846,7 @@ pub fn init(
     let telemetry = Telemetry {
         tx,
         dropped: AtomicU64::new(0),
+        dropped_total: AtomicU64::new(0),
         sampler: Sampler::from_ratio(config.sample_ratio),
         parent_based: config.parent_based,
     };
@@ -951,7 +970,8 @@ impl SinkRuntime {
 /// permanently, or the retry budget expires. This future owns only one batch.
 /// While it sleeps, request handling continues and the bounded channel sheds
 /// excess telemetry instead of turning an outage into application backpressure.
-async fn post_otlp(
+/// The metrics exporter shares it for `/v1/metrics`.
+pub(crate) async fn post_otlp(
     client: &reqwest::Client,
     url: &str,
     headers: &[(String, String)],
@@ -1107,6 +1127,11 @@ async fn pump(
             }
         }
         let sink_dropped = sink.flush(spans, logs, &node, &region, &service).await;
+        if let Some(telemetry) = TELEMETRY.get() {
+            telemetry
+                .dropped_total
+                .fetch_add(sink_dropped as u64, Ordering::Relaxed);
+        }
         let dropped = sink_dropped.saturating_add(
             TELEMETRY
                 .get()

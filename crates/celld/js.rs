@@ -2318,6 +2318,11 @@ impl WorkerIsolate {
             }
         }
         state.excessively_exceeded.store(false, Ordering::Relaxed);
+        if let Some(metrics) = crate::metrics::get() {
+            metrics
+                .isolate_heap_recoveries
+                .add(&[("celld.script", &state.metrics_script)], 1);
+        }
         let data = Arc::as_ptr(&state) as *mut HeapLimitState as *mut std::ffi::c_void;
         locker.remove_near_heap_limit_callback(near_heap_limit, state.limit);
         locker.add_near_heap_limit_callback(near_heap_limit, data);
@@ -2394,6 +2399,9 @@ struct HeapLimitState {
     /// the current one.
     limit: usize,
     last_gc_nudge: Mutex<Option<Instant>>,
+    /// The script label for operational metrics, read by the GC callback,
+    /// which has no other way to name the isolate it condemns.
+    metrics_script: Box<str>,
     /// An explicit admission refusal cannot use the condemnation flag because
     /// recovery clears that flag at the next turn.
     #[cfg(celld_internal_tests)]
@@ -2875,7 +2883,18 @@ extern "C" fn near_heap_limit(
     // SAFETY: `data` points into the Arc stored in the isolate slot. Worker::drop
     // removes this callback before the isolate (and its slots) are destroyed.
     let state = unsafe { &*(data as *const HeapLimitState) };
-    state.excessively_exceeded.store(true, Ordering::Relaxed);
+    let newly_condemned = !state.excessively_exceeded.swap(true, Ordering::Relaxed);
+    if newly_condemned {
+        if let Some(metrics) = crate::metrics::get() {
+            metrics.isolate_condemnations.add(
+                &[
+                    ("celld.script", &state.metrics_script),
+                    ("celld.isolate.condemnation.reason", "heap_limit"),
+                ],
+                1,
+            );
+        }
+    }
     // V8 fatally aborts the process if a near-limit callback does not extend
     // the limit. This reserve lets JS observe condemnation and unwind.
     //
@@ -3335,6 +3354,10 @@ pub struct InFlight {
     /// the reason, not only that it failed. This also records an output-gate
     /// failure after a successful handler.
     failure: Option<String>,
+    /// The same outcome as a short class for operational metrics, recorded
+    /// whether or not a trace is sampled: `timeout`, `stuck`, `storage`,
+    /// `exception`, or `_OTHER`.
+    failed: Option<&'static str>,
     /// The report owed to the loader isolate after this invocation retires.
     tail_report: Option<TailReportState>,
     /// The isolate this entry's ops belong to, so `abandon` can drop their
@@ -3364,6 +3387,7 @@ impl InFlight {
         if let Some(error) = self.scope.as_deref().and_then(storage::sql_critical_error) {
             let _ = end_event_context(tc);
             self.context.seal_wait_until();
+            self.failed.get_or_insert("storage");
             if self.trace.is_some_and(|trace| trace.sampled) {
                 self.failure = Some(crate::telemetry::cap_error(error.to_string()));
             }
@@ -3402,6 +3426,9 @@ impl InFlight {
             Answer::Queue(reply) => {
                 let read = read_queue_result(tc, value);
                 if let Ok(result) = &read {
+                    if result.outcome == QueueOutcome::Exception {
+                        self.failed.get_or_insert("exception");
+                    }
                     if result.outcome == QueueOutcome::Exception
                         && self.trace.is_some_and(|trace| trace.sampled)
                     {
@@ -3533,6 +3560,7 @@ impl InFlight {
                 // leave frames for the turn-end flush to publish.
                 ws_capture_discard(&self.context);
             }
+            self.failed.get_or_insert("_OTHER");
             if self.trace.is_some_and(|trace| trace.sampled) {
                 self.failure = Some(crate::telemetry::cap_error(error.to_string()));
             }
@@ -3652,6 +3680,15 @@ impl InFlight {
         completion: Result<GatedReplyCompletion, tokio::sync::oneshot::error::RecvError>,
     ) {
         self.gated_reply = None;
+        // A client that left before an unfailed reply is not a handler error.
+        if matches!(
+            completion,
+            Ok(GatedReplyCompletion::Sent { failure: Some(_) })
+                | Ok(GatedReplyCompletion::CallerClosed { failure: Some(_) })
+                | Err(_)
+        ) {
+            self.failed.get_or_insert("_OTHER");
+        }
         if self.trace.is_some_and(|trace| trace.sampled) {
             match completion {
                 Ok(GatedReplyCompletion::Sent {
@@ -3707,6 +3744,11 @@ impl InFlight {
         self.failure.as_deref()
     }
 
+    /// Whether and how the event failed, sampled or not.
+    pub(crate) fn failure_class(&self) -> Option<&'static str> {
+        self.failed
+    }
+
     pub(crate) fn finish_tail_report(&mut self) {
         if let Some(report) = self.tail_report.take() {
             report.finish(&self.context);
@@ -3726,6 +3768,9 @@ impl InFlight {
 
     /// Give up on a handler that will not settle.
     pub fn time_out(&mut self, budget: Duration) {
+        if self.reply.is_some() {
+            self.failed.get_or_insert("timeout");
+        }
         self.fail(anyhow!("handler exceeded {}s budget", budget.as_secs()));
     }
 
@@ -3734,6 +3779,9 @@ impl InFlight {
     /// request could resolve — which the pump concealed, because it settled
     /// every entry on every turn whoever the turn belonged to.
     pub fn stuck(&mut self) {
+        if self.reply.is_some() {
+            self.failed.get_or_insert("stuck");
+        }
         self.fail(anyhow!("handler is waiting on nothing"));
         self.background = None;
         self.context.seal_wait_until();
@@ -4203,6 +4251,16 @@ pub struct HeapBytes {
     pub external: u64,
 }
 
+/// An isolate's heap against its limit, for operational metrics.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct HeapUsage {
+    pub used_bytes: u64,
+    /// The limit before any emergency extension `near_heap_limit` grants.
+    pub limit_bytes: u64,
+    /// The isolate reached its limit and has not yet recovered.
+    pub over_limit: bool,
+}
+
 impl Worker {
     /// The pool holds this worker's permit and runs this on a blocking thread.
     /// The snapshot covers the shared isolate, including every resident cell.
@@ -4229,6 +4287,28 @@ impl Worker {
             physical: statistics.total_physical_size() as u64,
             external: statistics.external_memory() as u64,
         })
+    }
+
+    /// Heap use against the limit V8 started with, for operational metrics.
+    /// Takes the isolate lock like [`Worker::heap_bytes`], so the caller must
+    /// hold this worker's permit; `None` once the isolate has been freed.
+    pub(crate) fn heap_usage(&self) -> Option<HeapUsage> {
+        let inner = self.inner.as_ref()?;
+        let (mut locker, _cells) = inner.lock();
+        let used_bytes = locker.get_heap_statistics().used_heap_size() as u64;
+        let over_limit = locker
+            .get_slot::<Arc<HeapLimitState>>()
+            .is_some_and(|state| state.excessively_exceeded.load(Ordering::Relaxed));
+        Some(HeapUsage {
+            used_bytes,
+            limit_bytes: inner.original_heap_limit as u64,
+            over_limit,
+        })
+    }
+
+    /// The script this isolate runs, or `None` once it has been freed.
+    pub(crate) fn script_name(&self) -> Option<&str> {
+        Some(self.inner.as_ref()?.runtime_state.script_name.as_str())
     }
 
     /// Called only after the pool obtained the isolate permit with try_lock.
@@ -4715,6 +4795,7 @@ fn begin<'s>(
                 started: Instant::now(),
                 trace: None,
                 failure: None,
+                failed: None,
                 tail_report,
             };
             drop(guard);
@@ -4810,6 +4891,7 @@ fn begin_entrypoint_rpc(
                 started: event_started,
                 trace: None,
                 failure: None,
+                failed: None,
                 tail_report: None,
             };
             drop(guard);
@@ -5050,6 +5132,7 @@ fn begin_queue(
                 started: Instant::now(),
                 trace: None,
                 failure: None,
+                failed: None,
                 tail_report: None,
             };
             drop(guard);
@@ -5234,6 +5317,7 @@ fn start_cell_event<'s>(
                 started: event_started,
                 trace: None,
                 failure: None,
+                failed: None,
                 tail_report: None,
             };
             restore_io_context(tc, previous_io_context);
@@ -5290,6 +5374,7 @@ fn start_cell_event<'s>(
                     started: event_started,
                     trace: None,
                     failure: Some(failure),
+                    failed: Some("exception"),
                     tail_report: None,
                 }))
             };
@@ -5756,6 +5841,9 @@ fn settle(tc: &mut v8::PinScope, entry: &mut InFlight) {
                     finish_incoming_request(tc, request_id);
                 }
                 drop(guard);
+                if entry.reply.is_some() {
+                    entry.failed.get_or_insert("exception");
+                }
                 entry.fail_in_turn(anyhow!("rejected: {reason}"));
             }
         }
@@ -5910,6 +5998,7 @@ impl Worker {
             excessively_exceeded: AtomicBool::new(false),
             limit: original_heap_limit,
             last_gc_nudge: Mutex::new(None),
+            metrics_script: crate::metrics::script_label(script_name).into(),
             #[cfg(celld_internal_tests)]
             forced_admission_refusal: AtomicBool::new(false),
         });
@@ -10324,17 +10413,23 @@ fn op_heap_over_admission_share(
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
     let state = scope.get_slot::<Arc<HeapLimitState>>().cloned();
-    let over = match state {
+    let over = match &state {
         // A condemned isolate admits nothing, whatever the heap now reads.
         Some(state)
             if state.excessively_exceeded.load(Ordering::Relaxed)
-                || admission_refusal_forced(&state) =>
+                || admission_refusal_forced(state) =>
         {
             true
         }
         Some(state) => heap_share(scope, state.limit) >= HEAP_ADMISSION_SHARE,
         None => false,
     };
+    // The harness refuses exactly one WebSocket accept for each `true`.
+    if let (true, Some(state), Some(metrics)) = (over, &state, crate::metrics::get()) {
+        metrics
+            .isolate_admission_refusals
+            .add(&[("celld.script", &state.metrics_script)], 1);
+    }
     rv.set(v8::Boolean::new(scope, over).into());
 }
 #[cfg(celld_internal_tests)]

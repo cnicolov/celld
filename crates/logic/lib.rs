@@ -1271,6 +1271,12 @@ impl State {
         self.activity.handed_off
     }
 
+    /// The lifetime activity counters, without the resident list that
+    /// [`State::presence_snapshot`] also builds.
+    pub fn activity(&self) -> ActivitySnapshot {
+        self.activity
+    }
+
     /// Return an epoch this node has acquired for a dormant, warming, or
     /// published cell. A shutdown handoff acknowledges this authority without
     /// forcing the cell runtime into memory.

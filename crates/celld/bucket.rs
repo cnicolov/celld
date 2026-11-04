@@ -231,6 +231,34 @@ pub fn is_clean_cas_rejection(error: &Error) -> bool {
 /// the request did not commit, and the caller may retry within its authority.
 /// For If-None-Match, object_store also wraps a typed 412 Precondition inside
 /// AlreadyExists. Preserve that definitive rejection without parsing messages.
+/// Time one object-store request for operational metrics. A missing key is
+/// an answer, not a failure. A refused or conflicting conditional write is
+/// `cas_conflict`, so an alert can tell a lost race from an outage.
+async fn timed<T>(
+    operation: &'static str,
+    request: impl std::future::Future<Output = object_store::Result<T>>,
+) -> object_store::Result<T> {
+    let Some(metrics) = crate::metrics::get() else {
+        return request.await;
+    };
+    let started_us = crate::asyncrt::mono_us();
+    let result = request.await;
+    let error = match &result {
+        Ok(_) | Err(Error::NotFound { .. }) => None,
+        Err(error) if is_clean_cas_rejection(error) || is_s3_cas_conflict(error) => {
+            Some("cas_conflict")
+        }
+        Err(_) => Some("_OTHER"),
+    };
+    let mut pairs = vec![("celld.bucket.operation", operation)];
+    pairs.extend(error.map(|error| ("error.type", error)));
+    let elapsed_us = crate::asyncrt::mono_us().saturating_sub(started_us);
+    metrics
+        .bucket_operation_duration
+        .record(&pairs, elapsed_us as f64 / 1e6);
+    result
+}
+
 fn is_s3_cas_conflict(error: &Error) -> bool {
     match error {
         Error::AlreadyExists { source, .. } => {
@@ -962,7 +990,7 @@ impl Bucket {
     /// Body and CAS token, or `None` when the key does not exist.
     pub async fn get(&self, key: &str) -> anyhow::Result<Option<(Bytes, String)>> {
         let key = self.key(key);
-        match self.store.get(&Path::from(key.as_str())).await {
+        match timed("get", self.store.get(&Path::from(key.as_str()))).await {
             Ok(result) => {
                 let token = self
                     .backend
@@ -983,7 +1011,7 @@ impl Bucket {
     /// Size and CAS token, or `None` when the key does not exist.
     pub async fn head(&self, key: &str) -> anyhow::Result<Option<(u64, String)>> {
         let key = self.key(key);
-        match self.store.head(&Path::from(key.as_str())).await {
+        match timed("head", self.store.head(&Path::from(key.as_str()))).await {
             Ok(meta) => {
                 let token = self
                     .backend
@@ -1000,10 +1028,12 @@ impl Bucket {
 
     pub async fn put(&self, key: &str, body: impl Into<PutPayload>) -> anyhow::Result<()> {
         let key = self.key(key);
-        self.store
-            .put(&Path::from(key.as_str()), body.into())
-            .await
-            .with_context(|| format!("write {}://{}/{key}", self.scheme(), self.name))?;
+        timed(
+            "put",
+            self.store.put(&Path::from(key.as_str()), body.into()),
+        )
+        .await
+        .with_context(|| format!("write {}://{}/{key}", self.scheme(), self.name))?;
         Ok(())
     }
 
@@ -1021,10 +1051,11 @@ impl Bucket {
             head: true,
             ..GetOptions::default()
         };
-        match self
-            .store
-            .get_opts(&Path::from(key.as_str()), options)
-            .await
+        match timed(
+            "head",
+            self.store.get_opts(&Path::from(key.as_str()), options),
+        )
+        .await
         {
             Ok(result) => {
                 let value = BlobAttributes::read(&result.attributes)
@@ -1059,10 +1090,13 @@ impl Bucket {
             attributes: attributes.write(self.backend),
             ..PutOptions::default()
         };
-        self.store
-            .put_opts(&Path::from(key.as_str()), body.into(), options)
-            .await
-            .with_context(|| format!("write {}://{}/{key}", self.scheme(), self.name))?;
+        timed(
+            "put",
+            self.store
+                .put_opts(&Path::from(key.as_str()), body.into(), options),
+        )
+        .await
+        .with_context(|| format!("write {}://{}/{key}", self.scheme(), self.name))?;
         Ok(())
     }
 
@@ -1083,14 +1117,15 @@ impl Bucket {
             None => PutMode::Create,
             Some(token) => PutMode::Update(self.backend.update(token)),
         };
-        match self
-            .cas_store
-            .put_opts(
+        match timed(
+            "put_cas",
+            self.cas_store.put_opts(
                 &Path::from(key.as_str()),
                 body.into(),
                 PutOptions::from(mode),
-            )
-            .await
+            ),
+        )
+        .await
         {
             Ok(result) => {
                 // The write applied; a result without a usable token still
@@ -1127,7 +1162,7 @@ impl Bucket {
     /// Idempotent: deleting an absent key succeeds, as S3's DELETE does.
     pub async fn delete(&self, key: &str) -> anyhow::Result<()> {
         let key = self.key(key);
-        match self.store.delete(&Path::from(key.as_str())).await {
+        match timed("delete", self.store.delete(&Path::from(key.as_str()))).await {
             Ok(()) | Err(Error::NotFound { .. }) => Ok(()),
             Err(error) => Err(anyhow!(error).context(format!(
                 "delete {}://{}/{key}",

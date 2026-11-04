@@ -661,6 +661,7 @@ impl BucketOwnership {
                 None if self.ltx_exists(cell).await? => match self.read_owner(cell).await? {
                     Some(owner) => Some(owner),
                     None => {
+                        crate::metrics::record_lost_ownership(cell, "create");
                         self.hold_lost_record(cell, crate::asyncrt::mono_ms());
                         anyhow::bail!(
                             "celld ownership record lost: cells/{cell}/own.json is missing, but \

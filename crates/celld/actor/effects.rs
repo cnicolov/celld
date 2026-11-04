@@ -168,6 +168,14 @@ impl StepOutput {
                     Err(Failure::Ambiguous) => "ambiguous",
                     Err(Failure::Definite) => "definite_failure",
                 };
+                if let Some(metrics) = crate::metrics::get() {
+                    let applied = matches!(&result, Ok(LeaseCasOutcome::Applied { .. }));
+                    let mut pairs = vec![("celld.node.lease.attempt", attempt)];
+                    if !applied {
+                        pairs.push(("error.type", outcome));
+                    }
+                    metrics.node_lease_renewals.add(&pairs, 1);
+                }
                 if matches!(&result, Ok(LeaseCasOutcome::Applied { .. })) {
                     tracing::info!(
                         event = "node_lease_attempt",

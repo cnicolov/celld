@@ -118,6 +118,7 @@ the waker role, and it wakes only the cells whose owner node has stopped.
 - [Limitations](limitations.md)
 - [Security](security.md)
 - [Telemetry](telemetry.md)
+- [Metrics](metrics.md)
 - [Testing](testing.md)
 - [WebAssembly](wasm.md)
 - [Python Workers](services/workers.md#python-workers)
@@ -682,6 +683,8 @@ unset variable selects its default. A Boolean variable accepts only `0` or
 | `CELLD_LTX_HYDRATE_MBPS` | The background fill rate of a paged cell, in MiB per second, one cell at a time per node (default: 16; `0` keeps the cell sparse) |
 | `CELLD_LTX_DURABILITY_TIMEOUT_SECS` | The budget for one durability proof, and for the final snapshot of a handoff (default: 10). A queued write waits at most six budgets. A slow store can need more |
 | `CELLD_TOKIO_THREADS` | Host Tokio worker threads (default: the CPU count). The `host_runtime` log event at startup reports `worker_count` |
+| `CELLD_METRICS` | `1` serves operational [metrics](metrics.md) at `/metrics` on the internal listener, and pushes them to the `CELLD_OTEL` collector when it is a URL (default: `0`) |
+| `OTEL_METRIC_EXPORT_INTERVAL` | Milliseconds between OTLP metric pushes (default: 60000) |
 | `RUST_LOG` | The runtime log filter |
 
 An L1 compaction merges at most 256 source objects within a 64 MiB buffer.

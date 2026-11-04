@@ -206,8 +206,77 @@ pub struct Slot {
     retiring: AtomicBool,
     /// Observational only. Off means no counters or per-cell registry.
     monitor: Option<crate::monitor::SlotMonitor>,
+    /// Operational metrics; `None` unless `CELLD_METRICS=1`.
+    metrics: Option<SlotMetrics>,
     #[cfg(celld_internal_tests)]
     turn_observations: Mutex<Vec<String>>,
+}
+
+/// What operational metrics keep for one slot.
+#[derive(Default)]
+struct SlotMetrics {
+    /// The script's turn histograms. Learned on the first turn: a slot does
+    /// not know its script until it holds the worker.
+    turns: std::sync::OnceLock<Option<TurnSeries>>,
+    /// The heap at the last turn end or collection, for a collection that
+    /// finds the isolate busy.
+    heap: Mutex<Option<js::HeapUsage>>,
+    heap_sampled_ms: AtomicU64,
+}
+
+struct TurnSeries {
+    script: Box<str>,
+    duration: Arc<crate::metrics::Series>,
+    wait: Arc<crate::metrics::Series>,
+}
+
+/// How often a turn end refreshes the heap reading. A busy isolate is the one
+/// a collection cannot read, so its turns keep the reading current.
+const METRICS_HEAP_SAMPLE_MS: u64 = 1_000;
+
+impl SlotMetrics {
+    fn turn_series(&self, worker: &js::Worker, loaded_worker: bool) -> Option<&TurnSeries> {
+        self.turns
+            .get_or_init(|| {
+                let metrics = crate::metrics::get()?;
+                let script = if loaded_worker {
+                    "__loader"
+                } else {
+                    crate::metrics::script_label(worker.script_name().unwrap_or("_OTHER"))
+                };
+                let pairs = [("celld.script", script)];
+                Some(TurnSeries {
+                    script: script.into(),
+                    duration: metrics.turn_duration.series(&pairs),
+                    wait: metrics.turn_wait_duration.series(&pairs),
+                })
+            })
+            .as_ref()
+    }
+
+    fn script(&self) -> &str {
+        self.turns
+            .get()
+            .and_then(Option::as_ref)
+            .map_or("_OTHER", |series| &series.script)
+    }
+
+    fn sample_heap_if_due(&self, worker: &js::Worker, now_ms: u64) {
+        let last = self.heap_sampled_ms.load(Ordering::Relaxed);
+        if last != 0 && now_ms.saturating_sub(last) < METRICS_HEAP_SAMPLE_MS {
+            return;
+        }
+        self.heap_sampled_ms.store(now_ms.max(1), Ordering::Relaxed);
+        *self.heap.lock().unwrap() = worker.heap_usage();
+    }
+}
+
+/// One slot as operational metrics see it.
+pub(crate) struct SlotSample {
+    pub retiring: bool,
+    /// `None` until the first reading of an isolate that is busy whenever
+    /// a collection looks.
+    pub heap: Option<js::HeapUsage>,
 }
 
 thread_local! {
@@ -256,6 +325,7 @@ impl Slot {
         }
         self.turns.fetch_add(1, Ordering::Relaxed);
         let _turn = Counted(self);
+        let queued_us = self.metrics.as_ref().map(|_| crate::asyncrt::mono_us());
         let mut accounting = self.monitor.as_ref().map(|monitor| {
             let cell = match &lane {
                 TurnLane::Cell(scope) => monitor.cell(scope),
@@ -286,10 +356,31 @@ impl Slot {
         if let Some(accounting) = &mut accounting {
             accounting.start();
         }
-        let result = f(worker);
+        let timing = self
+            .metrics
+            .as_ref()
+            .zip(queued_us)
+            .map(|(metrics, queued_us)| (metrics, queued_us, crate::asyncrt::mono_us()));
+        if let Some((metrics, _, _)) = timing {
+            // Before the turn, so a condemnation during it can name the script.
+            metrics.turn_series(worker, self.loaded_worker);
+        }
+        let result = f(&mut *worker);
         // Finish on the executing thread, before releasing either permit.
         // Awaiting the scheduler/worker is never counted as CPU.
         drop(accounting);
+        if let Some((metrics, queued_us, started_us)) = timing {
+            let ended_us = crate::asyncrt::mono_us();
+            if let Some(series) = metrics.turn_series(worker, self.loaded_worker) {
+                series
+                    .wait
+                    .record(started_us.saturating_sub(queued_us) as f64 / 1e6);
+                series
+                    .duration
+                    .record(ended_us.saturating_sub(started_us) as f64 / 1e6);
+            }
+            metrics.sample_heap_if_due(worker, ended_us / 1_000);
+        }
         CURRENT_SLOT.set(previous);
         result
     }
@@ -362,6 +453,7 @@ impl Slot {
             adopted_cells: AtomicUsize::new(0),
             retiring: AtomicBool::new(false),
             monitor: crate::monitor::enabled().then(crate::monitor::SlotMonitor::default),
+            metrics: crate::metrics::enabled().then(SlotMetrics::default),
             #[cfg(celld_internal_tests)]
             turn_observations: Mutex::new(Vec::new()),
         })
@@ -396,6 +488,7 @@ impl Slot {
             adopted_cells: AtomicUsize::new(0),
             retiring: AtomicBool::new(false),
             monitor: None,
+            metrics: None,
             turn_observations: Mutex::new(Vec::new()),
         })
     }
@@ -467,6 +560,15 @@ impl Slot {
         };
         if !self.retiring.swap(true, Ordering::Relaxed) {
             tracing::warn!(isolate = %self.heap_id, slot = self.id, reason, "isolate condemned");
+            if let (Some(metrics), Some(slot)) = (crate::metrics::get(), &self.metrics) {
+                metrics.isolate_condemnations.add(
+                    &[
+                        ("celld.script", slot.script()),
+                        ("celld.isolate.condemnation.reason", "guest_fatal"),
+                    ],
+                    1,
+                );
+            }
         }
         reclaim.notify_one();
         true
@@ -536,6 +638,25 @@ impl Slot {
             requests: load.requests,
             retiring: load.retiring,
             memory,
+        })
+    }
+
+    /// A non-blocking reading for operational metrics: an isolate that is
+    /// running reports the heap it had at its last turn end. `None` once the
+    /// isolate has been freed, or when metrics are off.
+    pub(crate) fn metrics_sample(&self) -> Option<SlotSample> {
+        let metrics = self.metrics.as_ref()?;
+        let heap = match self.worker.try_lock() {
+            Ok(worker) => {
+                let heap = worker.as_ref()?.heap_usage();
+                *metrics.heap.lock().unwrap() = heap;
+                heap
+            }
+            Err(_) => *metrics.heap.lock().unwrap(),
+        };
+        Some(SlotSample {
+            retiring: self.is_retiring(),
+            heap,
         })
     }
 
@@ -744,6 +865,7 @@ impl Pool {
             adopted_cells: AtomicUsize::new(0),
             retiring: AtomicBool::new(self.retired.load(Ordering::Relaxed)),
             monitor: crate::monitor::enabled().then(crate::monitor::SlotMonitor::default),
+            metrics: crate::metrics::enabled().then(SlotMetrics::default),
             #[cfg(celld_internal_tests)]
             turn_observations: Mutex::new(Vec::new()),
         });
