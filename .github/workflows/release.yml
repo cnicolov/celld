@@ -35,7 +35,7 @@ concurrency:
 
 env:
   RUST_VERSION: 1.98.1
-  IMAGE: ghcr.io/denoland/celld
+  IMAGE: ghcr.io/cnicolov/celld
 
 jobs:
   build-celld:
